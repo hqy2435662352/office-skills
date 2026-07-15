@@ -42,8 +42,30 @@ Workflow skills depend on base skills for domain knowledge but do not duplicate 
 | [officecli-xlsx](officecli-xlsx/SKILL.md) | Base · Reference | Excel workbook creation, formulas, charts, formatting, conditional formatting, data validation, QA |
 | [officecli-docx](officecli-docx/SKILL.md) | Base · Reference | Word document creation, styles, tables, TOC, headers/footers, fields, tracked changes |
 | [officecli-pptx](officecli-pptx/SKILL.md) | Base · Reference | PPT deck creation, design principles, charts, animations, connectors, delivery gates |
-| [table-fill](table-fill/SKILL.md) | Workflow · Pipeline | 4-layer workflow (flatten → classify → map → fill), xlsx↔pptx data transfer with Human Gate |
-| [chart-gen](chart-gen/SKILL.md) | Workflow · 3-step | 3-step workflow (analyze → confirm → generate), add charts to existing xlsx with Human Gate |
+| [table-fill](table-fill/SKILL.md) | Workflow · Pipeline | Maps source data into a target template by semantic alignment, handling structural differences automatically. 4-layer pipeline: flatten source → classify columns → map coordinates → batch execute, with Human Gate |
+| [chart-gen](chart-gen/SKILL.md) | Workflow · 3-step | Automatically recommends and creates charts for existing xlsx data. 3-step flow: data analysis → chart proposal review → render, with Human Gate |
+
+### table-fill Use Cases
+
+| Scenario | Description |
+|----------|-------------|
+| **Monthly business review PPT** | Extract data from xlsx reports and populate PPT template tables, handling multi-sheet aggregation and multi-slide orchestration |
+| **Pivot table flattening** | Source is a pivot table or merged-cell layout, target is a flat row/column table — automatically resolves hierarchical labels and category aggregates |
+| **xlsx→xlsx template fill** | Map source metrics by time slices and product dimensions into a fixed-format reporting template |
+| **Cross-file data merge** | Extract, clean, and consolidate table data from multiple xlsx/pptx sources into a single target |
+
+Core capability: auto-detects dimension axes and metric axes in source tables, handles pivot table hierarchical labels, merged cells, subtotal rows, and similar complex layouts. Human Gate confirms mapping before execution.
+
+### chart-gen Use Cases
+
+| Scenario | Description |
+|----------|-------------|
+| **Sales trend chart** | Analyzes monthly sales data and recommends line or column charts with correct data ranges and series colors |
+| **Composition analysis** | Recommends pie or doughnut charts for category/region share data, sets data labels and color differentiation |
+| **KPI dashboard** | Creates combo charts (e.g. column + line) for multi-metric data regions, Human Gate verifies data ranges |
+| **Batch chart generation** | Creates charts across multiple structurally identical sheets, each with independent analysis→confirm→generate cycles |
+
+Core capability: auto-infers data range, chart type, and series configuration; shows sampled source data before creation so the user can verify, preventing costly rebuilds (chart series are immutable after creation).
 
 ## Dependency Graph
 
