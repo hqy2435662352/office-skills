@@ -1,0 +1,79 @@
+# chart_proposal_template.yaml -- Schema for {name}_chart_proposal.yaml
+# Produced by Step 1 (LLM analysis) and consumed by Step 3 (scripted generation).
+# The confirmed flag is checked by layer_gate.py --target 3.
+# Traceability lets users verify samples against the source xlsx without trusting the LLM.
+
+# NOTE: This file uses ASCII-safe strings only to ensure compatibility with
+# Python's default locale encoding (cp936 on Chinese Windows).
+# If you need non-ASCII values (e.g. Chinese axis labels), pass
+# encoding='utf-8' when loading this file with PyYAML.
+
+# --- File Identity -------------------------------------------------------------
+skill: chart-gen
+version: "1.0"
+source_file: "path/to/source.xlsx"
+proposal_file: "展平元数据输出/{name}_chart_proposal.yaml"
+status: pending                       # pending | confirmed | rejected
+
+# --- Chart Recommendation -----------------------------------------------------
+chart:
+  chart_type: column                   # column | bar | line | pie | ...
+  sheet: Sheet1                       # Target sheet name (ASCII-safe name recommended)
+  data_range: "Sheet1!A1:C13"         # Full data range for officecli --prop dataRange=
+  anchor: D2:J18                      # Placement anchor (cell range, not cm coords)
+  title: "Monthly Sales Trend"        # Chart title
+  preset: corporate                    # minimal | dark | corporate | magazine | dashboard | colorful | monochrome
+  manual_overrides:                   # Applied AFTER preset via officecli set --prop
+    - prop: legend
+      value: bottom
+    # - prop: dataLabels
+    #   value: outsideEnd
+
+# --- Series Definitions -------------------------------------------------------
+# One entry per data series (value axis) + optional category series (x-axis).
+# Non-contiguous columns must be split into separate series entries.
+series:
+  - name: "Sales Revenue (10k)"
+    values_range: "Sheet1!$B$2:$B$13"
+    categories_range: "Sheet1!$A$2:$A$13"
+    role: value                       # value = data series; category = x-axis label series
+
+  - name: "Cost (10k)"
+    values_range: "Sheet1!$C$2:$C$13"
+    # categories_range: "Sheet1!$A$2:$A$13"  # omit if same as first series
+    role: value
+
+# --- Traceability Table --------------------------------------------------------
+# Sampling verification table -- users open the source xlsx and confirm samples
+# match the values below. If they don't, the inferred data_range was wrong.
+traceability:
+  series:
+    - name: "Sales Revenue (10k)"
+      range: "Sheet1!$B$2:$B$13"
+      samples_first_3: [120, 135, 148]    # First 3 non-empty values (head)
+      samples_last_3: [162, 175, 188]      # Last 3 non-empty values (tail)
+      recommended_type: column
+      reason: "12-month comparison data, suitable for column chart"
+
+    - name: "Cost (10k)"
+      range: "Sheet1!$C$2:$C$13"
+      samples_first_3: [85, 92, 98]
+      samples_last_3: [105, 112, 120]
+      recommended_type: column
+      reason: "Same series overlay, shares X-axis month labels with Sales Revenue"
+
+  categories:
+    range: "Sheet1!$A$2:$A$13"
+    samples_first_3: ["Jan", "Feb", "Mar"]  # String values for x-axis labels
+    role: x_axis_label                 # x_axis_label | category_name
+
+# --- Human Gate ---------------------------------------------------------------
+confirmed: false                      # Set to true only after user confirms in Step 2
+                                      # layer_gate.py --target 3 will BLOCK if confirmed != true
+
+# --- Warnings / Notes ---------------------------------------------------------
+# Populated by Step 1 when anomalies are detected (empty rows, non-contiguous
+# columns, Chinese sheet names, etc.). Users should address these at Step 2.
+notes:
+  - "Empty rows detected at rows 8-10; included in data_range. Confirm whether to exclude."
+  # - "Non-contiguous columns detected: column C and E are data, column D is empty."
