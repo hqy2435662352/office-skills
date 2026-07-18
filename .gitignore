@@ -1,0 +1,35 @@
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# OfficeCLI / temp files
+*.tmp
+*.lock
+officecli-resident-*
+
+# Generated outputs / demo artifacts
+explicit_binding_demo.html
+explicit_binding_demo.xlsx
+flat_output/
+dumps/
+workspace/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test fixtures (keep in repo if needed; exclude large/temp ones)
+test_fixtures/
+
+# Hidden system folders
+.playwright-mcp/
