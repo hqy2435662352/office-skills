@@ -215,6 +215,8 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 ### validation 三件套
 
 - `required_coverage`: 关键源行必须被消费 (编译失败而非警告)。
+  `rows` 引用**展平 CSV 的原始行号** (CSV 每行最后一列携带的源表行号),
+  不是目标 sheet 行号。
 - `key_outputs`: Gate/readback 的采样格。必须是 plan 实际写入的格
   (值/公式/空皆可) — 指向未写入的格 → 编译失败 (KEY_OUTPUT_UNWRITTEN)。
 - `required_empty`: 额外 EMPTY 断言 (rarely needed — nulls 已覆盖大多数)。
@@ -239,9 +241,10 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 | group_merges 列 A + **per_row 公式同列** A | ❌ `DUPLICATE_TARGET_WRITE` — group lowering 拥有该列每一行 (锚点写/非锚点清空) | 公式换独立列 |
 | **aggregates × per_row 公式同列** | ❌ `DUPLICATE_TARGET_WRITE` — 首行锚点格双写 | 公式换独立列 |
 | **merges (1:{n}) × per_row 公式同列** (列无映射) | ✅ 编译通过 — merges 只写 merge 属性, 不写值 | 与 aggregate 不同, 不注册值写入 |
+| **nulls × aggregates 同列** | ❌ `DUPLICATE_TARGET_WRITE` — nulls 逐行清空 (含锚点格), 聚合再写锚点公式, 锚点双写 (特征: "first as empty") | 聚合列不要进 nulls |
 
 规则: **同列只能有一个"值所有者"** (mapping / per_row formula / aggregate /
-group lowering 四选一); merge 属性与值写入不冲突。
+nulls / group lowering 五选一); merge 属性与值写入不冲突。
 
 > 注: 早期撰写期文档假设"merges × per_row 同列 → DUPLICATE_TARGET_WRITE";
 > 实测 merges 只写 merge 属性、不注册值写入, 同列共存**编译通过**
@@ -279,6 +282,14 @@ formulas:
 - 映射列: 锚点写物化值 (含 numberformat props); 无映射列: 锚点写 `label`
   ("" = 清空锚点)。
 - **singleton 组永不合并** (长度 1 不建 merge), 但锚点仍照常写值/清空。
+
+### Q4b: aggregates 算残留覆盖吗?
+
+**不算。** 残留双基线的覆盖来源只有: 逐行 fills (列映射) / nulls / per_row
+公式 / merges 列 / group 锚点与 label。aggregates 只写块首行锚点格, 不是逐行
+覆盖 — 依赖聚合"顺带覆盖"残留会以 `PLACEHOLDER_RESIDUE_UNHANDLED` /
+`CLONE_RESIDUE_UNHANDLED` 拒绝。残留列要么逐行覆盖, 要么 `nulls: rows: all`
+显式清空, 聚合列则必须**独立于 nulls** (见 Q1)。
 
 ### Q5: 空值 / 0-口径?
 
@@ -363,6 +374,7 @@ formulas:
 |---|---|---|
 | 算术派生 (减法/乘法/除法/比率) | `formulas.per_row` + ROUND 精准 (如 `IFERROR(ROUND(X{r}-Y{r},2),0)`) | 一等 |
 | 每组合计 (系列盈亏按产品组合计) | 块级 `aggregates rows: 1:{n}` 只做整块聚合; 组合边界由数据决定, spec 无法表达动态组内范围 | **暂无一等**; 变通: `blocks[]` 每组合一块 + 各自块级 aggregates; 强行声明越块组内范围 → `AGG_RANGE_INVALID` |
+| 每组合计 — 负面表达 (勿用) | 块内硬编码多个显式范围聚合 (如 `1:4`, `5:7`...) — 组边界由数据决定, 硬编码必然漂移; 且与 nulls 同列时锚点双写 | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty") — 正确路径只有拆块 |
 | 字段继承 | `columns.lookup` + `mapping.lookups` (`missing: empty`) | 一等 |
 | 路由 (条件取列) | selectors 行过滤 + `fallback` 列回退 | 一等 |
 | 0-口径 | 常量 `value: "0"` / 空源留空 / 多列求和缺失按 0 | 一等 |

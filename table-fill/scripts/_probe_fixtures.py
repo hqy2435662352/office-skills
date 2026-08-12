@@ -370,6 +370,48 @@ def _pptx_inplace(spec, wd):
     return spec
 
 
+def _inplace_base(spec, wd):
+    """Shape of INPLACE_BASE_SPEC: inplace region 7-10, columns A/B/C/E,
+    nulls D/F — used by the inplace interaction probes."""
+    _set(spec, "mapping.targets.0.base_last_row", 14)
+    _set(spec, "mapping.targets.0.clone_roles",
+         [{"role": "data", "mode": "inplace",
+           "start_row": 7, "capacity": 4, "template_row": 8}])
+    _set(spec, "mapping.targets.0.columns",
+         [{"source": "A", "target": "A"},
+          {"source": "B", "target": "B"},
+          {"source": "C", "target": "C"},
+          {"source": "D", "target": "E"}])
+    _set(spec, "mapping.targets.0.nulls",
+         [{"col": "D", "rows": "all"}, {"col": "F", "rows": "all"}])
+    return spec
+
+
+def _nulls_aggregate_same_col(spec, wd):
+    """nulls 列 X all + aggregate 列 X → 锚点格先被 nulls 清空又被聚合写 →
+    DUPLICATE_TARGET_WRITE (通用规则, 与 inplace/append 无关)."""
+    _inplace_base(spec, wd)
+    _set(spec, "mapping.targets.0.formulas",
+         {"aggregates": [{"col": "F", "rows": "1:{n}",
+                          "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _per_group_total_hardcoded_ranges(spec, wd):
+    """每组合计的负面表达: 块内硬编码多个显式范围聚合 + nulls →
+    DUPLICATE_TARGET_WRITE (组合边界由数据决定, 硬编码范围必然漂移;
+    正确路径只有 blocks[] 拆块)."""
+    _inplace_base(spec, wd)
+    _set(spec, "mapping.targets.0.formulas",
+         {"aggregates": [
+             {"col": "F", "rows": "1:2",
+              "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+             {"col": "F", "rows": "3:3",
+              "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+         ]})
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -405,6 +447,11 @@ PROBE_CASES = [
      "build": _zero_policy},
     {"id": "per_group_total_blocks", "expect": "accept",
      "build": _per_group_total_blocks},
+    # ── Q1 补充: nulls × aggregates 同列 / 每组合计硬编码范围 (负面表达) ──
+    {"id": "nulls_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
+     "build": _nulls_aggregate_same_col},
+    {"id": "per_group_total_hardcoded_ranges", "expect": "DUPLICATE_TARGET_WRITE",
+     "build": _per_group_total_hardcoded_ranges},
     {"id": "pptx_group_merges", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
      "build": _pptx_group_merges},
     {"id": "pptx_inplace", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",

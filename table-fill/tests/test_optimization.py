@@ -426,6 +426,34 @@ class ModNominateTests(unittest.TestCase):
         self.assertIn("源面价", rules[0]["description"])
         self.assertEqual(rules[0]["group"], "business_transformation")
 
+    def test_out_relative_resolves_to_workdir(self):
+        """--out 相对路径以 workdir 为基准 — CWD != workdir 时结果不乱落
+        (2026-08-12 round2: mod_resolution.json 曾写到 CWD 需手动归位)."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as cwd:
+            workdir = Path(tmp)
+            cwd = Path(cwd)
+            idx = workdir / "MOD_INDEX.md"
+            mods = workdir / "MODS"
+            mods.mkdir(exist_ok=True)
+            idx.write_text(
+                "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
+                "|---|---|---|---|---|---|---|\n"
+                "| t_out | t | semantic_type::quotation |  | MOD_test.md | 1 | private |\n",
+                encoding="utf-8")
+            (mods / "MOD_test.md").write_text(
+                "## Applicability\n- semantic_type: quotation\n\n## 业务逻辑摘要\n- x\n",
+                encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "mod_nominate.py"),
+                 "--task", "报价汇总 迁移 毛利表", "--files", "a,b",
+                 "--workdir", str(workdir), "--index", str(idx),
+                 "--mods-dir", str(mods), "--out", "mod_resolution.json"],
+                cwd=str(cwd), capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((workdir / "mod_resolution.json").is_file())
+            self.assertFalse((cwd / "mod_resolution.json").exists())
+
     def test_explicit_alias_ignores_unrelated_mod_conflict(self):
         idx_dir = Path(__file__).parent / "_fixtures"
         index = idx_dir / "MOD_INDEX_explicit.md"
@@ -1339,6 +1367,24 @@ class FillSpecContractTests(unittest.TestCase):
                             "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
         self.assertIn("DUPLICATE_TARGET_WRITE", self._fail_codes(spec))
 
+    def test_nulls_rows_invalid_list_of_ranges_rejected(self):
+        """nulls rows 用 ['1:2','3:4'] 混合列表 → NULLS_ROWS_INVALID 结构化
+        拒绝 (曾以 Python traceback 崩溃)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["nulls"] = [
+            {"col": "D", "rows": ["1:2", "3:4"]}]
+        codes = self._fail_codes(spec)
+        self.assertIn("NULLS_ROWS_INVALID", codes)
+
+    def test_null_specs_valid_forms_pass(self):
+        """nulls rows 合法形态 ('all' / int 列表 / 'a:b' 字符串) 不被
+        NULLS_ROWS_INVALID 拒绝 (残留/部分覆盖仍按既有规则报错)."""
+        for rows in ("all", [1, 3], "2:4"):
+            spec = spec_with(self.wd)
+            spec["mapping"]["targets"][0]["nulls"] = [{"col": "D", "rows": rows}]
+            codes = self._fail_codes(spec)
+            self.assertNotIn("NULLS_ROWS_INVALID", codes, f"rows={rows!r}")
+
     def test_merges_and_per_row_formula_same_column_ok(self):
         """merges (1:{n}) 只写 merge 属性不写值 → 无映射的列上可与 per_row
         公式共存 — 编译通过."""
@@ -1757,6 +1803,7 @@ class CapabilitiesTests(unittest.TestCase):
         for cid in ("group_merges_aggregate_same_col", "group_merges_aggregate_diff_col",
                     "derived_subtraction_pattern", "mapped_group_column_anchor",
                     "lookup_missing_empty", "precision_keep", "per_group_total_blocks",
+                    "per_group_total_hardcoded_ranges", "nulls_aggregate_same_col",
                     "pptx_group_merges"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
 
@@ -1812,6 +1859,36 @@ class ProbeScaffoldTests(unittest.TestCase):
                 capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(r.returncode, 3)
             self.assertIn("MANIFEST_NOT_FOUND", r.stdout)
+
+    def test_scaffold_refuses_overwrite_without_force(self):
+        """默认输出 probe_spec.yaml; 已存在文件须 --force, 防止误覆盖
+        真实 fill_spec.yaml (2026-08-12 round1: 骨架曾静默覆盖丢失 spec)."""
+        import json as _json
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            # 默认路径 probe_spec.yaml 首次生成成功
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "make_probe_spec.py"),
+                 "--workdir", str(tmp)],
+                capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((tmp / "probe_spec.yaml").is_file())
+            # 再跑一次 → 拒绝覆盖
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "make_probe_spec.py"),
+                 "--workdir", str(tmp)],
+                capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 3)
+            self.assertIn("PROBE_SCAFFOLD_EXISTS", r.stdout)
+            # --force → 覆盖成功
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "make_probe_spec.py"),
+                 "--workdir", str(tmp), "--force"],
+                capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("PROBE_SCAFFOLD_WRITTEN", r.stdout)
 
 
 class DocCoverageGuardTests(unittest.TestCase):

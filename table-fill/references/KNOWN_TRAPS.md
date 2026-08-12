@@ -65,3 +65,20 @@
 | **源码阅读代替编译验证** | 为确认一个行为读源码 25 次交互 (机器 63s 的工作拖成 15–25 分钟) | **先写后编译**: compile 一轮 ~0.1s, stderr 缺陷清单 (code + corrective_action) 即权威反馈; 仅「文档未覆盖 且 报错无法解释」才读源码 |
 | **YAML 引号漏写** | `decisions`/`gaps` 含 `: ` 的裸标量被解析成 mapping, 内容静默丢失 | 含 `: `/引号/特殊字符的字符串统一加引号; SPEC_NON_STRING_ITEM 是兜底不是常态 |
 | **note_phase 缺失** | run_timing.json 只有 machine 条目, Gate 报告缺 Agent 时间栏 | 关键相位 (mod_resolution/spec_authoring/compile_review/execute_review/gate_wait) 至少各记一次 |
+
+## 组合行为陷阱 (2026-08-12 实测)
+
+| 陷阱 | 症状 | 正确路径 |
+|------|------|------|
+| **nulls × aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合再写公式) | 聚合列不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
+| **块内硬编码多范围聚合表达"每组合计"** | 完整业务列集下 V/W 锚点 8× DUPLICATE, 组合敏感, 最小 spec 不复现 (2026-08-12 埃及场景 20 轮 probe 才定位) | 组边界由数据决定 — 每组合计只有 `blocks[]` 拆块一条路 (见 FILLSPEC 能力映射表负面表达行) |
+| **`nulls rows` 用 `["1:2","3:4"]` 混合列表** | probe 抛 Python traceback 而非缺陷清单 (int("1:2") 崩溃) | 用 `rows: all` / int 列表 / `"a:b"` 字符串; 编译器现以 NULLS_ROWS_INVALID 结构化拒绝 |
+| **`officecli get --depth 0` 查不到 mergeCell** | 合并验证漏报 | 用 `officecli query merge` (或 execute readback 的组边界断言), 别靠 get 的单元格属性 |
+| **重复验证已覆盖事实** | 为确认 aggregates 锚点/克隆残留行为重复读 tests 与源码 (FILLSPEC Q1/Q10 已声明) | 契约章节未写的问题才查; 机械事实 (如克隆是否携带合并) 先在 KNOWN_TRAPS 找答案 |
+
+## 已 spike 确认的机械事实 (免重复 spike)
+
+| 事实 | 结论 |
+|------|------|
+| **克隆携带合并区** | `add --from` 复制 template_row 的格式+值+**mergeCell** (实测: 克隆合并标题行 A1:F1 → 克隆行 A41:F41 带合并) — 标题/表头克隆源选合并行无需额外合并 op; data 行克隆携带的旧合并是 group_merges unmerge 的对象 |
+| **merges × aggregates 同列** | `merges 1:{n}` + `aggregates 1:{n}` 同列编译通过 (聚合锚点=合并锚点=块首行); 同列多条 aggregates 用显式范围 (2:2、3:3) 做块内多组小计; merges+多组显式范围同列**不建议** (聚合锚点落合并区非锚点格, 执行期未验证) |

@@ -312,6 +312,28 @@ def parse_rel_rows(rows_spec) -> set[int] | None:
     return set()
 
 
+def validate_nulls_rows(cfg: dict, defects: list) -> None:
+    """nulls rows 格式静态校验 — 非法格式给结构化缺陷, 而不是在
+    parse_rel_rows 里抛 ValueError 冒泡成 Python traceback
+    (2026-08-12: rows: ['1:2','3:4'] 列表混合写法曾让 probe 崩溃)."""
+    for n in cfg.get("nulls", []):
+        rows = n.get("rows")
+        col = n.get("col", "?")
+        if rows == "all":
+            continue
+        ok = False
+        if isinstance(rows, list):
+            ok = all(isinstance(r, int) and r >= 1 for r in rows)
+        elif isinstance(rows, str) and re.fullmatch(r"\d+\s*:\s*\d+", str(rows)):
+            ok = True
+        if not ok:
+            defects.append({
+                "code": "NULLS_ROWS_INVALID", "col": col, "rows": rows,
+                "message": f"nulls[{col}] rows {rows!r} is not a valid row spec — "
+                           "'all', an int list, or a 'a:b' range string",
+                "corrective_action": "Use rows: all, rows: [1, 3], or rows: \"2:4\""})
+
+
 def resolve_blocks(target: dict) -> list[dict]:
     """Target block list with single-block backward compatibility.
 
@@ -1823,6 +1845,11 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         anchor_rows = {int(re.search(r"\d+$", a).group()) for a in anchors}
         for b in block_infos:
             cfg = b["cfg"]
+            validate_nulls_rows(cfg, defects)  # 先于任何 parse_rel_rows 调用
+            if any(d.get("code") == "NULLS_ROWS_INVALID" for d in defects):
+                fail("STATIC_VALIDATION_FAILED",
+                     f"{len(defects)} static validation defect(s)",
+                     "Fix the nulls rows specs and re-run compile_fill.py", defects)
             template_row = next((r.get("template_row") for r in cfg.get("clone_roles", [])
                                  if r.get("role") == "data"), None)
             if template_row is None:
