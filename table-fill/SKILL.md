@@ -131,6 +131,9 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
 - 输出 `prepare_manifest.json` (文件哈希、flattened sheets、digest、fingerprints)。
 - 每个 sheet 一个 `{name}_digest.md` — **LLM 只读 digest, 不读 meta.json**。
 - 阶段 B 之前先读 outline 确认 sheet 名; 一次 outline 只跑一次, 不重复。
+- **`--sheets` 按任务文本一次列出全部源 sheet** (文件间用 `;` 分隔,
+  `file.xlsx:S1,S2;file2.xlsx:S3`) — 漏列 sheet 会触发 TARGET_NOT_FLATTENED
+  报错后补跑; 增量展平 (flatten 可多次调用) 是**兜底**不是常态。
 - flatten 可**多次调用增量展平** (如先源后目标、或分 sheet 批次): manifest
   按条目 name 合并, 新覆盖旧, 不互相覆盖。
 
@@ -221,7 +224,18 @@ SUM 聚合 (如 O/S/T 用 ROUND(...,2), 比率 U/V/W 用 ROUND(...,4)); 无残�
   (code + corrective_action) 即**权威反馈** → 定向修 → 重编译。**禁止以源码
   阅读替代编译验证** — 读源码的成本是编译的数百倍, 结论还不一定对
   (precision: keep 反例: 读了源码反而选错, 见 references/KNOWN_TRAPS.md)。
-- **源码/spike 边界**: 仅当「文档未覆盖 且 编译报错无法解释」才读源码或做
+- **probe = 唯一允许的确认手段 (硬性)**: 任何"编译器会怎样处理 X"的不确定,
+  **禁止读源码、禁止通读编译器代码确认**。四条路, 按此顺序:
+  1. `assets/combination_patterns.yaml` — 组合模式**先复制后理解** (改列名即可);
+  2. `compile_fill.py --capabilities` — 一条命令向编译器查询整个契约矩阵
+     (输出与 FILLSPEC 契约章节一致, 由测试强制);
+  3. `scripts/make_probe_spec.py --workdir <dir>` — 一键生成 probe 骨架
+     (指纹/inputs 自动从 manifest 填), 填入不确定片段;
+  4. `compile_fill.py --probe --spec <spec> --workdir <dir>` — 对 spec 做编译验证:
+     与完整编译**同管线**所以结论必然一致, 且零副作用 (不写 plan/mapping/
+     timing)。probe 失败 (exit 3) 时 stdout 直接给内部缺陷码 +
+     corrective_action。
+- **源码/spike 边界**: 仅当「文档未覆盖 且 probe/编译报错无法解释」才读源码或做
   spike; spike 实验**一律使用独立 scratch 文件, staged 文件只读** — 在 staged
   副本上做实验会污染暂存文件, 触发重复 flatten。
 - **YAML 纪律**: 含 `: ` / 引号 / 特殊字符的字符串**统一加引号** —
@@ -230,8 +244,13 @@ SUM 聚合 (如 O/S/T 用 ROUND(...,2), 比率 U/V/W 用 ROUND(...,4)); 无残�
 - **note_phase 合规**: 关键相位至少各记录一次 — `mod_resolution` /
   `spec_authoring` / `compile_review` / `execute_review` / `gate_wait`;
   缺 Agent 相位 → run_timing 不完整, Gate 报告缺 Agent 时间栏。
-- **效率提示**: 把每轮验证成本从数分钟降到秒级 — compile 一轮 0.1s, 读源码
-  是它的数百倍。不确定"编译器会怎样处理 X"时, 写一版让编译器回答。
+- **效率提示**: 把每轮验证成本从数分钟降到秒级 — compile/probe 一轮 0.1s,
+  读源码是它的数百倍。不确定"编译器会怎样处理 X"时, 写一版让编译器回答。
+- **失败成本量化 (为什么不怕第 1 轮失败)**: 第 1 轮执行失败是**预期路径** —
+  修复成本 ≈ 编译 0.1s + 重跑 ~20s + 一次 spec 改动, 合计 <2 分钟; 为防失败
+  而读源码是负收益 (一次源码阅读 ≈ 数分钟到十几分钟)。repair 预算 1 轮
+  约束的是**连续失败** (防无限循环), 不是单次失败 — 单次失败照常走
+  "失败处置表 → 修 → 重跑"。
 
 ### 4. Compile — `compile_fill.py` (唯一 Compiler)
 

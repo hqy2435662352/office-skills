@@ -1,0 +1,143 @@
+# combination_patterns.yaml — FillSpec 组合模式速查与复制源
+#
+# 用法: 不确定"某个组合怎么写"时, 先在此文件找模式复制 (改列名即可),
+# 不需要理解交互规则; 模式复制后仍不确定 → compile_fill.py --probe 验证。
+#
+# 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书
+# (tests/test_optimization.py: FillSpecContractTests / CapabilityMappingContractTests);
+# 运行时可用 compile_fill.py --capabilities 直接向编译器查询整个契约矩阵。
+
+patterns:
+  # ── Q1: group_merges 列 × 公式/聚合 ──
+  - id: group_merges_plus_aggregate_diff_col
+    question: group_merges 列要和聚合共存, 怎么写?
+    answer: 聚合必须放独立列 (同列 → DUPLICATE_TARGET_WRITE)
+    fragment: |
+      group_merges:
+        - col: A
+          group_by: A
+      formulas:
+        aggregates:
+          - col: V
+            rows: "1:{n}"
+            formula: "IFERROR(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),0)"
+            style: anchor
+
+  - id: aggregate_or_per_row_independent_col
+    question: 派生公式/聚合能写在映射列上吗?
+    answer: 不能 — 派生列必须是独立未映射列 (同列 → DUPLICATE_TARGET_WRITE)
+    fragment: |
+      formulas:
+        per_row:
+          G: "IFERROR(ROUND(A{r}-B{r},2),0)"
+        aggregates:
+          - col: V
+            rows: "1:{n}"
+            formula: "SUM(T{r1}:T{r2})"
+            style: anchor
+
+  # ── Q2: 算术派生列 (FLD-006 减法) ──
+  - id: derived_subtraction
+    question: 原型机成本 = 面价 − 铜管成本 怎么写?
+    answer: per_row formula + ROUND(...,2), 独立未映射列
+    fragment: |
+      formulas:
+        per_row:
+          O: "IFERROR(ROUND(J{r}-K{r}-L{r}-M{r}-N{r},2),0)"
+
+  - id: derived_ratio
+    question: 比率列怎么写?
+    answer: per_row formula + ROUND(...,4) (比率用 4 位)
+    fragment: |
+      formulas:
+        per_row:
+          U: "IFERROR(IF(S{r}=0,0,T{r}/S{r}),0)"
+
+  # ── Q3: 映射列 × 合并列 ──
+  - id: mapped_group_column
+    question: 映射列同时做分组合并, 怎么写?
+    answer: 同列声明 mapping + group_merges 即可 — 锚点写物化值, 非锚点自动清空
+    fragment: |
+      columns:
+        - source: A
+          target: A
+      group_merges:
+        - col: A
+          group_by: A
+          style: label
+
+  - id: unmapped_group_column_label
+    question: 无映射列的分组合并怎么写?
+    answer: label 必填 ("" = 清空锚点); 缺 label → GROUP_MERGE_ANCHOR_UNCOVERED
+    fragment: |
+      group_merges:
+        - col: F
+          group_by: A
+          label: ""      # 无映射列的锚点文本 ("" = 清空)
+
+  # ── Q5: 0-口径 ──
+  - id: zero_policy
+    question: 报价缺失行 (0-口径) 怎么写?
+    answer: 常量 "0" + 缺失源留空; 数值 0 不是缺失, 原样写入
+    fragment: |
+      columns:
+        - target: J
+          value: "0"              # 常量 (0-口径)
+        - source: [P, Q]
+          target: N               # 多列求和, 缺失/空/"-" 按 0
+
+  # ── Q6: lookup missing ──
+  - id: lookup_missing_empty
+    question: 查表键缺失时怎么处理?
+    answer: missing: empty → 缺失格留空; missing: error → 编译失败 (LOOKUP_KEY_MISSING)
+    fragment: |
+      columns:
+        - target: D
+          lookup: {name: sku_fields, field: factory_model, missing: empty}
+      lookups:
+        - name: sku_fields
+          from: inheritance.json
+          key_column: G
+          fields: [factory_model, compressor]
+          missing: empty
+
+  # ── Q7: 精度 ──
+  - id: round4_precision
+    question: 15 位成本值怎么处理?
+    answer: 首选 transform: round4; precision: keep 只在列宽确有余量时用
+    fragment: |
+      columns:
+        - source: D
+          target: B
+          transform: round4
+
+  # ── 能力映射表: 每组合计 (变通) ──
+  - id: per_group_total_blocks
+    question: 系列盈亏按产品组合计 (每组合计) 怎么写?
+    answer: 暂无一等表达 — 按组合拆 blocks[], 每块各自 aggregates (组合边界由数据决定)
+    fragment: |
+      blocks:
+        - clone_roles: [spacer, title, header, data]
+          rows:
+            source: source_maoli
+            selectors:
+              - column: A
+                pattern: "家用*"
+          formulas:
+            aggregates:
+              - col: V
+                rows: "1:{n}"
+                formula: "SUM(T{r1}:T{r2})"
+                style: anchor
+        - clone_roles: [spacer, title, header, data]
+          rows:
+            source: source_maoli
+            selectors:
+              - column: A
+                pattern: "商用*"
+          formulas:
+            aggregates:
+              - col: V
+                rows: "1:{n}"
+                formula: "SUM(T{r1}:T{r2})"
+                style: anchor

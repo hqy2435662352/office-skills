@@ -188,6 +188,9 @@ required_coverage 按源分别声明 (source 填展平 name 或 csv 名)。
 | `{source: [P, Q], target: N}` | 多列求和, 缺失/`-`/空按 0 |
 | `{target: J, value: "0"}` | 常量 (0-口径等) |
 
+**已映射列无需再进 `nulls`**: 列映射逐行写值 (含空源值写空串), 已覆盖残留;
+`nulls` 只用于**没有列映射但克隆携带旧值**的列 (如连接管 "/" 占位)。
+
 transforms 支持 `regex_replace` (pattern/replacement) 与 `strip`; 另有内置数值舍入 `round2`/`round4` (消除 15 位成本值的执行期溢出)。列映射可设 `precision: keep` 显式接受长精度值。
 
 ### lookups
@@ -222,6 +225,10 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 > 用例背书** (`tests/test_optimization.py`: FillSpecContractTests) — 文档声称
 > "能编译"必须能编译, 声称"按错误码拒绝"必须按错误码拒绝。FILLSPEC 按特性组织,
 > 本章节按问题组织: 找不到答案时先查这里, **不要读 compile_fill.py 源码**。
+>
+> 运行时直接问编译器: `compile_fill.py --capabilities` 输出与本章节同源的契约
+> 矩阵 (同一探针集驱动文档、测试与运行时报告, 三者不会漂移); 对某个具体写法
+> 不确定 → `compile_fill.py --probe` (与完整编译同管线, 零副作用)。
 
 ### Q1: group_merges 列能与公式/聚合共存吗？
 
@@ -297,6 +304,54 @@ formulas:
 3. 反例教训 (2026-08-12): Agent 读了 `apply_precision_policy` 源码后自选
    `precision: keep` 绕过文档推荐的 round4 → 第一轮 text_overflow 失败。
    **源码阅读给出错误安全感 — 按文档推荐序写, 用编译验证。**
+
+### Q8: CLONE_SOURCE_IS_ANCHOR 检查作用域?
+
+- **只检查 data role 的 template_row** — 锚点行携带锚点公式 (如
+  `SUM(T19:T21)`), 克隆到数据行即静默公式残留, 编译拒绝。
+- **title/header 的 template_row 选锚点行无编译检查** (实测: 锚点行作
+  title/header 克隆源编译通过) — 锚点公式会被克隆进单行标题, 若未给
+  `value` 覆盖则残留。**任何克隆源的 template_row 都避免选锚点行**;
+  title/header 给 `value` 可覆盖文本, 但公式残留不在此机制覆盖内。
+- 混合 inplace 的 overflow 克隆 (template_row) 同样适用 data 检查。
+
+### Q9: title/header 的 value 何时写入?
+
+- **延迟到 adds 之后、fills 阶段写入** (deferred_values) — 所有 add/remove
+  先完成, 值写入不与行结构操作穿插。这是 `duplicate_row` 坑的防御排序:
+  add 之间穿插 cell 写入会破坏 officecli 行簿记。
+- 推论: plan 的 op 顺序恒为 clear → add → remove → merge → fill; 标题值
+  属于 fill 阶段, 不会出现在 add 序列中。
+
+### Q10: readback 断言种类 (register 语义)?
+
+| 写入来源 | readback kind | 断言 |
+|---|---|---|
+| 列映射 / sets 值 / 标题 value | `value` | 数字归一化比较 (`$138.00` vs `138`) |
+| nulls / required_empty / 清空 | `empty` | 断言 EMPTY |
+| per_row 公式 / aggregates / 合并锚点 | `nonempty` | 断言非空 (公式结果编译期不可确定) |
+
+- 每格恰好一种 kind (一格一 owner); 同一格被两种写入来源命中 →
+  `DUPLICATE_TARGET_WRITE`。
+
+### Q11: 克隆会携带 template_row 的合并区吗?
+
+- **会** — `add --from` 复制 template_row 的格式 + 值 + mergeCell
+  (2026-08-12 spike 实测: 克隆合并标题行 A1:F1 → 克隆行自动带 A41:F41 合并)。
+- 推论: **标题行/表头行克隆源选合并行, 无需额外合并 op** (合并随克隆携带);
+  其携带的旧文本由 title/header 的 `value` 覆盖, 否则残留。
+- 反向推论: data 行克隆源若为合并区行, 克隆行携带的旧合并正是
+  group_merges 重建时 unmerge 的对象 (含单格残留 A19:A19 的源头)。
+
+### Q12: merges × aggregates 共存与多组聚合写法?
+
+| 组合 | 结果 |
+|---|---|
+| `merges 1:{n}` + `aggregates 1:{n}` 同列 | 编译通过 — 聚合锚点 = 块首行 = 合并锚点 (既有一行声明) |
+| 同列多条 `aggregates` + 显式范围 (如 `2:2`、`3:3`) | 编译通过 — 每条聚合落在各自的显式行 (实测: 数据行 8/9 落点正确), 用于**块内多组小计行** |
+| `merges 1:{n}` + 多条显式范围聚合同列 | 编译通过, 但聚合锚点会落在合并区**非锚点格** — 执行期行为未验证, **不建议** (整块合并与分组小计语义互斥, 用上一行写法) |
+
+- 与它们冲突的只有 per_row 公式 (同列 → DUPLICATE_TARGET_WRITE, Q1)。
 
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 

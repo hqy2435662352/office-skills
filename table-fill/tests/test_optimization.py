@@ -16,175 +16,14 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 import compile_fill  # noqa: E402
 import mod_nominate  # noqa: E402
 import promote_output  # noqa: E402
-from prepare_run import facts_sha256, structure_facts  # noqa: E402
+from _probe_fixtures import (  # noqa: E402
+    BASE_SPEC,
+    make_probe_inplace_workdir as make_inplace_workdir,
+    make_probe_workdir as make_workdir,
+)
 
 
 # ── Shared fixtures ────────────────────────────────────────────────────
-
-def make_workdir(tmp: Path, n_source_rows: int = 3) -> dict:
-    """Synthetic workdir: source CSV, target meta/csv, manifest, lookup."""
-    src_rows = [
-        ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
-        ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
-        ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
-    ][:n_source_rows]
-    with open(tmp / "source_maoli_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
-        for i, row in enumerate(src_rows):
-            csv.writer(f).writerow(row + [101 + i])
-
-    target_meta = {
-        "sheet": "S",
-        "dimensions": {"rows": 20, "cols": 10, "data_rows": 2},
-        "header_band": {"header_rows": [2], "data_start_row": 3},
-        "merged_ranges": ["A5:A6"],
-        "merge_anchors": [{"range": "A5:A6", "anchor": "A5", "formula": ""}],
-        "blocks": [],
-        "columns": [{"col": "A", "nonempty": 2}, {"col": "D", "nonempty": 1}],
-        "formulas": {"D3": "B3-C3"},
-        "column_numfmt": {"D": "0.00"},
-    }
-    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
-        json.dump(target_meta, f, ensure_ascii=False)
-
-    with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["标题", "", "", "", "", "", "", "", "", "", "1"])
-        w.writerow(["类别", "规格", "型号", "", "", "", "", "", "", "", "2"])
-        w.writerow(["家用", "12K", "Z001", "F-1", "", "", "", "", "", "", "3"])
-        w.writerow(["家用", "18K", "Z002", "F-2", "", "", "", "", "", "", "4"])
-
-    facts = [structure_facts(target_meta)]
-    manifest = {
-        "schema_version": 2,
-        "files": [
-            {"staged": "source_maoli.xlsx", "source": "x", "sha256": "a"},
-            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
-        ],
-        "flattened": [
-            {"file": "source_maoli.xlsx", "sheet": "毛利表", "name": "source_maoli",
-             "csv": "source_maoli_flat.csv", "meta": "m.json",
-             "digest": "d.md", "candidates": "c.yaml"},
-            {"file": "target.xlsx", "sheet": "S", "name": "target",
-             "csv": "target_flat.csv", "meta": "target_meta.json",
-             "digest": "d.md", "candidates": "c.yaml"},
-        ],
-        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
-                   "csv": "target_flat.csv", "meta": "target_meta.json",
-                   "digest": "d.md", "candidates": "c.yaml"},
-        "fingerprints": {
-            "source_structure": facts_sha256(facts),
-            "target_structure": facts_sha256(facts),
-        },
-    }
-    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False)
-
-    lookups = {"Z001": {"compressor": "C-1", "copper": "P-1"},
-               "Z002": {"compressor": "C-2", "copper": "P-2"}}
-    with open(tmp / "inheritance.json", "w", encoding="utf-8") as f:
-        json.dump(lookups, f, ensure_ascii=False)
-    return {"manifest": manifest, "lookups": lookups}
-
-
-def make_inplace_workdir(tmp: Path, n_source_rows: int = 3) -> dict:
-    """Target with a 4-row Placeholder Region (rows 7-10), Total row 11,
-    notes rows 12-14 — the MXP quotation template shape. Region rows carry
-    values in A/B/C/D/F (residue baseline per retained row)."""
-    src_rows = [
-        ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
-        ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
-        ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
-        ["商用", "28K", "Z004", "F-4", "C-4", "10", "11", "12"],
-        ["商用", "32K", "Z005", "F-5", "C-5", "13", "14", "15"],
-    ][:n_source_rows]
-    with open(tmp / "source_maoli_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
-        for i, row in enumerate(src_rows):
-            csv.writer(f).writerow(row + [101 + i])
-
-    target_meta = {
-        "sheet": "S",
-        "dimensions": {"rows": 14, "cols": 6, "data_rows": 4},
-        "header_band": {"header_rows": [2], "data_start_row": 7},
-        "merged_ranges": ["A7:A10"],
-        "merge_anchors": [{"range": "A7:A10", "anchor": "A7", "formula": ""}],
-        "blocks": [],
-        "columns": [{"col": "A", "nonempty": 4}, {"col": "B", "nonempty": 4}],
-        "formulas": {},
-        "column_numfmt": {},
-    }
-    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
-        json.dump(target_meta, f, ensure_ascii=False)
-
-    with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["公司标题", "", "", "", "", "", "1"])
-        w.writerow(["Type", "Model", "C&H capacity", "Pipe", "", "Panel", "2"])
-        w.writerow(["", "", "", "", "", "", "3"])
-        w.writerow(["To Messrs: ATLAS", "", "", "", "", "", "4"])
-        w.writerow(["", "", "", "", "", "", "5"])
-        w.writerow(["", "", "", "", "", "", "6"])
-        for i, r in enumerate(range(7, 11), start=1):
-            w.writerow(["Xpro placeholder", f"M{i}", f"{i}000Btu", "/", "",
-                        "Panel looking", str(r)])
-        w.writerow(["Total", "", "", "", "", "", "11"])
-        w.writerow(["* ship to Egypt", "", "", "", "", "", "12"])
-        w.writerow(["* delivery note", "", "", "", "", "", "13"])
-        w.writerow(["* validity note", "", "", "", "", "", "14"])
-
-    facts = [structure_facts(target_meta)]
-    manifest = {
-        "schema_version": 2,
-        "files": [
-            {"staged": "source_maoli.xlsx", "source": "x", "sha256": "a"},
-            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
-        ],
-        "flattened": [
-            {"file": "source_maoli.xlsx", "sheet": "毛利表", "name": "source_maoli",
-             "csv": "source_maoli_flat.csv", "meta": "m.json",
-             "digest": "d.md", "candidates": "c.yaml"},
-            {"file": "target.xlsx", "sheet": "S", "name": "target",
-             "csv": "target_flat.csv", "meta": "target_meta.json",
-             "digest": "d.md", "candidates": "c.yaml"},
-        ],
-        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
-                   "csv": "target_flat.csv", "meta": "target_meta.json",
-                   "digest": "d.md", "candidates": "c.yaml"},
-        "fingerprints": {
-            "source_structure": facts_sha256(facts),
-            "target_structure": facts_sha256(facts),
-        },
-    }
-    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False)
-    return {"manifest": manifest}
-
-
-BASE_SPEC = {
-    "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
-    "inputs": {"sources": ["source_maoli.xlsx"], "target": "target.xlsx",
-               "source_sheets": [{"source": "source_maoli.xlsx", "sheets": ["毛利表"]}],
-               "target_sheet": "S"},
-    "fingerprints": {"source_structure": None, "target_structure": None},
-    "mapping": {"targets": [{
-        "sheet": "S", "base_last_row": 4,
-        "clone_roles": [
-            {"role": "title", "template_row": 1},
-            {"role": "header", "template_row": 2},
-            {"role": "data", "template_row": 3},
-        ],
-        "rows": {"source": "source_maoli"},
-        "columns": [
-            {"source": "A", "target": "A"},
-            {"source": "B", "target": "B"},
-            {"source": "C", "target": "C"},
-        ],
-        "nulls": [{"col": "D", "rows": "all"}],
-    }]},
-    "decisions": [], "gaps": [],
-    "lineage": [{"source": "source_maoli_flat.csv", "role": "primary", "note": ""}],
-    "validation": {"required_coverage": [], "required_empty": [], "key_outputs": ["A7"]},
-}
-
 
 def spec_with(wd: dict, **mutations) -> dict:
     import copy
@@ -1629,6 +1468,65 @@ class FillSpecContractTests(unittest.TestCase):
         plan = compile_spec_with(self.wd, spec)
         self.assertEqual(plan["warnings"], [])
 
+    # ── Q8: CLONE_SOURCE_IS_ANCHOR 作用域 (只查 data role) ──
+    def test_anchor_check_applies_to_data_role_only(self):
+        """fixture 锚点 = A5. title/header 克隆源选锚点行无编译检查 (边界已文档化,
+        FILLSPEC Q8 — 公式残留风险标注); data role 克隆源选锚点行 → 拒绝."""
+        for role in ("title", "header"):
+            spec = spec_with(self.wd)
+            spec["mapping"]["targets"][0]["clone_roles"] = [
+                {"role": role, "template_row": 5, "value": "X"},
+                {"role": "data", "template_row": 7},
+            ]
+            self.assertEqual(self._fail_codes(spec), [],
+                             f"{role} 克隆源=锚点行应无编译检查 (文档化边界)")
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "title", "template_row": 2, "value": "X"},
+            {"role": "data", "template_row": 5},
+        ]
+        self.assertIn("CLONE_SOURCE_IS_ANCHOR", self._fail_codes(spec))
+
+    # ── Q9: title/header value 延迟到 fills 阶段 (adds 之后) ──
+    def test_title_value_written_after_all_adds(self):
+        """标题值 op 恒在所有 add/remove 之后 (deferred_values — 防 duplicate_row:
+        add 之间穿插 cell 写入破坏 officecli 行簿记)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "spacer"},
+            {"role": "title", "template_row": 1, "value": "HDR"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        spec["validation"]["key_outputs"] = ["A8"]  # spacer 后移: 数据行 8-10
+        plan = compile_spec_with(self.wd, spec)
+        ops = plan["operations"]
+        last_add = max(i for i, o in enumerate(ops) if o["command"] == "add")
+        title_idx = next(i for i, o in enumerate(ops)
+                         if o["command"] == "set"
+                         and o.get("props", {}).get("value") == "HDR")
+        self.assertGreater(title_idx, last_add)
+        # add 之间不得穿插任何 cell 写入
+        add_positions = [i for i, o in enumerate(ops) if o["command"] == "add"]
+        for a, b in zip(add_positions, add_positions[1:]):
+            self.assertTrue(all(ops[i]["command"] == "add"
+                                for i in range(a + 1, b)),
+                            "add 之间穿插非 add op")
+
+    # ── Q10: readback 断言种类 (register 语义) ──
+    def test_readback_kinds_by_write_source(self):
+        """value→值断言; nulls/清空→EMPTY; 公式/合并锚点→nonempty; 一格一 kind."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {"per_row": {"F": "A{r}*2"}}
+        plan = compile_spec_with(self.wd, spec)
+        by_kind = {}
+        for rb in plan["readback"]:
+            by_kind.setdefault(rb["kind"], []).append(rb["path"])
+        self.assertIn("/S/D7", by_kind["empty"])     # nulls (BASE_SPEC D 列) → EMPTY
+        self.assertIn("/S/A7", by_kind["value"])     # 列映射 → 值断言
+        self.assertIn("/S/F7", by_kind["nonempty"])  # per_row 公式 → nonempty
+        self.assertEqual(len({rb["path"] for rb in plan["readback"]}),
+                         len(plan["readback"]), "一格一断言")
 
 class CapabilityMappingContractTests(unittest.TestCase):
     """能力映射表 (FILLSPEC「能力映射表」章节) 的编译用例背书.
@@ -1761,6 +1659,161 @@ class CapabilityMappingContractTests(unittest.TestCase):
         self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", self._fail_codes(spec))
 
 
+class ProbeTests(unittest.TestCase):
+    """compile_fill.py --probe: compile-only verification, zero side effects.
+
+    The probe runs the exact same pipeline as a real compile — its answer is
+    authoritative and always matches what a full compile would do."""
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _probe(self, spec) -> dict:
+        return compile_fill.probe_spec(spec, self.wd["manifest"], self.tmp)
+
+    def test_probe_accepted_spec(self):
+        spec = spec_with(self.wd)
+        r = self._probe(spec)
+        self.assertTrue(r["accepted"])
+        self.assertEqual(r["exit_code"], 0)
+        self.assertGreater(r["operations"], 0)
+        self.assertEqual(r["defects"], [])
+
+    def test_probe_rejected_with_code(self):
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["group_merges"] = [{"col": "A", "group_by": "A"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [{"col": "A", "rows": "1:{n}",
+                            "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        r = self._probe(spec)
+        self.assertFalse(r["accepted"])
+        self.assertEqual(r["exit_code"], 3)
+        self.assertEqual(r["code"], "STATIC_VALIDATION_FAILED")
+        codes = {d["code"] for d in r["defects"]}
+        self.assertIn("DUPLICATE_TARGET_WRITE", codes)
+
+    def test_probe_matches_full_compile(self):
+        """probe 结论与完整编译一致 (同管线, 不会出现 probe 通过但 compile 拒绝)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"G": "IFERROR(ROUND(A{r}-B{r},2),0)"}}
+        r = self._probe(spec)
+        self.assertTrue(r["accepted"])
+        plan = compile_spec_with(self.wd, spec)
+        self.assertEqual(r["operations"], len(plan["operations"]))
+
+    def test_probe_writes_no_artifacts(self):
+        """probe 零副作用: 不写 execution_plan.json / mapping.md / run_timing.json."""
+        spec = spec_with(self.wd)
+        self._probe(spec)
+        self.assertFalse((self.tmp / "execution_plan.json").exists())
+        self.assertFalse((self.tmp / "mapping.md").exists())
+        self.assertFalse((self.tmp / "run_timing.json").exists())
+
+    def test_probe_rejected_writes_no_artifacts(self):
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [{"col": "G", "rows": "1:9",
+                            "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        r = self._probe(spec)
+        self.assertFalse(r["accepted"])
+        self.assertFalse((self.tmp / "execution_plan.json").exists())
+        self.assertFalse((self.tmp / "mapping.md").exists())
+        self.assertFalse((self.tmp / "run_timing.json").exists())
+
+
+class CapabilitiesTests(unittest.TestCase):
+    """compile_fill.py --capabilities: the contract matrix as the compiler
+    itself judges it — same PROBE_CASES list as the contract tests, so the
+    runtime report, the tests and FILLSPEC.md can never drift apart."""
+
+    def test_capabilities_matrix_matches_expectations(self):
+        from _probe_fixtures import PROBE_CASES
+        with tempfile.TemporaryDirectory() as tmp:
+            results = compile_fill.run_probe_cases(Path(tmp))
+        by_id = {r["id"]: r for r in results}
+        self.assertEqual(sorted(by_id), sorted(c["id"] for c in PROBE_CASES))
+        for case in PROBE_CASES:
+            r = by_id[case["id"]]
+            if case["expect"] == "accept":
+                self.assertTrue(r["accepted"], f"{case['id']} 应被接受")
+                self.assertIsNone(r["code"])
+            else:
+                self.assertFalse(r["accepted"], f"{case['id']} 应被拒绝")
+                self.assertEqual(r["code"], case["expect"],
+                                 f"{case['id']} 错误码应为 {case['expect']}")
+
+    def test_capabilities_covers_contract_claims(self):
+        """契约关键组合必须在 capabilities 报告中 (防探针集被误删)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            results = compile_fill.run_probe_cases(Path(tmp))
+        by_id = {r["id"]: r for r in results}
+        for cid in ("group_merges_aggregate_same_col", "group_merges_aggregate_diff_col",
+                    "derived_subtraction_pattern", "mapped_group_column_anchor",
+                    "lookup_missing_empty", "precision_keep", "per_group_total_blocks",
+                    "pptx_group_merges"):
+            self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
+
+
+class ProbeScaffoldTests(unittest.TestCase):
+    """make_probe_spec.py: skeleton spec with fingerprints/inputs auto-filled
+    from the manifest — the boilerplate elimination that makes --probe cheap."""
+
+    def _scaffold(self, tmp: Path) -> dict:
+        import json as _json
+        import subprocess
+        sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+        out = tmp / "probe_spec.yaml"
+        r = subprocess.run(
+            [sys.executable, str(SKILL_ROOT / "scripts" / "make_probe_spec.py"),
+             "--workdir", str(tmp), "--out", str(out)],
+            capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = _json.loads(r.stdout)
+        self.assertEqual(payload["code"], "PROBE_SCAFFOLD_WRITTEN")
+        text = out.read_text(encoding="utf-8")
+        return _json.loads(text[text.index("{"):])  # 跳过注释头
+
+    def test_scaffold_fills_fingerprints_and_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            spec = self._scaffold(tmp)
+            mfp = wd["manifest"]["fingerprints"]
+            self.assertEqual(spec["fingerprints"]["source_structure"], mfp["source_structure"])
+            self.assertEqual(spec["fingerprints"]["target_structure"], mfp["target_structure"])
+            self.assertEqual(spec["inputs"]["target"], "target.xlsx")
+            self.assertEqual(spec["inputs"]["target_sheet"], "S")
+            self.assertEqual(spec["inputs"]["sources"], ["source_maoli.xlsx"])
+
+    def test_scaffold_probes_without_fingerprint_mismatch(self):
+        """骨架生成的 spec 直接 probe 不因指纹报错 (样板是骨架, 结果接受与否
+        取决于片段; 至少不该死在指纹样板手上)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            spec = self._scaffold(tmp)
+            r = compile_fill.probe_spec(spec, wd["manifest"], tmp)
+            self.assertNotEqual(r.get("code"), "FILLSPEC_FINGERPRINT_MISMATCH")
+            self.assertIn("accepted", r)
+
+    def test_scaffold_missing_manifest_fails(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "make_probe_spec.py"),
+                 "--workdir", tmp, "--out", str(Path(tmp) / "p.yaml")],
+                capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(r.returncode, 3)
+            self.assertIn("MANIFEST_NOT_FOUND", r.stdout)
+
+
 class DocCoverageGuardTests(unittest.TestCase):
     """doc-coverage 守卫: 关键交互词必须留在文档中, 章节被误删时测试变红.
 
@@ -1829,6 +1882,73 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
         self.assertIn("precision: keep", text)
         self.assertIn("scratch", text)
+
+    def test_skill_md_probe_rules(self):
+        """SKILL.md 撰写规程: probe 是唯一允许的确认手段 (防规程被误删)."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("--probe", text)
+        self.assertIn("--capabilities", text)
+        self.assertIn("make_probe_spec.py", text)
+
+    def test_combination_patterns_exist(self):
+        """assets/combination_patterns.yaml 存在且含关键模式 (防模板被误删)."""
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        self.assertTrue(p.is_file(), "缺 assets/combination_patterns.yaml")
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("group_merges", text)
+        self.assertIn("round4", text)
+
+    def test_fillspec_q8_anchor_scope_words(self):
+        """契约章节含 Q8 小节: data role 作用域 + title/header 无检查边界."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q8:.*\n", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q8 小节")
+        q8 = section[m.end():]
+        self.assertIn("data", q8)
+        self.assertIn("title/header", q8)
+
+    def test_fillspec_q9_q10_sections(self):
+        """契约章节含 Q9 (value 延迟写入) 与 Q10 (readback 种类) 小节."""
+        section = self._fillspec_section("组合行为契约")
+        self.assertIsNotNone(re.search(r"^### Q9:", section, re.MULTILINE), "缺 Q9")
+        self.assertIsNotNone(re.search(r"^### Q10:", section, re.MULTILINE), "缺 Q10")
+        self.assertIn("deferred_values", section)
+        self.assertIn("nonempty", section)
+
+    def test_skill_md_failure_cost_quantified(self):
+        """SKILL.md 撰写规程量化失败成本: 第 1 轮失败是预期路径, 修复 <2 分钟,
+        预算约束连续失败而非单次失败 (消除'怕失败读源码'的动机)."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("预期路径", text)
+        self.assertIn("2 分钟", text)
+        self.assertIn("连续失败", text)
+
+    def test_fillspec_q11_q12_sections(self):
+        """契约章节含 Q11 (克隆携带合并) 与 Q12 (merges×aggregates/多组聚合)."""
+        section = self._fillspec_section("组合行为契约")
+        self.assertIsNotNone(re.search(r"^### Q11:", section, re.MULTILINE), "缺 Q11")
+        self.assertIsNotNone(re.search(r"^### Q12:", section, re.MULTILINE), "缺 Q12")
+        self.assertIn("mergeCell", section)
+        self.assertIn("显式范围", section)
+
+    def test_known_traps_spike_facts(self):
+        """KNOWN_TRAPS 沉淀已 spike 机械事实 (克隆携带合并 / merges×aggregates)."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        self.assertIn("克隆携带合并", text)
+        self.assertIn("mergeCell", text)
+        self.assertIn("A41:F41", text)
+
+    def test_mod_index_execution_boundary(self):
+        """MOD_INDEX 标注执行 vs 治理文档边界: 执行任务不读 MOD_TEMPLATE."""
+        text = (SKILL_ROOT / "references" / "MOD_INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("不读", text)
+        self.assertIn("MOD_TEMPLATE", text)
+
+    def test_skill_md_prepare_sheets_all_at_once(self):
+        """SKILL.md prepare 阶段 B: 一次列出全部源 sheet, 增量展平是兜底."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("一次列出全部源 sheet", text)
+        self.assertIn("兜底", text)
 
 
 if __name__ == "__main__":
