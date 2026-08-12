@@ -33,7 +33,9 @@ def main() -> None:
     parser.add_argument("--workdir", type=Path, required=True,
                         help="prepared workdir with prepare_manifest.json")
     parser.add_argument("--out", type=Path, default=None,
-                        help="output path (default <workdir>/fill_spec.yaml)")
+                        help="output path (default <workdir>/probe_spec.yaml)")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite an existing output file")
     args = parser.parse_args()
 
     import _probe_fixtures as pf
@@ -63,11 +65,21 @@ def main() -> None:
         for e in manifest["flattened"] if e["name"] != target["name"]
     ]
 
-    out = args.out or (args.workdir / "fill_spec.yaml")
+    out = args.out or (args.workdir / "probe_spec.yaml")
+    if out.is_file() and not args.force:
+        print(json.dumps({
+            "status": "ERROR", "code": "PROBE_SCAFFOLD_EXISTS",
+            "path": str(out),
+            "message": f"{out.name} already exists — a real fill_spec.yaml or "
+                       "a previous scaffold must not be silently overwritten",
+            "corrective_action": "Pick a new --out path, or pass --force to "
+                                 "overwrite (you know what you are replacing)",
+        }, ensure_ascii=False, indent=2))
+        sys.exit(3)
     out.write_text(
         "# probe scaffold — SKELETON, edit clone_roles/columns/rows to your "
         "target's real structure (digest is the source of truth), then:\n"
-        "#   python scripts/compile_fill.py --probe --spec fill_spec.yaml --workdir <dir>\n"
+        f"#   python scripts/compile_fill.py --probe --spec {out.name} --workdir <dir>\n"
         + json.dumps(spec, ensure_ascii=False, indent=2),
         encoding="utf-8")
 

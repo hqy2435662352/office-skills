@@ -45,28 +45,7 @@ except ImportError:
 
 MANIFEST_NAME = "prepare_manifest.json"
 
-def _record_timing(workdir: Path, phase: str) -> None:
-    """Append one phase record to run_timing.json (observability)."""
-    import json as _json
-    import time as _time
-    entry = {
-        "phase": phase,
-        "started_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "duration_ms": round((_time.perf_counter() - _T0) * 1000),
-    }
-    path = workdir / "run_timing.json"
-    try:
-        data = []
-        if path.is_file():
-            data = _json.loads(path.read_text(encoding="utf-8"))
-        data.append(entry)
-        path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except (OSError, ValueError):
-        pass
-
-
-_T0 = __import__("time").perf_counter()
-
+from _officecli import ensure_utf8_stdio, fail, record_timing  # noqa: E402
 PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
 
@@ -83,29 +62,6 @@ STYLE_DEFAULTS = {
         "alignment.vertical": "center",
     },
 }
-
-
-def _utf8_stdio() -> None:
-    import sys as _s
-    for _st in (_s.stdout, _s.stderr):
-        try:
-            _st.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-
-def fail(code: str, message: str, corrective_action: str,
-         defects: list | None = None, exit_code: int = 3) -> None:
-    payload = {
-        "status": "ERROR", "code": code,
-        "message": message, "corrective_action": corrective_action,
-    }
-    if defects is not None:
-        payload["defects"] = defects
-    sys.stderr.write(json.dumps(payload, ensure_ascii=False, indent=2))
-    sys.exit(exit_code)
-
-
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1773,7 +1729,6 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             [r for m in matched for r in m["matched"]], bcfg, num_cols,
             lookups, transforms, defects)
         drs = []
-        miter = iter([r for m in matched for r in m["matched"]])
         # map materialized rows back to their source csv
         src_of = []
         for m in matched:
@@ -2103,7 +2058,7 @@ def run_probe_cases(workdir: Path) -> list[dict]:
 
 
 def main() -> None:
-    _utf8_stdio()
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Compiler: FillSpec → execution plan + mapping")
     parser.add_argument("--spec", type=Path, help="fill_spec.yaml (required unless --capabilities)")
     parser.add_argument("--workdir", type=Path, help="workdir (required unless --capabilities)")
@@ -2150,7 +2105,7 @@ def main() -> None:
     mapping_path = args.workdir / MAPPING_NAME
     mapping_path.write_text(render_mapping(spec, plan, manifest), encoding="utf-8")
 
-    _record_timing(args.workdir, "compile")
+    record_timing(args.workdir, "compile")
     print(json.dumps({
         "status": "SUCCESS", "code": "PLAN_GENERATED",
         "operations": len(plan["operations"]),

@@ -40,6 +40,11 @@ import re
 import sys
 from pathlib import Path
 
+from _officecli import (  # noqa: E402
+    ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
+    sha256_file,
+)
+
 SEMANTIC_KEYWORDS = {
     "quotation": ["报价", "核价", "毛利", "汇总", "迁移", "回写", "填表", "核价表"],
     "quotation_summary_migration": ["报价", "汇总", "毛利", "迁移", "回写"],
@@ -62,23 +67,6 @@ DIGEST_SIGNALS = {
     "dimension_set", "measure_set", "formula_chain", "block_layout",
     "unit_convention", "time_granularity",
 }
-
-
-def _utf8_stdio() -> None:
-    import sys as _s
-    for _st in (_s.stdout, _s.stderr):
-        try:
-            _st.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-
-def fail(code: str, message: str, corrective_action: str, exit_code: int = 1) -> None:
-    sys.stderr.write(json.dumps({
-        "status": "ERROR", "code": code,
-        "message": message, "corrective_action": corrective_action,
-    }, ensure_ascii=False, indent=2))
-    sys.exit(exit_code)
 
 
 def parse_index(path: Path) -> list[dict]:

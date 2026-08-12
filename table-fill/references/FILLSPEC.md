@@ -340,7 +340,9 @@ formulas:
 |---|---|---|
 | 列映射 / sets 值 / 标题 value | `value` | 数字归一化比较 (`$138.00` vs `138`) |
 | nulls / required_empty / 清空 | `empty` | 断言 EMPTY |
-| per_row 公式 / aggregates / 合并锚点 | `nonempty` | 断言非空 (公式结果编译期不可确定) |
+| per_row 公式 / aggregates | `nonempty` | 断言非空 (公式结果编译期不可确定) |
+| group 锚点 (映射值/label/清空) | `value` / `empty` | 按锚点写什么断言什么 |
+| plain `merges` (1:{n}) | **无 readback** | merges 只写 merge 属性不写值, 不注册断言 |
 
 - 每格恰好一种 kind (一格一 owner); 同一格被两种写入来源命中 →
   `DUPLICATE_TARGET_WRITE`。

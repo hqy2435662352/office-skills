@@ -1385,6 +1385,76 @@ class FillSpecContractTests(unittest.TestCase):
             codes = self._fail_codes(spec)
             self.assertNotIn("NULLS_ROWS_INVALID", codes, f"rows={rows!r}")
 
+    def test_plain_merges_register_no_readback(self):
+        """Q10: plain merges (1:{n}) 只写 merge 属性, 不产生 readback 条目."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["merges"] = [
+            {"col": "E", "rows": "1:{n}", "style": "label"}]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        e_readback = [rb for rb in plan["readback"] if rb["path"].startswith("/S/E")]
+        self.assertEqual(e_readback, [])
+        merges = [op["props"]["merge"] for op in plan["operations"]
+                  if op.get("props", {}).get("merge")]
+        self.assertEqual(merges, ["E7:E9"])
+
+    def test_title_clone_from_anchor_row_ok(self):
+        """Q8: title/header 的 template_row 选锚点行无编译检查 (编译通过),
+        data 的 template_row 选锚点行 → CLONE_SOURCE_IS_ANCHOR."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "title", "template_row": 5, "value": "块标题"},  # A5:A6 锚点
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        self.assertEqual(self._fail_codes(spec), [])
+        spec2 = spec_with(self.wd)
+        spec2["mapping"]["targets"][0]["clone_roles"][2]["template_row"] = 5
+        self.assertIn("CLONE_SOURCE_IS_ANCHOR", self._fail_codes(spec2))
+
+    def test_title_value_deferred_to_fill_phase(self):
+        """Q9: 标题 value 延迟到 adds 之后写入 (op 顺序恒为 add→...→set)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "title", "template_row": 1, "value": "块标题"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        kinds = [op["command"] for op in plan["operations"]]
+        first_set = kinds.index("set")
+        self.assertNotIn("set", kinds[:first_set])
+        self.assertGreater(kinds.count("add"), 0)
+
+    def test_merges_and_aggregates_same_column_ok(self):
+        """Q12: merges 1:{n} + aggregates 1:{n} 同列 — 编译通过
+        (聚合锚点 = 块首行 = 合并锚点)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["merges"] = [
+            {"col": "E", "rows": "1:{n}", "style": "label"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [{"col": "E", "rows": "1:{n}",
+                            "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertEqual(self._fail_codes(spec), [])
+
+    def test_multi_range_aggregates_same_column(self):
+        """Q12: 同列多条显式范围聚合 — 编译通过, 每条落在各自显式行
+        (块内多组小计行写法)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [
+                {"col": "E", "rows": "1:2",
+                 "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+                {"col": "E", "rows": "3:3",
+                 "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+            ]}
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        agg_paths = [op["path"] for op in plan["operations"]
+                     if "formula" in op.get("props", {}) and "SUM" in op["props"]["formula"]]
+        self.assertEqual(agg_paths, ["/S/E7", "/S/E9"])
+
     def test_merges_and_per_row_formula_same_column_ok(self):
         """merges (1:{n}) 只写 merge 属性不写值 → 无映射的列上可与 per_row
         公式共存 — 编译通过."""
