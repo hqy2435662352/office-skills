@@ -3144,11 +3144,15 @@ class ModCatalogIndexTests(unittest.TestCase):
         self.assertEqual(e.visibility, "private")
 
     def test_live_index_revisions_synced_with_mod_files(self):
-        """真实 MOD_INDEX 与 MOD 文件头修订号一致 (漂移守护)."""
+        """真实 MOD_INDEX 与 MOD 文件头修订号一致 (漂移守护).
+
+        发布仓库不携带私有客户 MOD — Registered MODs 为空时本守卫跳过
+        (私有 MOD 随捕获流程存在于本地, 不随 office-skills 推送)."""
         refs = SKILL_ROOT / "references"
         index_text = (refs / "MOD_INDEX.md").read_text(encoding="utf-8")
         entries = parse_mod_index(index_text)
-        self.assertTrue(entries, "MOD_INDEX 无已注册 MOD")
+        if not entries:
+            return
         for entry in entries:
             mod_file = refs / entry.path
             self.assertTrue(mod_file.is_file(), f"索引指向缺失文件: {entry.path}")

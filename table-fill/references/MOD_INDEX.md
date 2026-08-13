@@ -40,8 +40,8 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
 ## Registered MODs
 
 | MOD Name | Aliases | Scope Signals (+) | Exclusion Signals (-) | Path | Revision | Visibility |
-| tcl_quotation_summary_migration | tcl-quote-migration | semantic_type::quotation,target_title::报价汇总,source_pattern::毛利表*,target_pattern::报价汇总*,sheet_marker::三三三\|333,dimension_set::product_sku,formula_chain::net_price_to_total_margin,block_layout::repeated_24_role_history_blocks | 目标缺少24角色表头指纹(数量,报价,净价,原型机成本,结算价,净收入,毛利,单机型损益率,系列盈亏,总盈亏) | MOD_tcl_quotation_summary_migration.md | 5 | private |
-| tcl_cost_reply_to_quotation_summary_block | tcl-email-quote-block | semantic_type::cost_reply_to_quotation_summary_block,source_pattern::*核价邮件*,target_pattern::*报价*,sheet_marker::三三三\|333,dimension_set::product_sku,measure_set::prototype_cost,formula_chain::net_price_to_total_margin,block_layout::repeated_quotation_history_blocks | 目标缺少客户Sheet重复批次块或Z码和原型机成本角色 | MOD_tcl_cost_reply_to_quotation_summary_block.md | 2 | private |
+|---|---|---|---|---|---|---|
+| _(no MOD registered — 暂无注册 MOD: 私有客户 MOD 不随发布推送, 见「Adding a MOD」捕获流程)_ | | | | | | |
 
 ## 提名流程 (L0.5 — 展平前)
 
