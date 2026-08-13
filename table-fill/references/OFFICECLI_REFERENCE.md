@@ -15,9 +15,10 @@ subprocess.run(["officecli", "batch", "file.xlsx", "--input", "batch.json"], ...
 
 **所有 officecli 写操作直接修改文件**，不需要额外保存步骤。这与 openpyxl 的 `wb.save()` 模式完全不同——如果用 openpyxl 的思维去理解 officecli，会误以为需要 `open` 显式打开文件。
 
-## batch JSON 格式（Layer 3/4 主要执行机制）
+## batch JSON 格式（执行机制）
 
-Layer 3 的 LLM 直接生成 batch.json，Layer 4 用 `officecli batch` 执行。格式：
+V2 中 batch JSON 由 `compile_fill.py` 生成 (execution_plan.json 的 operations 段),
+LLM 不直接生成。`execute_batch.py` 用 `officecli batch` 执行。格式：
 
 ```json
 [

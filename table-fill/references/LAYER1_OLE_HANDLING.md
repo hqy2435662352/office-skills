@@ -31,7 +31,7 @@ python scripts/extract_ole.py --input file.pptx --slide 14 --output-dir 展平�
 
 提取后的 xlsx 视为普通源文件：
 1. 用 `flatten_source.py` 展平
-2. Layer 2 分类 → Layer 3 映射 → Layer 4 用 officecli 填充
+2. MOD Resolution → FillSpec 映射 → 用 officecli 填充
 
 ## 输出
 
