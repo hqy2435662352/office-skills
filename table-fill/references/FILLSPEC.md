@@ -201,6 +201,12 @@ transforms 支持 `regex_replace` (pattern/replacement) 与 `strip`; 另有内�
 Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` → 编译失败
 并列出缺失 key; `missing: empty` → 留空。
 
+**索引输入 sheet 排除目标 sheet**: 构建 inheritance 索引时**禁止把本次填充的
+目标 sheet 作为输入** — 目标 sheet 的既有数据是历史输出, 不是字段权威源;
+把它喂进索引会产生自引用: 同 SKU 在不同 sheet 的多值 → 共识 conflict → 按
+缺失处理 (静默留空, 常见排查线索见 KNOWN_TRAPS)。索引输入只用独立数据 sheet
+(如埃及 FRESH 的 01_埃及机型、09_Fresh拖多)。
+
 ### formulas / merges / nulls
 
 - 模板键: `{r}` (数据行), `{r1}`/`{r2}` (聚合起止), `{n}` (数据行数)。缺键报错。
@@ -431,7 +437,9 @@ formulas:
 - 修复 `LOOKUP_TABLE_EMPTY`: 检查索引结构 (`field_consensus` 是否存在 / 是否被
   手工改写), 用 `build_inheritance_index.py` **重建索引** — 禁止手改 JSON。
 - `LOOKUP_COLUMN_ALL_MISSING` 出现时判断: 真缺失 (keys 不在索引 → 记 gaps) 还是
-  索引坏了 (结构问题 → 重建索引)。
+  索引坏了 (结构问题 → 重建索引) — 重建前先检查**索引输入是否误含目标 sheet**
+  (自引用: 目标 sheet 既有块与独立数据 sheet 同 SKU 多值 → 共识 conflict →
+  按缺失处理, 表现与"整列未命中"相同, 见 KNOWN_TRAPS)。
 
 ## 执行顺序保证 (Execution Order Contract)
 
@@ -623,7 +631,7 @@ digest, 不要 unzip sheet XML 考古。
 | NUMERIC_OVERFLOW_RISK | 直接值 >4 位小数 / >12 位有效数字 (成本 15 位精度) | 加 `transform: round4` 或 `precision: keep` |
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
 | LOOKUP_TABLE_EMPTY | 索引归一化后为空 (field_consensus 丢失 / 文件被手工改写) | 检查索引结构, 用 build_inheritance_index.py 重建 — 禁止手改 JSON |
-| LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建) |
+| LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建); 重建前检查索引输入是否误含目标 sheet (自引用 → 共识 conflict → 缺失) |
 | REQUIRED_COVERAGE_UNMATCHED | 必需源行未消费 | 修 selectors 或记入 gaps |
 | SPEC_TARGETS_TOO_MANY | 声明了多个目标 | 每次运行只编译一个目标 |
 | CLONE_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分行, 其余行残留克隆值 | 用 rows: all 或加列映射 |

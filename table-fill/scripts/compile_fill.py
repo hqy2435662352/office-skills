@@ -835,8 +835,11 @@ def note_lookup_all_missing(stats: dict, warnings: list) -> None:
 
     LOOKUP_COLUMN_ALL_MISSING (warn-only, compile proceeds): a non-empty index
     whose keys never hit may be a genuine absence (record as gaps — e.g. the
-    Egypt FRESH 商用风管 SKU really is not in the index) or a broken index;
-    either way an entire column of silent blanks must not pass unremarked."""
+    Egypt FRESH 商用风管 SKU really is not in the index), a broken index, or a
+    self-referencing index (the fill target sheet fed in as an index input —
+    its historical rows are outputs, not field authority, and collide with
+    independent data sheets into consensus conflicts); either way an entire
+    column of silent blanks must not pass unremarked."""
     for (name, tcol), cur in sorted(stats.items()):
         if cur["total"] > 0 and cur["missing"] == cur["total"]:
             warnings.append({
@@ -844,11 +847,19 @@ def note_lookup_all_missing(stats: dict, warnings: list) -> None:
                 "message": f"lookup column {tcol} (lookup {name!r}) resolved to "
                            f"empty for ALL {cur['total']} row(s) — either the keys "
                            "are genuinely absent from the index (record them as "
-                           "gaps) or the index file is broken",
+                           "gaps), the index file is broken, or the index input "
+                           "included the target sheet itself",
                 "corrective_action": "Check the index file (field_consensus still "
                                      "present? rebuilt with "
-                                     "build_inheritance_index.py?); if the keys "
-                                     "really are absent, record them as gaps",
+                                     "build_inheritance_index.py?); check the "
+                                     "index input sheets exclude the target sheet "
+                                     "of this fill (a self-referencing index "
+                                     "collides historical rows of the target "
+                                     "sheet with independent data sheets into "
+                                     "consensus conflicts, so keys go missing — "
+                                     "build the index from independent data "
+                                     "sheets only); if the keys really are "
+                                     "absent, record them as gaps",
             })
 
 

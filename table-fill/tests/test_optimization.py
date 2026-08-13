@@ -753,6 +753,19 @@ class LookupNormalizeTests(unittest.TestCase):
                 ["", "", ""])  # 全列留空但不再静默
             self.assertGreater(len(plan["operations"]), 0)  # 警告不阻断编译
 
+    def test_lookup_all_missing_corrective_action_self_reference(self):
+        """整列未命中 corrective_action 提示索引输入自引用排查 (埃及 FRESH 坑 2:
+        目标 sheet 误作索引输入 → 同 SKU 多值 → 共识 conflict → 静默缺失)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_all_missing_lookup_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], Path(tmp))
+            w = next(w for w in plan["warnings"]
+                     if w["code"] == "LOOKUP_COLUMN_ALL_MISSING")
+            self.assertIn("target sheet", w["corrective_action"])
+            self.assertIn("index input", w["corrective_action"])
+
     def test_lookup_column_partial_miss_no_warning(self):
         """部分命中 (部分行缺失是合法 gaps) → 不触发全列警告."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3207,6 +3220,34 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("LOOKUP_TABLE_EMPTY", text)
         self.assertIn("手改 JSON", text)
         self.assertIn("build_inheritance_index.py", text)
+
+    def test_fillspec_lookups_source_excludes_target(self):
+        """「lookups」契约条目: 索引输入 sheet 排除目标 sheet — 自引用 → 共识
+        conflict → 按缺失处理 (静默), 排查线索见 KNOWN_TRAPS (埃及 FRESH 坑 2)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(encoding="utf-8")
+        m = re.search(r"^### lookups\s*$", text, re.MULTILINE)
+        self.assertIsNotNone(m, "FILLSPEC.md 缺 ### lookups 小节")
+        nxt = re.search(r"^### ", text[m.end():], re.MULTILINE)
+        section = text[m.end():m.end() + (nxt.start() if nxt else len(text))]
+        self.assertIn("目标 sheet", section)
+        self.assertIn("自引用", section)
+        self.assertIn("KNOWN_TRAPS", section)
+
+    def test_fillspec_q15_self_reference_hint(self):
+        """Q15 整列未命中排查含自引用线索 (索引输入误含目标 sheet)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q15:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q15 小节")
+        q15 = section[m.end():]
+        self.assertIn("目标 sheet", q15)
+        self.assertIn("自引用", q15)
+
+    def test_known_traps_lookup_source_self_reference(self):
+        """KNOWN_TRAPS 沉淀索引自引用机械事实: 输入含目标 sheet → 同 SKU 多值
+        → 共识 conflict → 按缺失处理; 构建索引只喂独立数据 sheet."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        self.assertIn("目标 sheet", text)
+        self.assertIn("共识 conflict", text)
 
     def test_fillspec_layout_decision_tree_style_first(self):
         """FILLSPEC 布局决策树: 以样式为第一判定条件 (带样式分支先于裸行分支),
