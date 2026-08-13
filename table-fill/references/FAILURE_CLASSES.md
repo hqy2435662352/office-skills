@@ -22,7 +22,7 @@ repair 预算内的验证次数)。
 | `path_permission` | Access denied / Permission denied | ASCII workdir; 文件非只读 (`force_writable`); 中文路径先 stage | Windows 中文路径 set/batch Access denied |
 | `duplicate_row` (2026-08-10) | XML 出现两个 `<row r=N>`, 部分格读写落错元素 | 根因: 在 add 操作之间穿插 cell 写入 (如标题克隆后立即写 value) 破坏 officecli 行簿记。修复: 所有 cell 写入移到 add/remove 之后 — **Compiler 已内置此排序**; 若复现, 检查 fill_spec 是否经 compile_fill.py 生成 plan | 标题 value 写在 data add 之前 → row 25 重复 |
 | `unknown` | 无法自动分类 | 读失败记录原始字段 + KNOWN_TRAPS.md 人工判定 | — |
-| `row_anchor_missing` | officecli 报 `Anchor row N not found` | 行号空洞: 目标 sheet row 元素 r 值不连续, `add after/from /row[N]` 锚点不存在 → 用 `scripts/repair_row_gaps.py --workdir <dir>` 物化缺失行 → 重跑 `prepare_run.py --flatten` (指纹变化) → 更新 spec 指纹 → 重编译 → 重执行 | 埃及模板 1..21, 23..52 缺 22 |
+| `row_anchor_missing` | officecli 报 `Anchor row N not found` | 行号空洞: 目标 sheet row 元素 r 值不连续, `add after/from /row[N]` 锚点不存在 → 用 `scripts/repair_row_gaps.py --workdir <dir>` 物化缺失行 → **指纹自动重算** (脚本自动重跑 flatten) → 更新 spec 指纹 (或 `--patch-spec`) → 重编译 → 重执行 | 埃及模板 1..21, 23..52 缺 22 |
 
 ## v2.5 验证失败码
 

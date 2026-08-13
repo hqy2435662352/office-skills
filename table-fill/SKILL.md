@@ -136,6 +136,11 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
   报错后补跑; 增量展平 (flatten 可多次调用) 是**兜底**不是常态。
 - flatten 可**多次调用增量展平** (如先源后目标、或分 sheet 批次): manifest
   按条目 name 合并, 新覆盖旧, 不互相覆盖。
+- **行号空洞修复 (TEMPLATE_ROW_GAP)**: `scripts/repair_row_gaps.py --workdir <dir>`
+  物化缺失行元素后**自动重跑 flatten (仅目标 sheet) 同步 manifest 指纹** —
+  flatten 不需手工重跑; 唯一动作 = 更新 spec 的 target_structure 指纹
+  (抄 repair 输出 JSON 的 `fingerprints.target_structure`, 或 `--patch-spec`
+  一步完成) + 重编译 (见 FILLSPEC Q16)。
 
 ### 2. MOD Resolution — `mod_nominate.py` (条件中断)
 

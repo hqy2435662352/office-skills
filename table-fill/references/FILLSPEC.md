@@ -449,6 +449,19 @@ formulas:
   (自引用: 目标 sheet 既有块与独立数据 sheet 同 SKU 多值 → 共识 conflict →
   按缺失处理, 表现与"整列未命中"相同, 见 KNOWN_TRAPS)。
 
+### Q16: 模板行号空洞修复后指纹怎么办?
+
+| 情形 | 行为 |
+|---|---|
+| 编译报 `TEMPLATE_ROW_GAP` (exit 3) — 行洞命中 add 锚点/克隆源 | 跑 `scripts/repair_row_gaps.py --workdir <dir>` — 物化缺失行元素, 并**自动重跑 flatten (仅目标 sheet) 同步 prepare_manifest.json 指纹** |
+| 修复后要更新 spec 指纹 | **Agent 不再手工同步** — 脚本输出 JSON 带新 `fingerprints.target_structure`, 抄进 fill_spec.yaml, 或一步完成: `repair_row_gaps.py --workdir <dir> --patch-spec fill_spec.yaml` (外科手术式改写该键, 保留其余内容) |
+| 修复后重编译 | `compile_fill.py --spec fill_spec.yaml --workdir <dir>` — 指纹匹配后正常出 plan |
+
+- 流程保证: **行洞修复 = staged 文件修改 = 指纹必然变化** (机械事实); 指纹
+  同步由 repair 脚本自动完成, 唯一手工动作 = 更新 spec 指纹 + 重编译。
+- 注意: `repair_row_gaps.py` 修复后若仍报空洞 (复见), 先查 `officecli close`
+  刷盘 (脚本已内置), 再查 staged 文件是否被后续 flatten 覆盖过。
+
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
@@ -652,6 +665,7 @@ digest, 不要 unzip sheet XML 考古。
 | INPLACE_NO_CLONE_SOURCE | inplace data role 缺 template_row | 声明非锚点占位行 |
 | INPLACE_REGION_OVERLAP | 前置 add/remove 或 sets 触碰占位区 | base_last_row ≥ 占位区末端; 移除/写入移到区外 |
 | STRUCTURAL_OP_OUT_OF_ZONE | 非终末 inplace 块声明 remove_rows (结构行操作只属于终末 inplace 块的 Trim) | 前置 append 块不声明 remove_rows; 收缩由终末 inplace 块 Trim (编译器推导) |
+| TEMPLATE_ROW_GAP | 目标 sheet 行号空洞命中 add 锚点/克隆源行 | `scripts/repair_row_gaps.py --workdir <dir>` — 指纹自动重算; 更新 spec 指纹 (或 `--patch-spec`) → 重编译 (见 Q16) |
 | REMOVE_TARGETS_APPEND_ZONE | append 块 remove_rows > base_last_row — add 推移行号后 remove 命中新数据行 (自毁 plan) | 首选 **append-only 合法终态**: 占位行自然下沉保留, 无需删除; remove_rows 只能声明 ≤ base_last_row 的模板既有行; 仅当占位行带样式时 inplace 才是条件选项 |
 | PLACEHOLDER_RESIDUE_UNHANDLED | 保留占位行携带未覆盖值 | 加 columns/null/group label |
 | PLACEHOLDER_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分保留行 | rows: all 或列映射 |

@@ -2347,10 +2347,12 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                                        f"{kind} row {a} is a row-number gap in the target "
                                        f"sheet (row elements: missing {row_gaps}) — officecli "
                                        f"`add after/from /row[{a}]` would fail at runtime",
-                            "corrective_action": "Materialize the missing row elements "
-                                                 "(scripts/repair_row_gaps.py --workdir <dir>) "
-                                                 "then re-run prepare_run.py --flatten, update "
-                                                 "the spec fingerprints, and recompile",
+                            "corrective_action": "Materialize the missing row "
+                                                 "elements (scripts/repair_row_gaps.py "
+                                                 "--workdir <dir> — fingerprints "
+                                                 "auto re-synced), then update the "
+                                                 "spec target_structure fingerprint "
+                                                 "(or --patch-spec) and recompile",
                         })
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",

@@ -3440,6 +3440,43 @@ class DocCoverageGuardTests(unittest.TestCase):
                      "group_aggregates", "append-only"):
             self.assertIn(word, text, f"KNOWN_TRAPS 缺机械事实词 {word!r}")
 
+    def test_fillspec_q16_row_gap_fingerprint_sync(self):
+        """契约章节 Q16: repair_row_gaps 自动重跑 flatten 同步 manifest 指纹;
+        唯一手工动作 = 更新 spec 指纹 (或 --patch-spec) + 重编译 (防流程回退
+        到手工三步同步)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q16:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q16 小节")
+        q16 = section[m.end():]
+        for word in ("repair_row_gaps.py", "自动", "指纹", "patch-spec",
+                     "必然变化"):
+            self.assertIn(word, q16)
+
+    def test_error_code_table_has_template_row_gap(self):
+        """TEMPLATE_ROW_GAP 在「常见编译错误速查」表内 (防章节误删)."""
+        table = self._error_code_table()
+        self.assertIn("TEMPLATE_ROW_GAP", table)
+        self.assertIn("repair_row_gaps.py", table)
+
+    def test_known_traps_row_gap_auto_resync(self):
+        """KNOWN_TRAPS 沉淀行洞修复机械事实: 行洞修复 = staged 文件修改 =
+        指纹必然变化; repair 脚本自动重算, Agent 不再手工同步."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        for word in ("指纹必然变化", "自动", "patch-spec", "唯一动作"):
+            self.assertIn(word, text)
+
+    def test_skill_md_repair_auto_flatten(self):
+        """SKILL.md prepare 段: repair 后 flatten 已自动, 唯一动作 = 更新
+        spec 指纹 + 重编译."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        m = re.search(r"^### 1\. Prepare.*?(?=^### 2\.)",
+                      text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "SKILL.md 缺 Prepare 段")
+        section = m.group(0)
+        for word in ("repair_row_gaps.py", "自动重跑 flatten", "patch-spec",
+                     "唯一动作"):
+            self.assertIn(word, section)
+
 
 class ModCatalogIndexTests(unittest.TestCase):
     """MOD_INDEX.md 目录解析: 转义管道 + 修订号漂移守护."""

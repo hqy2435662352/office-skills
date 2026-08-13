@@ -125,7 +125,7 @@ def standard_fix(cls: str) -> str:
         "FINAL_ROW_COUNT_MISMATCH": "最终行数不符: 核对源匹配行数与 capacity/start_row(trim 或 overflow 方向); selectors 是否漏配/误配行; 修 fill_spec.yaml 重编译重执行",
         "GROUP_BOUNDARY_MISMATCH": "组边界不符: 核对 group_by 物化值同值段与预期; 是否 merges/group_merges 同列混用; 残留合并需 lowering 逐行 unmerge(含单格残留); 修 fill_spec.yaml 重编译重执行",
         "RENDER_QA_FAILED": "渲染产物生成失败: png 失败 → 降级 --render html(纯文本模型只做结构渲染检查, 不得声称视觉验证); html 也失败 → 核对 region(plan.render_qa.region)与文件路径",
-        "row_anchor_missing": "行号空洞: 目标 sheet row 元素 r 值不连续, officecli `add after/from /row[N]` 锚点不存在 → 用 scripts/repair_row_gaps.py --workdir <dir> 物化缺失行 → 重跑 prepare_run.py --flatten(指纹变化) → 更新 spec 指纹 → 重编译 → 重执行",
+        "row_anchor_missing": "行号空洞: 目标 sheet row 元素 r 值不连续, officecli `add after/from /row[N]` 锚点不存在 → 用 scripts/repair_row_gaps.py --workdir <dir> 物化缺失行 → 指纹自动重算(脚本自动重跑 flatten) → 更新 spec 指纹(或 --patch-spec) → 重编译 → 重执行",
         "unknown": "无法自动分类: 读取失败记录原始信息, 参考 references/FAILURE_CLASSES.md 人工判定",
     }
     return fixes.get(cls, fixes["unknown"])
