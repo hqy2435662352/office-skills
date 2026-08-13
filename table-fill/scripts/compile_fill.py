@@ -159,6 +159,22 @@ REQUIRED_TOP = ("task", "inputs", "fingerprints", "mapping", "decisions",
                 "gaps", "lineage", "validation")
 
 
+def _bare_scalar_text(item: object) -> str:
+    """Reconstruct the original bare-scalar line text from its parsed form.
+
+    YAML parses `- 追加新历史块: 源文件 ...` into {'追加新历史块': '源文件 ...'};
+    the corrective example must show the text the user actually wrote (a `k: v`
+    join), not the dict repr — repr is not what belongs inside the quotes
+    (2026-08-13 Egypt FRESH: the old hint suggested quoting the whole dict,
+    which is not valid YAML)."""
+    if not isinstance(item, dict):
+        return str(item)
+    text = ": ".join(f"{k}: {_bare_scalar_text(v)}" for k, v in item.items())
+    # The reconstruction is shown inside a double-quoted YAML scalar — escape
+    # embedded quotes/backslashes so the corrective example stays copy-paste-valid.
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def validate_schema(spec: dict, manifest: dict) -> list[dict]:
     defects = []
     for key in REQUIRED_TOP:
@@ -192,8 +208,10 @@ def validate_schema(spec: dict, manifest: dict) -> list[dict]:
                                 "message": f"{list_key}[{i}] is {type(item).__name__} "
                                            f"(value {item!r}) — a bare scalar containing "
                                            f"': ' was parsed as a mapping",
-                                "corrective_action": f"Quote the {list_key} entry: "
-                                                     f'- "{item}" (wrap the whole line in quotes)'})
+                                "corrective_action": f"用双引号包裹整行: "
+                                                     f'- "{_bare_scalar_text(item)}" '
+                                                     f"(wrap the WHOLE line — colon included — "
+                                                     "in double quotes, exactly as written)"})
     lineage = spec.get("lineage")
     if isinstance(lineage, list):
         for i, entry in enumerate(lineage):

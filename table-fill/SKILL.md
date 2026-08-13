@@ -264,8 +264,10 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
   spike; spike 实验**一律使用独立 scratch 文件, staged 文件只读** — 在 staged
   副本上做实验会污染暂存文件, 触发重复 flatten。
 - **YAML 纪律**: 含 `: ` / 引号 / 特殊字符的字符串**统一加引号** —
-  `decisions`/`gaps` 里的裸标量含 `: ` 会被解析成 mapping 而静默丢内容
-  (SPEC_NON_STRING_ITEM 编译兜底仍在, 但不要依赖兜底)。
+  `decisions`/`gaps` 条目含 `: ` 时给**整行** (含冒号) 加双引号:
+  `- "追加新历史块: 源文件 ..."`。漏写 → 裸标量被解析成 mapping 静默丢内容
+  (SPEC_NON_STRING_ITEM exit 3, corrective_action 直接给正确写法 — 兜底仍在,
+  但不要依赖兜底)。
 - **note_phase 合规**: 关键相位至少各记录一次 — `mod_resolution` /
   `spec_authoring` / `compile_review` / `execute_review` / `gate_wait`;
   缺 Agent 相位 → run_timing 不完整, Gate 报告缺 Agent 时间栏。

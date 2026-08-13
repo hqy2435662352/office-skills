@@ -112,6 +112,14 @@ validation:
 
 ## 语义要点
 
+### YAML 纪律 (decisions / gaps)
+
+Q: `decisions`/`gaps` 条目含 `: ` 怎么写? A: **整行双引号包裹** —
+`- "追加新历史块: 源文件 11_FRESH本土 的毛利数据"` (含冒号的裸标量整行加
+双引号, 冒号也在引号内)。漏写 → 裸标量被 YAML 解析成 mapping →
+SPEC_NON_STRING_ITEM (exit 3); corrective_action 直接给正确写法
+(`用双引号包裹整行: - "..."`), 照抄即可 — 不要试图把 dict 包进字符串。
+
 ### clone_roles 与目标布局
 
 `base_last_row` 之后按 clone_roles 顺序分配行号: spacer 占 1 行, title/header
@@ -657,6 +665,7 @@ digest, 不要 unzip sheet XML 考古。
 | LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建); 重建前检查索引输入是否误含目标 sheet (自引用 → 共识 conflict → 缺失) |
 | REQUIRED_COVERAGE_UNMATCHED | 必需源行未消费 | 修 selectors 或记入 gaps |
 | SPEC_TARGETS_TOO_MANY | 声明了多个目标 | 每次运行只编译一个目标 |
+| SPEC_NON_STRING_ITEM | `decisions`/`gaps` 条目被 YAML 解析成 mapping (裸标量含 `: `) | **整行双引号包裹** (含冒号): `- "追加新历史块: 源文件 ..."` — corrective_action 给正确写法, 照抄即可 |
 | CLONE_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分行, 其余行残留克隆值 | 用 rows: all 或加列映射 |
 | PPTX_TARGET_OUT_OF_BOUNDS | 列字母超出表宽 | 检查表列数 |
 | INPLACE_MULTIPLE_BLOCKS | 一个目标声明了多个 inplace 块 | 每目标至多一个 inplace 块 |

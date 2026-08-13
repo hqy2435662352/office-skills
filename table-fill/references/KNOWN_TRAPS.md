@@ -66,7 +66,7 @@
 | **读了源码反而做错决策 (precision: keep 反例)** | Agent 读 `apply_precision_policy` 后自选 `precision: keep` 绕过文档推荐的 `round4` → 第一轮 text_overflow 失败 | 信任 FILLSPEC 推荐次序: `round4` 优先, `keep` 仅列宽足够时; 用编译验证, 不用源码预读 |
 | **staged 副本污染** | spike 实验直接在 staged 副本上做 → 文件被改 → 重新 flatten (+10s 机器 + 心智负担) | spike 永远用独立 **scratch** 文件; staged 文件只读 |
 | **源码阅读代替编译验证** | 为确认一个行为读源码 25 次交互 (机器 63s 的工作拖成 15–25 分钟) | **先写后编译**: compile 一轮 ~0.1s, stderr 缺陷清单 (code + corrective_action) 即权威反馈; 仅「文档未覆盖 且 报错无法解释」才读源码 |
-| **YAML 引号漏写** | `decisions`/`gaps` 含 `: ` 的裸标量被解析成 mapping, 内容静默丢失 | 含 `: `/引号/特殊字符的字符串统一加引号; SPEC_NON_STRING_ITEM 是兜底不是常态 |
+| **YAML 引号漏写** | `decisions`/`gaps` 含 `: ` 的裸标量被解析成 mapping, 内容静默丢失 | 含 `: ` 的条目**整行双引号包裹** (含冒号): `- "追加新历史块: 源文件 ..."` — 漏写 → SPEC_NON_STRING_ITEM (exit 3), corrective_action 给正确写法; 兜底不是常态 |
 | **note_phase 缺失** | run_timing.json 只有 machine 条目, Gate 报告缺 Agent 时间栏 | 关键相位 (mod_resolution/spec_authoring/compile_review/execute_review/gate_wait) 至少各记一次 |
 
 ## 组合行为陷阱 (2026-08-12 实测)

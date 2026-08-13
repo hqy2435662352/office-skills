@@ -1368,6 +1368,35 @@ class DecisionStringTests(unittest.TestCase):
         msg = next(d["message"] for d in defects if d["code"] == "SPEC_NON_STRING_ITEM")
         self.assertIn("': '", msg)
 
+    def test_spec_non_string_item_msg(self):
+        """SPEC_NON_STRING_ITEM corrective_action 直接教整行双引号写法 (含
+        冒号整行加引号), 示例用原文案 (k: v 重构) 而非 dict repr — 埃及 FRESH
+        复盘: 旧建议 `- "{'追加新历史块': '...'}"` 把整个 dict 包成字符串,
+        语法不可行, Agent 得自己领悟."""
+        spec = {
+            "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
+            "inputs": {"sources": ["source_maoli.xlsx"], "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_maoli.xlsx", "sheets": ["s"]}],
+                       "target_sheet": "S"},
+            "fingerprints": {"source_structure": "x", "target_structure": "y"},
+            "mapping": {"targets": [{"sheet": "S"}]},
+            "decisions": [{"追加新历史块": "源文件 11_FRESH本土 的毛利数据"},
+                          {"备注": '源文件 "11" 的毛利'}],
+            "gaps": [],
+            "lineage": [{"source": "s.csv", "role": "primary", "note": ""}],
+            "validation": {"required_coverage": [], "required_empty": [], "key_outputs": []},
+        }
+        defects = compile_fill.validate_schema(spec, {"files": [], "flattened": []})
+        cas = [d["corrective_action"] for d in defects
+               if d["code"] == "SPEC_NON_STRING_ITEM"]
+        self.assertEqual(len(cas), 2)
+        ca = cas[0]
+        self.assertIn("用双引号包裹整行", ca)
+        self.assertIn('- "追加新历史块: 源文件 11_FRESH本土 的毛利数据"', ca)
+        self.assertNotIn("'追加新历史块':", ca)
+        self.assertIn('- "备注: 源文件 \\"11\\" 的毛利"', cas[1],
+                      "值内含双引号时 corrective 示例必须转义, 保持照抄即用")
+
     def test_quoted_decisions_pass(self):
         spec = {
             "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
@@ -3476,6 +3505,50 @@ class DocCoverageGuardTests(unittest.TestCase):
         for word in ("repair_row_gaps.py", "自动重跑 flatten", "patch-spec",
                      "唯一动作"):
             self.assertIn(word, section)
+
+    def test_fillspec_yaml_discipline_whole_line_quote(self):
+        """FILLSPEC「YAML 纪律」契约条目: decisions/gaps 条目含 ': ' →
+        整行双引号包裹 (含冒号), 漏写 → SPEC_NON_STRING_ITEM exit 3,
+        corrective_action 给正确写法 (防契约条目被误删或回退到 dict repr)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(encoding="utf-8")
+        m = re.search(r"^### YAML 纪律", text, re.MULTILINE)
+        self.assertIsNotNone(m, "FILLSPEC.md 缺 ### YAML 纪律 小节")
+        nxt = re.search(r"^### ", text[m.end():], re.MULTILINE)
+        section = text[m.end():m.end() + (nxt.start() if nxt else len(text))]
+        for word in ("整行双引号包裹", "SPEC_NON_STRING_ITEM", "exit 3",
+                     "corrective_action", "冒号"):
+            self.assertIn(word, section)
+        self.assertIn('"追加新历史块', section)
+
+    def test_error_code_table_has_spec_non_string_item(self):
+        """SPEC_NON_STRING_ITEM 在「常见编译错误速查」表内且修复指引为
+        整行双引号包裹 (防误导性修复建议回退)."""
+        table = self._error_code_table()
+        m = re.search(r"^\|\s*SPEC_NON_STRING_ITEM.*$", table, re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 SPEC_NON_STRING_ITEM 行")
+        self.assertIn("整行双引号包裹", m.group(0))
+
+    def test_skill_md_yaml_discipline_whole_line_quote(self):
+        """SKILL.md「YAML 纪律」: decisions/gaps 含 ': ' → 整行 (含冒号)
+        加双引号, 漏写 → SPEC_NON_STRING_ITEM exit 3 (防纪律词被降级为
+        '统一加引号' 的模糊表达)."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        m = re.search(r"^-\s+\*\*YAML 纪律\*\*", text, re.MULTILINE)
+        self.assertIsNotNone(m, "SKILL.md 缺 YAML 纪律 纪律条")
+        nxt = re.search(r"^-\s+\*\*", text[m.end():], re.MULTILINE)
+        bullet = text[m.start():m.start() + (nxt.start() if nxt else 400)]
+        self.assertIn("整行", bullet)
+        self.assertIn("SPEC_NON_STRING_ITEM", bullet)
+
+    def test_known_traps_yaml_quote_mechanical_fact(self):
+        """KNOWN_TRAPS 沉淀 YAML 引号机械事实: 整行双引号包裹 + 漏写 →
+        SPEC_NON_STRING_ITEM exit 3 + corrective_action 给正确写法."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        m = re.search(r"^\|\s*\*\*YAML 引号漏写\*\*.*$", text, re.MULTILINE)
+        self.assertIsNotNone(m, "KNOWN_TRAPS 缺 YAML 引号漏写 行")
+        row = m.group(0)
+        for word in ("整行双引号包裹", "SPEC_NON_STRING_ITEM", "corrective_action"):
+            self.assertIn(word, row)
 
 
 class ModCatalogIndexTests(unittest.TestCase):
