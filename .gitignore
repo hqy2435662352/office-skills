@@ -33,3 +33,11 @@ test_fixtures/
 
 # Hidden system folders
 .playwright-mcp/
+
+# 候选技能目录已并入 canonical suite repo (~/.config/opencode/skills)
+/table-fill-v25-customer-quotation-candidate*
+/table-fill-v3/
+/table-fill-optimized*/
+/table-fill-governance/
+# issue tracker 为本地工作文件, 不追踪
+/.scratch/
