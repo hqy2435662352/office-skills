@@ -403,8 +403,10 @@ def _per_group_total_hardcoded_ranges(spec, wd):
     """每组合计的负面表达 (触发条件已定位, 2026-08-13 契约修正):
     DUPLICATE_TARGET_WRITE 的确切触发因素是 **聚合列 (F) 进了 nulls** —
     nulls 逐行清空先注册锚点格 empty, 聚合再写锚点公式注册 nonempty →
-    锚点双写 (特征 "first as empty"). 同形 spec 去掉该因素 (聚合列不进
-    nulls) 即编译通过, 见 _per_group_total_explicit_ranges."""
+    锚点双写 (特征 "first as empty"). 最小变异实证 (聚合列移出 nulls 列、
+    其余不动 → 编译通过) 见 tests/test_optimization.py →
+    test_per_group_total_trigger_minimal_mutation; 通过形态见
+    _per_group_total_explicit_ranges."""
     _inplace_base(spec, wd)
     _set(spec, "mapping.targets.0.formulas",
          {"aggregates": [

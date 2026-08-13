@@ -1114,6 +1114,27 @@ class InplacePositionModelTests(unittest.TestCase):
         ]
         self._compile_fails_with(spec, "STRUCTURAL_OP_OUT_OF_ZONE")
 
+    def test_per_group_total_trigger_minimal_mutation(self):
+        """每组合计被拒 fixture 的触发因素最小变异实证 (2026-08-13):
+        被拒形态 (聚合列 F 进 nulls D/F) → 只把聚合列移出 nulls 列
+        (F→G, nulls 与其余完全不动) → 编译通过 — 触发因素就是
+        "聚合列进 nulls", 与"硬编码范围"无关."""
+        import _probe_fixtures as pf
+        spec = pf._per_group_total_hardcoded_ranges(
+            copy.deepcopy(BASE_SPEC), self.wd)
+        spec["fingerprints"] = {
+            "source_structure": self.wd["manifest"]["fingerprints"]["source_structure"],
+            "target_structure": self.wd["manifest"]["fingerprints"]["target_structure"],
+        }
+        self._compile_fails_with(spec, "DUPLICATE_TARGET_WRITE")
+        spec["mapping"]["targets"][0]["formulas"]["aggregates"] = [
+            {"col": "G", "rows": "1:2",
+             "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+            {"col": "G", "rows": "3:3",
+             "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+        ]
+        self._compile(spec)  # 不抛 SystemExit = 编译通过
+
     def test_sets_in_region_rejected(self):
         spec = self._spec()
         spec["mapping"]["targets"][0]["sets"] = [{"path": "A8", "value": "x"}]

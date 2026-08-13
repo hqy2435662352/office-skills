@@ -385,8 +385,9 @@ formulas:
   (见能力映射表「每组合计 (动态边界)」行)。
 - 历史纠偏 (2026-08-13): 曾误判「硬编码范围必然漂移 → 正确路径只有拆块」;
   实际拒绝 fixture 的触发因素是**聚合列进了 nulls**, 与"硬编码范围"无关 —
-  同形 spec 去掉该因素即编译通过 (probe 实证, capabilities 矩阵
-  `per_group_total_explicit_ranges` = accept 背书)。
+  最小变异实证 (被拒 fixture 只把聚合列移出 nulls 列、其余不动 → 编译通过,
+  `tests/test_optimization.py` → `test_per_group_total_trigger_minimal_mutation`);
+  capabilities 矩阵同时背书通过形态 (`per_group_total_explicit_ranges` = accept)。
 
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
