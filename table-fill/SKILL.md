@@ -202,13 +202,16 @@ Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_templa
   `base_last_row` (来自 digest) + `clone_roles` (spacer/title/header/data,
   各带 template_row) + `rows` (source 展平名 + selectors) + `columns`
   (源列→目标列, 支持 lookup/transform/常量/多列求和/`fallback`/`transforms`
-  链) + `lookups` + `formulas` (per_row + aggregates, 用 `{r}`/`{r1}:{r2}`/
-  `{n}` 模板) + `merges` + `nulls` (克隆残留置空) + `remove_rows`
+  链) + `lookups` + `formulas` (per_row + aggregates + group_aggregates,
+  用 `{r}`/`{r1}:{r2}`/`{n}` 模板) + `merges` + `nulls` (克隆残留置空)
+  + `remove_rows`
 - **v2.5 位置模型**: data role 可 `mode: inplace` (占位区消费,
   `start_row`/`capacity`/`template_row` 显式, N>capacity→克隆补差,
   N<capacity→尾部 trim); 目标级 `sets` (模板坐标绝对写, `value: null`=清空);
   块级 `group_merges` (按 group_by 物化值分组重建合并, 非锚点显式清空,
-  singleton 不合并); `columns[].props`/`sets[].props` 白名单 V1=numberformat。
+  singleton 不合并); 块级 `group_aggregates` (按 group_by 物化值分组,
+  聚合公式落组锚点行, 组边界数据驱动 — 每组合计一等能力);
+  `columns[].props`/`sets[].props` 白名单 V1=numberformat。
   schema_version 2→2.5 (mode 缺省 = append, 向后兼容)。全量 schema 见
   references/FILLSPEC.md「v2.5: Row Layout Mode」。
 - **布局决策先查决策树**: inplace vs clone-append vs 收缩 三选一以 digest
@@ -371,8 +374,8 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
   需要加行时 agent 用 python-pptx **一次性**创建后永久关闭 — 禁止在 officecli
   操作后重新 import)。
 - v2.5: `sets` 支持完整 DOM 路径 (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`);
-  `group_merges`/`mode: inplace` 的 pptx 侧在 spike 夹具验证前拒绝
-  (PPTX_CAPABILITY_NOT_ROLLED_OUT)。
+  `group_merges`/`group_aggregates`/`mode: inplace` 的 pptx 侧在 spike 夹具
+  验证前拒绝 (PPTX_CAPABILITY_NOT_ROLLED_OUT)。
 - pptx 的 key_outputs / required_empty 用完整路径
   (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`)。
 - 模板自身 validate 失败 (如 chart schema 扩展) 时, validate 按基线噪音记录
@@ -413,6 +416,47 @@ N+1、validate 对合并残留视而不见) 见 references/KNOWN_TRAPS.md。
 
 **禁止**: 把 REPAIR 类问题与 ASK 类问题捆绑呈报; 提供"简化任务/手动 officecli
 处理/暂停任务"等放弃选项; 以"时间/复杂度"为由绕过或忽略失败门禁。
+
+## 不信任事件转换纪律 (事后制度化: 把"修复 Agent"变成"修复 skill")
+
+任何对执行机制或契约的怀疑, 只要满足任一触发条件, **事后必须强制转换** —
+产出物让下一位 Agent 不必重新考古。怀疑本身是正常信号, 不转换才是损失
+(埃及案例基线: 机器 63s + Agent ~650s, 其中 mod_resolution 370s / spec_authoring
+166s / execute_review 55s / gate_wait 59s — 详见 .scratch/table-fill-compiler-trust
+spec Comments 复盘基线归档; XML 勘察发生在 spec_authoring, 不在 mod_resolution)。
+
+**触发条件 (任一)**:
+
+| 触发条件 | 示例 |
+|---|---|
+| 对执行机制怀疑 > ~1 分钟 | "编译器会怎样处理 X"悬而未决 |
+| 手工模拟行位移/坐标推算 | add/remove 交互、trim 后行号手算 (一次以上) |
+| 读源码确认执行行为 | 无论结论对错, 都是一次未转换的不信任事件 |
+| 契约结论与实测不符 | 能力矩阵/FILLSPEC 声明 vs 编译/执行结果矛盾 |
+
+**最高优先触发条件 — 契约漂移 (issue 05 类)**: 文档/能力矩阵声称的接受性或
+缺陷行为与实际编译行为不一致。契约是 Agent 决策的地图, 漂移即地图错位 —
+必须最先修复, 并以一致性回归断言闭环 (capabilities 矩阵输出 == 实际编译
+结果), 使下次运行不可能再次踩进漂移区。
+
+**转换动作三件套 (缺一不可)**:
+
+1. **编译器检查**: 把怀疑点变成静态缺陷码 (compile_fill 静态验证段,
+   exit 3 + corrective_action); 需要时以最小变异实验 (probe 面) 查明确切
+   触发条件再落码。
+2. **契约 Q&A**: 结论写进 FILLSPEC「组合行为契约」/「执行顺序保证」/
+   能力映射表 — Agent 按问题定位的权威答案, 不再二次勘察。
+3. **contract test**: 以最小 fixture 固定该行为 (test_optimization.py 既有
+   契约测试面, 不新增基建) — 未来改动使行为回归时测试变红。
+
+**产出物 (三者同源, 缺一视为未完成)**: 缺陷码 + 契约条目 + 回归测试;
+KNOWN_TRAPS 同步沉淀机械事实 (重放 oracle), 不落 KNOWN_TRAPS 的转换不算
+完成。
+
+**反例 (不转换的成本)**: 埃及 11_FRESH本土 — Agent 对 remove_rows 越界手工
+模拟 30+ 次行位移才确认执行身份。事后转换产物: `REMOVE_TARGETS_APPEND_ZONE`
+(编译器检查) + FILLSPEC「执行顺序保证」E1-E4 (契约 Q&A) + contract tests
+(回归测试), 同域任务再运行零烧脑。
 
 ## Observability
 

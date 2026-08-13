@@ -70,9 +70,9 @@
 
 | 陷阱 | 症状 | 正确路径 |
 |------|------|------|
-| **nulls × aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合再写公式) | 聚合列不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
+| **nulls × aggregates/group_aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合/组聚合再写公式) | 聚合列 (含组聚合落点列) 不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
 | **append 块 remove_rows 越界 (2026-08-13)** | remove_rows > base_last_row 编译通过, 执行删掉刚插入的新数据行 (adds 推移行号; 行数断言 rows+adds−removes 恒等抓不住; 埃及 11_FRESH本土 为此手工模拟 30+ 次行位移) | 编译器现以 REMOVE_TARGETS_APPEND_ZONE 静态拒绝; remove_rows 只声明 ≤ base_last_row 的模板既有行。首选 **append-only 合法终态** (占位行自然下沉保留, 无需删除); inplace 只在占位行带样式时成立 (裸行占位 inplace → 无边框块, 违反 VAL-007) |
-| **聚合列进 nulls 表达"每组合计"** | 聚合锚点 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空锚点格, 聚合再写公式); 曾误判为「硬编码范围必然漂移 → 只有拆块」(2026-08-13 契约修正: 最小 spec 实证触发因素就是聚合列进 nulls) | 聚合列不进 nulls — 同形 spec (单块 + 显式范围聚合) 编译通过 (埃及最终方案); 复制即用见 combination_patterns.yaml `per_group_total_explicit_ranges` |
+| **聚合列进 nulls 表达"每组合计"** | 聚合锚点 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空锚点格, 聚合再写公式); 曾误判为「硬编码范围必然漂移 → 只有拆块」(2026-08-13 契约修正: 最小 spec 实证触发因素就是聚合列进 nulls) | 聚合列不进 nulls — 同形 spec (单块 + 显式范围聚合) 编译通过 (埃及最终方案); 复制即用见 combination_patterns.yaml `per_group_total_explicit_ranges`; 或 group_aggregates 一等能力 (group_by + col + formula, 组锚点行落公式, 组边界数据驱动, 2026-08-13 落地) |
 | **`nulls rows` 用 `["1:2","3:4"]` 混合列表** | probe 抛 Python traceback 而非缺陷清单 (int("1:2") 崩溃) | 用 `rows: all` / int 列表 / `"a:b"` 字符串; 编译器现以 NULLS_ROWS_INVALID 结构化拒绝 |
 | **`officecli get --depth 0` 查不到 mergeCell** | 合并验证漏报 | 用 `officecli query merge` (或 execute readback 的组边界断言), 别靠 get 的单元格属性 |
 | **重复验证已覆盖事实** | 为确认 aggregates 锚点/克隆残留行为重复读 tests 与源码 (FILLSPEC Q1/Q10 已声明) | 契约章节未写的问题才查; 机械事实 (如克隆是否携带合并) 先在 KNOWN_TRAPS 找答案 |
@@ -83,6 +83,8 @@
 |------|------|
 | **克隆携带合并区** | `add --from` 复制 template_row 的格式+值+**mergeCell** (实测: 克隆合并标题行 A1:F1 → 克隆行 A41:F41 带合并) — 标题/表头克隆源选合并行无需额外合并 op; data 行克隆携带的旧合并是 group_merges unmerge 的对象 |
 | **merges × aggregates 同列** | `merges 1:{n}` + `aggregates 1:{n}` 同列编译通过 (聚合锚点=合并锚点=块首行); 同列多条 aggregates 用显式范围 (2:2、3:3) 做块内多组小计; merges+多组显式范围同列**不建议** (聚合锚点落合并区非锚点格, 执行期未验证) |
+| **remove/add 交互 (执行顺序契约, 2026-08-13)** | append 块 remove_rows ≤ base_last_row → 模板坐标在 add 区之外, **不被 add 推移** (REMOVE_TARGETS_APPEND_ZONE 保证与 add 区无交集); op 恒序 clear→add→remove→merge→fill (值写入不穿插 add, 防 duplicate_row); remove 自底向上; ops 用模板坐标, readback 用最终坐标 (inplace 移位由编译器翻译)。每份 plan 自带机械事实: execution_plan.json `mechanical_facts` / mapping.md「执行机械事实」栏 — 埃及 11_FRESH本土 式行位移考古不再需要, 先查 FILLSPEC「执行顺序保证」 |
+| **group_aggregates lowering (2026-08-13)** | 组锚点行落公式: 组由 group_by 物化值连续同值段 (compute_groups) 派生, {r1}:{r2} 按组起止展开且必须留块内 (AGG_RANGE_INVALID 为数据派生恒真不变量); 各锚点自动登记 nonempty readback; 与 group_merges/per_row 同列或组聚合列进 nulls → DUPLICATE_TARGET_WRITE (一格一 owner)。**whole_run 跨块总计落点语义 (末块尾部 vs 独立行) 未 spike — 声明 → CAPABILITY_NOT_ROLLED_OUT**, 免重复 spike |
 
 ## 占位行样式粒度决策事实 (2026-08-13 埃及复盘)
 

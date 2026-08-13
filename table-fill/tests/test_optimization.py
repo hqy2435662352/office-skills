@@ -19,6 +19,7 @@ import promote_output  # noqa: E402
 from _mod_catalog import parse_mod_index  # noqa: E402
 from _probe_fixtures import (  # noqa: E402
     BASE_SPEC,
+    make_egypt_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
 )
@@ -1726,6 +1727,144 @@ class FillSpecContractTests(unittest.TestCase):
         spec["mapping"]["targets"][0]["formulas"] = {"per_row": {"E": "A{r}*2"}}
         self.assertEqual(self._fail_codes(spec), [])
 
+    # ── Q13: group_aggregates 一等能力 (组聚合写组锚点行) ──
+    def test_group_aggregates_egypt_3_groups_anchors(self):
+        """埃及等价: 3 产品组 (家用×2 / 商用×2 / 工程×1) + V 列组聚合 — 编译
+        通过, 聚合公式落各组锚点行 ({r1}:{r2} 按组起止展开), readback 自动
+        登记各锚点 nonempty."""
+        wd = make_egypt_workdir(self.tmp)
+        wd["workdir"] = self.tmp
+        spec = spec_with(wd)
+        spec["fingerprints"] = wd["manifest"]["fingerprints"]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [
+                {"group_by": "A", "col": "V",
+                 "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+                 "style": "anchor"}]}
+        self.assertEqual(compile_fail_codes(wd, spec), [])
+        plan = compile_spec_with(wd, spec)
+        agg = [op for op in plan["operations"] if op["command"] == "set"
+               and op["path"].startswith("/S/V")
+               and "formula" in op.get("props", {})]
+        # 数据行 7-11, 组 (1,2)/(3,4)/(5,5) → 锚点 V7/V9/V11
+        self.assertEqual([op["path"] for op in agg], ["/S/V7", "/S/V9", "/S/V11"])
+        self.assertEqual(agg[0]["props"]["formula"],
+                         "IFERROR(ROUND(SUM(T7:T8)/SUM(S7:S8),4),0)")
+        self.assertEqual(agg[1]["props"]["formula"],
+                         "IFERROR(ROUND(SUM(T9:T10)/SUM(S9:S10),4),0)")
+        self.assertEqual(agg[2]["props"]["formula"],
+                         "IFERROR(ROUND(SUM(T11:T11)/SUM(S11:S11),4),0)")
+        ga_readback = [(rb["path"], rb["kind"]) for rb in plan["readback"]
+                       if rb["path"].startswith("/S/V")]
+        self.assertEqual(ga_readback,
+                         [("/S/V7", "nonempty"), ("/S/V9", "nonempty"),
+                          ("/S/V11", "nonempty")])
+        # 验收 4 (观测形态): 每个公式的展开范围恒在数据块 7-11 内 —
+        # 组范围由数据派生, 越块由编译器以 AGG_RANGE_INVALID 内部守卫拒绝
+        for op in agg:
+            rows = re.findall(r"(?:T|S)(\d+):(?:T|S)(\d+)", op["props"]["formula"])
+            self.assertTrue(rows,
+                            f"公式缺 {r'{r1}:{r2}'} 范围: {op['props']['formula']}")
+            for lo, hi in rows:
+                self.assertTrue(7 <= int(lo) <= int(hi) <= 11,
+                                f"组范围越块: {op['props']['formula']}")
+
+    def test_group_aggregates_missing_group_by_rejected(self):
+        """group_aggregates 条目缺 group_by → GROUP_BY_COLUMN_UNMAPPED."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [{"col": "G",
+                                  "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertIn("GROUP_BY_COLUMN_UNMAPPED", self._fail_codes(spec))
+
+    def test_group_aggregates_malformed_shape_rejected(self):
+        """group_aggregates 声明形态非法 (条目非 mapping / per_group 非列表) →
+        GROUP_AGGREGATES_INVALID 结构化拒绝 (曾会静默吞掉或 AttributeError
+        崩溃)."""
+        for formulas in (
+                {"group_aggregates": ["SUM(A{r1}:A{r2})"]},
+                {"group_aggregates": {"per_group": {"group_by": "A",
+                                                    "col": "G",
+                                                    "formula": "SUM(A{r1}:A{r2})"},
+                                      "whole_run": None}},
+                {"group_aggregates": "SUM(A{r1}:A{r2})"}):
+            spec = spec_with(self.wd)
+            spec["mapping"]["targets"][0]["formulas"] = formulas
+            self.assertIn("GROUP_AGGREGATES_INVALID",
+                          self._fail_codes(spec),
+                          f"formulas={formulas!r}")
+
+    def test_group_aggregates_with_group_merges_same_col_duplicate(self):
+        """组聚合与 group_merges 同列: 组锚点双写 (块首行两组锚点重合) →
+        DUPLICATE_TARGET_WRITE."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["group_merges"] = [
+            {"col": "G", "group_by": "A", "label": "X"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [{"group_by": "A", "col": "G",
+                                  "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertIn("DUPLICATE_TARGET_WRITE", self._fail_codes(spec))
+
+    def test_group_aggregates_with_per_row_same_col_duplicate(self):
+        """组聚合与 per_row 公式同列: 锚点格双写 → DUPLICATE_TARGET_WRITE."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"G": "A{r}*2"},
+            "group_aggregates": [{"group_by": "A", "col": "G",
+                                  "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertIn("DUPLICATE_TARGET_WRITE", self._fail_codes(spec))
+
+    def test_group_aggregates_col_in_nulls_duplicate(self):
+        """组聚合列进 nulls → 锚点先被 nulls 清空再写公式 (特征 "first as
+        empty") → DUPLICATE_TARGET_WRITE (组聚合列必须独立于 nulls)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["nulls"] = [
+            {"col": "D", "rows": "all"}, {"col": "G", "rows": "all"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [{"group_by": "A", "col": "G",
+                                  "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertIn("DUPLICATE_TARGET_WRITE", self._fail_codes(spec))
+
+    def test_group_aggregates_whole_run_gated_pre_spike(self):
+        """whole_run (跨块总计) 落点语义 (末块尾部 vs 独立行) 需 spike 锁定 —
+        spike 前声明 (dict 形态) → CAPABILITY_NOT_ROLLED_OUT."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": {
+                "per_group": [{"group_by": "A", "col": "G",
+                               "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}],
+                "whole_run": {"col": "G", "formula": "SUM(A5:A9)",
+                              "rows": "last_block_tail"}}}
+        self.assertIn("CAPABILITY_NOT_ROLLED_OUT", self._fail_codes(spec))
+
+    def test_group_aggregates_whole_run_list_entry_gated(self):
+        """列表条目形态的 whole_run 声明同样被门拒绝 (spec 草案形态)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [
+                {"group_by": "A", "col": "G",
+                 "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+                {"whole_run": {"col": "G", "formula": "SUM(A5:A9)",
+                               "rows": "last_block_tail"}},
+            ]}
+        self.assertIn("CAPABILITY_NOT_ROLLED_OUT", self._fail_codes(spec))
+
+    def test_group_aggregates_group_by_unmapped_rejected(self):
+        """group_by 列无列映射 → GROUP_BY_COLUMN_UNMAPPED."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [{"group_by": "F", "col": "G",
+                                  "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        self.assertIn("GROUP_BY_COLUMN_UNMAPPED", self._fail_codes(spec))
+
+    def test_group_aggregates_formula_template_invalid(self):
+        """公式模板未知键 → FORMULA_TEMPLATE_INVALID (静态期拒绝)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [{"group_by": "A", "col": "G",
+                                  "formula": "SUM(A{r9}:A{r2})", "style": "anchor"}]}
+        self.assertIn("FORMULA_TEMPLATE_INVALID", self._fail_codes(spec))
+
     # ── Q2: 算术派生列 (FLD-006 减法) 标准模式 ──
     def test_derived_column_subtraction_per_row_formula(self):
         """减法派生列标准模式: per_row formula + ROUND(...,2) 写在独立未映射列 —
@@ -2006,6 +2145,272 @@ class FillSpecContractTests(unittest.TestCase):
             self.assertNotIn("REMOVE_TARGETS_APPEND_ZONE", codes)
             compile_fill.compile_spec(spec, wd["manifest"], tmp)  # 编译通过
 
+
+class ExecutionOrderContractTests(unittest.TestCase):
+    """「执行顺序保证」契约 (FILLSPEC 章节) 的编译用例背书 — 文档声称与编译器
+    行为 lockstep: op 全局顺序不变量 (E1) / remove 目标身份 (E2) / 自底向上
+    (E3) / 坐标翻译边界 (E4) / 机械事实派生 (mechanical_facts + mapping.md)."""
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _compile(self, spec):
+        return compile_fill.compile_spec(spec, self.wd["manifest"], self.wd["workdir"])
+
+    def _remove_rows_of(self, plan) -> list[int]:
+        return [int(re.search(r"/row\[(\d+)\]$", op["path"]).group(1))
+                for op in plan["operations"] if op["command"] == "remove"]
+
+    # ── E1: op 全局顺序不变量 (clear → add → remove → merge → fill) ──
+    def test_global_op_order_invariant_append_only(self):
+        """E1 (append-only 形态): 全局序列 = clear → add → remove → merge → fill —
+        add 序列连续 (之间零 cell 写入 — 值写入穿插 add 破坏行簿记 →
+        duplicate_row); 全部 remove 在最后一个 add 之后; merge 属性写入与值写入
+        全部在全部结构操作之后."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "title", "template_row": 1, "value": "HDR"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        spec["mapping"]["targets"][0]["remove_rows"] = [3]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"E": "A{r}*2"},
+            "aggregates": [{"col": "F", "rows": "1:{n}",
+                            "formula": "SUM(E{r1}:E{r2})", "style": "anchor"}]}
+        spec["mapping"]["targets"][0]["merges"] = [
+            {"col": "D", "rows": "1:{n}", "style": "label"}]
+        plan = self._compile(spec)
+        ops = plan["operations"]
+        add_idx = [i for i, o in enumerate(ops) if o["command"] == "add"]
+        remove_idx = [i for i, o in enumerate(ops) if o["command"] == "remove"]
+        set_idx = [i for i, o in enumerate(ops) if o["command"] == "set"]
+        # 任意两个 add 之间零 cell 写入
+        for a, b in zip(add_idx, add_idx[1:]):
+            self.assertTrue(all(ops[i]["command"] == "add" for i in range(a + 1, b)),
+                            "add 之间穿插非 add op — 破坏行簿记 (duplicate_row)")
+        # 全部 remove 在最后一个 add 之后
+        self.assertTrue(remove_idx, "本 spec 应有 remove")
+        self.assertGreater(max(remove_idx), max(add_idx))
+        # merge 属性写入与值写入全部在最后一个结构操作之后 (append-only 成立)
+        merge_set_idx = [i for i in set_idx if "merge" in ops[i].get("props", {})]
+        value_set_idx = [i for i in set_idx
+                         if "value" in ops[i].get("props", {})
+                         or "formula" in ops[i].get("props", {})]
+        last_struct = max(add_idx + remove_idx)
+        self.assertTrue(merge_set_idx and value_set_idx, "本 spec 应有 merge 与值写入")
+        self.assertTrue(all(i > last_struct for i in merge_set_idx + value_set_idx),
+                        "append-only: merge/值写入必须全部在 add/remove 之后")
+
+    def test_inplace_hybrid_op_order(self):
+        """E1 (inplace 混合形态): 全局序列 = append 块全部操作 → sets → 终末
+        inplace 结构操作 (overflow add / trim remove) → inplace 值操作. sets 是
+        值写却先于 inplace 结构操作 — 位置由 Excel 行移位搬移 (契约精确化,
+        FILLSPEC「执行顺序保证」E1 与「v2.5: Row Layout Mode」同源)."""
+        # trim 形态 (N=3 < capacity 4): sets → trim removes → 值写, 无 add
+        wd2 = make_inplace_workdir(self.tmp, n_source_rows=3)
+        wd2["workdir"] = self.tmp
+        spec2 = copy.deepcopy(INPLACE_BASE_SPEC)
+        spec2["fingerprints"] = wd2["manifest"]["fingerprints"]
+        spec2["mapping"]["targets"][0]["sets"] = [
+            {"path": "A4", "value": "To Messrs: MXP"}]
+        ops2 = compile_fill.compile_spec(spec2, wd2["manifest"], self.tmp)["operations"]
+        set_a4 = next(i for i, o in enumerate(ops2) if o.get("path") == "/S/A4")
+        remove_idx = [i for i, o in enumerate(ops2) if o["command"] == "remove"]
+        self.assertEqual([o["command"] for o in ops2[:set_a4]], [],
+                         "sets 先于 inplace 结构操作 (trim 前执行, 由移位搬移)")
+        self.assertGreater(min(remove_idx), set_a4, "trim removes 在 sets 之后")
+        self.assertEqual([o["command"] for o in ops2[max(remove_idx) + 1:]], ["set"] * len(ops2[max(remove_idx) + 1:]),
+                         "trim removes 之后只剩 inplace 值写, 无结构 op")
+        # overflow 形态 (N=5 > capacity 4): sets → overflow add → 值写, 无 remove
+        wd3 = make_inplace_workdir(self.tmp, n_source_rows=5)
+        wd3["workdir"] = self.tmp
+        spec3 = copy.deepcopy(INPLACE_BASE_SPEC)
+        spec3["fingerprints"] = wd3["manifest"]["fingerprints"]
+        spec3["mapping"]["targets"][0]["sets"] = [
+            {"path": "A4", "value": "To Messrs: MXP"}]
+        ops3 = compile_fill.compile_spec(spec3, wd3["manifest"], self.tmp)["operations"]
+        set_a4 = next(i for i, o in enumerate(ops3) if o.get("path") == "/S/A4")
+        add_idx = [i for i, o in enumerate(ops3) if o["command"] == "add"]
+        self.assertEqual(len(add_idx), 1, "N=5 → 1 overflow 克隆")
+        self.assertGreater(min(add_idx), set_a4, "overflow add 在 sets 之后")
+        self.assertEqual([o["command"] for o in ops3[max(add_idx) + 1:]],
+                         ["set"] * len(ops3[max(add_idx) + 1:]),
+                         "overflow add 之后只剩 inplace 值写, 无结构 op")
+
+    # ── E2: add 之后 remove 的目标身份 ──
+    def test_remove_targets_template_coordinates_not_shifted(self):
+        """E2: remove_rows 是模板坐标, 不随 add 推移 — remove op 的 path 精确
+        等于 spec 声明的行号; 被删行全部 ≤ base_last_row; add 插入行全部 >
+        base_last_row (两者无交集, remove 永不命中刚插入的新数据行)."""
+        spec = spec_with(self.wd)  # base_last_row=4, 数据行 5-7
+        spec["mapping"]["targets"][0]["remove_rows"] = [2, 3]
+        plan = self._compile(spec)
+        base = spec["mapping"]["targets"][0]["base_last_row"]
+        removes = self._remove_rows_of(plan)
+        self.assertEqual(sorted(removes), [2, 3],
+                         "remove op 行号必须 == spec 声明的模板坐标")
+        self.assertTrue(all(r <= base for r in removes))
+        insert_rows = []
+        for op in plan["operations"]:
+            if op["command"] == "add" and "after" in op:
+                anchor = int(re.search(r"/row\[(\d+)\]$", op["after"]).group(1))
+                insert_rows.append(anchor + 1)
+        self.assertTrue(all(r > base for r in insert_rows),
+                        "add 全部插在 base_last_row 之下 (append 区)")
+        self.assertEqual(set(removes) & set(insert_rows), set(),
+                         "remove 目标与 add 插入行无交集")
+        mf = plan["mechanical_facts"]
+        self.assertTrue(mf["removes"]["all_within_base"])
+        self.assertIn("不被 add 推移", mf["removes"]["conclusion"])
+        self.assertTrue(all(r > base for r in mf["add_zone"]["append_insert_rows"]),
+                        "机械事实: append 插入行全部在 base_last_row 之下")
+        self.assertEqual(mf["add_zone"]["overflow_insert_rows"], [],
+                         "append-only plan 无 overflow 克隆")
+
+    # ── E3: remove 底上序 ──
+    def test_removes_bottom_up_order(self):
+        """E3: remove 自底向上 — 每个 append 块内 remove_rows 按行号降序生成
+        (先删上行会让按位置解析的执行器下行坐标失效); inplace Trim 同理由
+        自底向上 (尾部裁剪)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["remove_rows"] = [1, 2, 3, 4]
+        plan = self._compile(spec)
+        self.assertEqual(self._remove_rows_of(plan), [4, 3, 2, 1])
+        self.assertTrue(plan["mechanical_facts"]["removes"]["bottom_up"])
+        # inplace Trim: region 7-10, N=2 → 尾部裁剪 10, 9 (自底向上)
+        wd2 = make_inplace_workdir(self.tmp, n_source_rows=2)
+        wd2["workdir"] = self.tmp
+        spec2 = copy.deepcopy(INPLACE_BASE_SPEC)
+        spec2["fingerprints"] = wd2["manifest"]["fingerprints"]
+        plan2 = compile_fill.compile_spec(spec2, wd2["manifest"], self.tmp)
+        self.assertEqual(self._remove_rows_of(plan2), [10, 9])
+        self.assertEqual(plan2["mechanical_facts"]["trim"]["rows"], [10, 9])
+        self.assertIn("自底向上", plan2["mechanical_facts"]["trim"]["conclusion"])
+
+    # ── E4: 坐标翻译边界 ──
+    def test_ops_template_readback_final_coordinates(self):
+        """E4: ops 用模板坐标, readback 用最终坐标. append-only 无移位 →
+        readback 坐标 == op 坐标; inplace trim → set op 保持模板坐标, readback /
+        sets 记录翻译为最终坐标 (区下所有行 −1)."""
+        # append-only: 无 inplace → 无行移位
+        plan = self._compile(spec_with(self.wd))
+        mf = plan["mechanical_facts"]
+        self.assertFalse(mf["shift"]["present"])
+        op_rows = {int(re.search(r"/([A-Z]+)(\d+)$", op["path"]).group(2))
+                   for op in plan["operations"] if op["command"] == "set"}
+        rb_rows = {int(re.search(r"/([A-Z]+)(\d+)$", rb["path"]).group(2))
+                   for rb in plan["readback"]}
+        self.assertEqual(op_rows, rb_rows, "无移位时 readback 坐标应等于模板坐标")
+        # inplace trim: 3 数据行, capacity 4 → trim 1, shift −1
+        wd2 = make_inplace_workdir(self.tmp, n_source_rows=3)
+        wd2["workdir"] = self.tmp
+        spec2 = copy.deepcopy(INPLACE_BASE_SPEC)
+        spec2["fingerprints"] = wd2["manifest"]["fingerprints"]
+        spec2["mapping"]["targets"][0]["sets"] = [
+            {"path": "A4", "value": "To Messrs: MXP"},
+            {"path": "A14", "value": "* ship to Algeria"},
+        ]
+        plan2 = compile_fill.compile_spec(spec2, wd2["manifest"], self.tmp)
+        mf2 = plan2["mechanical_facts"]
+        self.assertTrue(mf2["shift"]["present"])
+        self.assertEqual(mf2["shift"]["region"], "7-10")
+        self.assertEqual(mf2["shift"]["value"], -1)
+        self.assertTrue(mf2["shift"]["readback_translated"])
+        # op path 保持模板坐标
+        set_paths = {op["path"] for op in plan2["operations"]
+                     if op["command"] == "set" and op["path"].endswith(("A4", "A14"))}
+        self.assertEqual(set_paths, {"/S/A4", "/S/A14"})
+        # readback 与 sets 记录翻译为最终坐标 (A14 → A13)
+        rb = {rb["path"] for rb in plan2["readback"]}
+        self.assertIn("/S/A13", rb)
+        self.assertNotIn("/S/A14", rb)
+        self.assertEqual([s["path"] for s in plan2["sets"]], ["/S/A4", "/S/A13"])
+
+    # ── 机械事实栏 (从契约派生, 非自由文本) ──
+    def test_mechanical_facts_derived_not_free_text(self):
+        """mechanical_facts 与 ops/布局机械一致: 对同一 plan 重算 removes、
+        锚点链与 add 插入行, 断言事实栏 == 重算结果 (机械派生, 非自由文本)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["remove_rows"] = [3]
+        plan = self._compile(spec)
+        mf = plan["mechanical_facts"]
+        self.assertEqual(mf["removes"]["rows"], sorted(self._remove_rows_of(plan)))
+        self.assertEqual(mf["base_last_row"],
+                         spec["mapping"]["targets"][0]["base_last_row"])
+        after_rows = sorted({int(re.search(r"/row\[(\d+)\]$", op["after"]).group(1))
+                             for op in plan["operations"]
+                             if op["command"] == "add" and "after" in op})
+        self.assertEqual(mf["anchor_chain"]["after_rows"], after_rows)
+        insert_rows = [a + 1 for a in after_rows]
+        self.assertEqual(mf["add_zone"]["append_insert_rows"], sorted(set(insert_rows)))
+        self.assertEqual(mf["add_zone"]["overflow_insert_rows"], [])
+        # 契约声明的顺序不变量与 plan 一致
+        self.assertEqual(mf["op_order_invariant"], "clear → add → remove → merge → fill")
+
+    def test_mapping_md_mechanical_facts_rendered(self):
+        """mapping.md「执行机械事实」栏由 mechanical_facts 派生渲染 — 对 append
+        运行, removes ≤ base 的结论显式可见 (验收标准: 埃及案例 Agent 不读源码
+        即可回答 remove/add 交互问题)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["remove_rows"] = [3]
+        plan = self._compile(spec)
+        md = compile_fill.render_mapping(spec, plan, self.wd["manifest"])
+        self.assertIn("## 执行机械事实", md)
+        self.assertIn("clear → add → remove → merge → fill", md)
+        self.assertIn("removes: [3]", md)
+        self.assertIn("不被 add 推移", md)
+        self.assertIn("readback 坐标 == 模板坐标", md)
+        self.assertIn("TEMPLATE_ROW_GAP", md)
+
+    def test_op_order_invariant_two_forms(self):
+        """E1 两形态 (2026-08-13 修正): mechanical_facts.op_order_invariant 按
+        plan 形态派生 — append-only → clear→add→remove→merge→fill; inplace
+        混合 → append 块全部操作→sets→inplace 结构→inplace 值写. 契约字符串
+        与 FILLSPEC E1 同源 (防止回退到单一恒式)."""
+        # append-only 形态
+        plan = self._compile(spec_with(self.wd))
+        self.assertEqual(plan["mechanical_facts"]["op_order_invariant"],
+                         "clear → add → remove → merge → fill")
+        # inplace 混合形态 (INPLACE_BASE_SPEC: region 7-10 + sets)
+        wd2 = make_inplace_workdir(self.tmp, n_source_rows=3)
+        wd2["workdir"] = self.tmp
+        spec2 = copy.deepcopy(INPLACE_BASE_SPEC)
+        spec2["fingerprints"] = wd2["manifest"]["fingerprints"]
+        spec2["mapping"]["targets"][0]["sets"] = [
+            {"path": "A4", "value": "To Messrs: MXP"},
+        ]
+        plan2 = compile_fill.compile_spec(spec2, wd2["manifest"], self.tmp)
+        self.assertEqual(
+            plan2["mechanical_facts"]["op_order_invariant"],
+            "append 块全部操作 → sets → 终末 inplace 块结构操作 "
+            "(overflow 克隆 add → trim remove) → inplace 值操作")
+        self.assertNotEqual(plan["mechanical_facts"]["op_order_invariant"],
+                            plan2["mechanical_facts"]["op_order_invariant"],
+                            "两形态的顺序不变量必须不同 (E1 双表述)")
+
+    def test_anchor_chain_gap_rejected_before_plan(self):
+        """锚点链事实的背书: add 引用行若落在目标行号空洞 → TEMPLATE_ROW_GAP 拒绝
+        (exit 3) — plan 能产出 ⟹ 锚点链引用行均存在. mapping.md 的
+        gap_checked 是 plan 存在性不变量, 非自由文本."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            meta = json.loads((tmp / "target_meta.json").read_text(encoding="utf-8"))
+            meta["row_gaps"] = [4]  # title add 的 after 锚点 /row[4] (BASE_SPEC)
+            (tmp / "target_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            spec = spec_with(wd)
+            codes = compile_fail_codes(wd, spec)
+            self.assertIn("TEMPLATE_ROW_GAP", codes)
+
+
 class CapabilityMappingContractTests(unittest.TestCase):
     """能力映射表 (FILLSPEC「能力映射表」章节) 的编译用例背书.
 
@@ -2108,6 +2513,25 @@ class CapabilityMappingContractTests(unittest.TestCase):
                if "formula" in op.get("props", {}) and "SUM" in op["props"]["formula"]]
         # block1: spacer5 title6 header7 data8-9 → 聚合 G8; block2: spacer10 title11 header12 data13
         self.assertEqual(agg, ["/S/G8", "/S/G13"])
+
+    def test_per_group_total_first_class(self):
+        """每组合计 → 一等: group_aggregates (group_by + col + formula,
+        组锚点行落公式, 组边界由数据决定)."""
+        wd = make_egypt_workdir(self.tmp)
+        wd["workdir"] = self.tmp
+        spec = spec_with(wd)
+        spec["fingerprints"] = wd["manifest"]["fingerprints"]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "group_aggregates": [
+                {"group_by": "A", "col": "V",
+                 "formula": "SUM(T{r1}:T{r2})", "style": "anchor"}]}
+        self.assertEqual(compile_fail_codes(wd, spec), [])
+        plan = compile_spec_with(wd, spec)
+        self.assertEqual(
+            [op["path"] for op in plan["operations"]
+             if op["command"] == "set" and op["path"].startswith("/S/V")
+             and "formula" in op.get("props", {})],
+            ["/S/V7", "/S/V9", "/S/V11"])
 
     def test_per_group_total_explicit_ranges_same_block(self):
         """每组合计 → 一等: 单块 + 多条显式范围聚合 (V/W 同块, 聚合列不进
@@ -2337,7 +2761,8 @@ class CapabilitiesTests(unittest.TestCase):
                     "derived_subtraction_pattern", "mapped_group_column_anchor",
                     "lookup_missing_empty", "precision_keep", "per_group_total_blocks",
                     "per_group_total_hardcoded_ranges", "nulls_aggregate_same_col",
-                    "pptx_group_merges"):
+                    "pptx_group_merges", "group_aggregates_egypt_3_groups",
+                    "group_aggregates_whole_run_gate"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
 
 
@@ -2570,12 +2995,63 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("first as empty", q13)
         self.assertIn("per_group_total_explicit_ranges", q13)
 
+    def test_fillspec_q14_group_aggregates_section(self):
+        """契约章节含 Q14 小节 (group_aggregates 一等能力 + whole_run 门)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q14:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q14 小节")
+        q14 = section[m.end():]
+        self.assertIn("group_aggregates", q14)
+        self.assertIn("group_by", q14)
+        self.assertIn("CAPABILITY_NOT_ROLLED_OUT", q14)
+        self.assertIn("DUPLICATE_TARGET_WRITE", q14)
+
+    def test_fillspec_capability_table_group_aggregates_first_class(self):
+        """能力映射表「每组合计」→ 一等 (group_aggregates 表达)."""
+        section = self._fillspec_section("能力映射表")
+        self.assertIn("group_aggregates", section)
+        self.assertIn("一等", section)
+        self.assertIn("CAPABILITY_NOT_ROLLED_OUT", section)
+
+    def test_fillspec_error_code_table_has_capability_gate(self):
+        """CAPABILITY_NOT_ROLLED_OUT 在「常见编译错误速查」表内 (whole_run 门)."""
+        self.assertIn("CAPABILITY_NOT_ROLLED_OUT", self._error_code_table())
+
+    def test_combination_patterns_group_aggregates_pattern(self):
+        """combination_patterns.yaml 含 group_aggregates 一等模式 (改列名即可)."""
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("group_aggregates", text)
+        self.assertIn("group_by", text)
+
     def test_known_traps_spike_facts(self):
         """KNOWN_TRAPS 沉淀已 spike 机械事实 (克隆携带合并 / merges×aggregates)."""
         text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
         self.assertIn("克隆携带合并", text)
         self.assertIn("mergeCell", text)
         self.assertIn("A41:F41", text)
+
+    def test_fillspec_execution_order_section(self):
+        """「执行顺序保证」章节存在且覆盖全部四条锁定声明: op 顺序不变量 /
+        remove 目标身份 / 自底向上 / 坐标翻译边界 (防章节误删或声明回退)."""
+        section = self._fillspec_section("执行顺序保证")
+        for word in ("clear", "add", "remove", "merge", "fill",
+                     "duplicate_row", "模板坐标", "自底向上", "readback",
+                     "REMOVE_TARGETS_APPEND_ZONE", "deferred_values",
+                     "final_row"):
+            self.assertIn(word, section, f"执行顺序保证章节缺 {word!r}")
+        self.assertIsNotNone(re.search(r"^### E1:", section, re.MULTILINE), "缺 E1")
+        self.assertIsNotNone(re.search(r"^### E2:", section, re.MULTILINE), "缺 E2")
+        self.assertIsNotNone(re.search(r"^### E3:", section, re.MULTILINE), "缺 E3")
+        self.assertIsNotNone(re.search(r"^### E4:", section, re.MULTILINE), "缺 E4")
+
+    def test_known_traps_remove_add_interaction(self):
+        """KNOWN_TRAPS 沉淀 remove/add 交互权威事实 (埃及案例重放 oracle:
+        Agent 无需读源码即可回答 add 后 remove 目标是谁 — 指向 FILLSPEC 章节)."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        self.assertIn("不被 add 推移", text)
+        self.assertIn("执行顺序保证", text)
+        self.assertIn("mechanical_facts", text)
 
     def test_mod_index_execution_boundary(self):
         """MOD_INDEX 标注执行 vs 治理文档边界: 执行任务不读 MOD_TEMPLATE."""
@@ -2623,6 +3099,28 @@ class DocCoverageGuardTests(unittest.TestCase):
             self.assertIn(word, section)
         self.assertIn("必须加载后才可写 spec", section)
         self.assertIn("不因输出形态优化放宽", section)
+
+    def test_skill_md_distrust_conversion_section(self):
+        """SKILL.md「不信任事件转换纪律」: 四类触发条件 + 契约漂移为最高优先
+        触发条件 + 三件套 + 产出物 (防制度小节被误删或触发条件被降级)."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("不信任事件转换", text)
+        for word in ("三件套", "契约漂移", "最高优先", "contract test",
+                     "缺陷码", "契约 Q&A", "回归测试", "KNOWN_TRAPS"):
+            self.assertIn(word, text)
+        # 契约漂移必须单独列为最高优先触发条件 (issue 05 类)
+        m = re.search(r"最高优先触发条件[^\n]*", text)
+        self.assertIsNotNone(m, "缺最高优先触发条件声明")
+        self.assertIn("契约漂移", m.group(0))
+
+    def test_known_traps_three_workflows_oracles(self):
+        """KNOWN_TRAPS 与三个工作流产物对应 (07 验收 #2): remove/add 交互
+        (01/02), 裸行占位 → append-only 终态 (03/04), 显式范围 nulls 触发
+        条件 (05), 组聚合落点 (06) 全部有重放 oracle."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        for word in ("不被 add 推移", "裸行占位", "占位行样式", "first as empty",
+                     "group_aggregates", "append-only"):
+            self.assertIn(word, text, f"KNOWN_TRAPS 缺机械事实词 {word!r}")
 
 
 class ModCatalogIndexTests(unittest.TestCase):

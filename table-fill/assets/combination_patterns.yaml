@@ -138,12 +138,28 @@ patterns:
             formula: "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)"
             style: anchor
 
+  # ── Q14: 每组合计 (一等 group_aggregates) ──
+  - id: per_group_total_group_aggregates
+    question: 系列盈亏按产品组合计 (每组合计, 动态组边界) 怎么写?
+    answer: "一等表达 — group_aggregates: group_by 分组列 (必须有列映射), 聚合公式自动落到各组锚点行, 组边界由数据决定"
+    fragment: |
+      formulas:
+        group_aggregates:
+          - group_by: A
+            col: V
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+    note: |
+      组聚合列必须独立于 nulls / group_merges / per_row (同列 →
+      DUPLICATE_TARGET_WRITE); whole_run 跨块总计 spike 前声明 →
+      CAPABILITY_NOT_ROLLED_OUT。
+
   # ── 能力映射表: 每组合计 (动态边界 → 拆块变通) ──
   - id: per_group_total_blocks
     question: 组合边界由数据决定 (范围不可静态枚举) 的每组合计怎么写?
-    answer: 动态组边界无法用显式范围表达 — 按组合拆 blocks[], 每块各自
-      aggregates 1:{n} (组合边界由数据决定); 静态范围优先用
-      per_group_total_explicit_ranges
+    answer: 变通 — 按组合拆 blocks[], 每块各自 aggregates (组合边界由数据决定);
+      一等能力是 group_aggregates (见 per_group_total_group_aggregates);
+      静态范围优先用 per_group_total_explicit_ranges
     fragment: |
       blocks:
         - clone_roles: [spacer, title, header, data]

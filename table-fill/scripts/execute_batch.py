@@ -82,7 +82,8 @@ def run_batches(book: Path, operations: list, probe_path: str) -> list:
     deferred flush loses the last chunks' edits — so every batch run ends
     with an explicit `close` (flush + release; no-op without a resident).
 
-    Returns failed chunks: {"chunk_start", "rc", "stdout_tail", "stderr_tail"}."""
+    Returns failed chunks: {"chunk_start", "rc", "stdout_tail", "stderr_tail",
+    "failing_op", "failing_op_error"}."""
     failures = []
     for start in range(0, len(operations), CHUNK_SIZE):
         chunk = operations[start:start + CHUNK_SIZE]
@@ -94,16 +95,10 @@ def run_batches(book: Path, operations: list, probe_path: str) -> list:
             proc = officecli("batch", str(book), "--commands",
                              json.dumps(chunk, ensure_ascii=False), timeout=600)
             if proc.returncode != 0:
-                failures.append({
-                    "chunk_start": start, "rc": proc.returncode,
-                    "stdout_tail": proc.stdout[-600:], "stderr_tail": proc.stderr[-600:],
-                })
+                failures.append(_failed_chunk(start, proc, chunk))
                 return failures
         elif proc.returncode != 0:
-            failures.append({
-                "chunk_start": start, "rc": proc.returncode,
-                "stdout_tail": proc.stdout[-600:], "stderr_tail": proc.stderr[-600:],
-            })
+            failures.append(_failed_chunk(start, proc, chunk))
             return failures  # coordinate system may be corrupt — stop at first failure
         if start + CHUNK_SIZE < len(operations) and probe_path \
                 and _chunk_has_structural(chunk):
@@ -122,6 +117,37 @@ def run_batches(book: Path, operations: list, probe_path: str) -> list:
     # later clean_residents() taskkill would otherwise drop the tail chunks).
     officecli("close", str(book))
     return failures
+
+
+ERROR_LINE_RE = re.compile(r"\[\s*\d+\]\s*ERROR:\s*(.*)", re.IGNORECASE)
+
+
+def _failed_chunk(start: int, proc, chunk: list) -> dict:
+    """Build a failure record for a failed batch chunk.
+
+    Parses officecli's per-op output (`[N] ERROR: ...`) to identify the
+    failing op and its full error text — the agent's primary diagnosis
+    input (2026-08-12 复盘: stdout_tail 截断曾把关键错误行丢掉, 导致
+    盲猜修复)."""
+    stdout = proc.stdout or ""
+    error_line = ""
+    for line in stdout.splitlines():
+        m = ERROR_LINE_RE.match(line)
+        if m:
+            error_line = m.group(1).strip()
+            break
+    failing_op = None
+    if error_line:
+        m = re.search(r"^\[\s*(\d+)\]\s*ERROR:", stdout, re.MULTILINE)
+        if m:
+            idx = int(m.group(1)) - 1  # officecli 输出 [N] 是 1-based
+            if 0 <= idx < len(chunk):
+                failing_op = chunk[idx]
+    return {
+        "chunk_start": start, "rc": proc.returncode,
+        "stdout_tail": stdout[-600:], "stderr_tail": proc.stderr[-600:],
+        "failing_op": failing_op, "failing_op_error": error_line,
+    }
 
 
 def _chunk_has_structural(chunk: list) -> bool:
