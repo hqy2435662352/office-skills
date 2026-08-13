@@ -33,3 +33,6 @@ test_fixtures/
 
 # Hidden system folders
 .playwright-mcp/
+
+# Private customer MODs (local-only overlay — 私有客户 MOD 不随发布推送)
+table-fill/references/MOD_tcl_*
