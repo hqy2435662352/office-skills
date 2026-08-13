@@ -341,7 +341,7 @@ formulas:
 |---|---|---|
 | 列映射 / sets 值 / 标题 value | `value` | 数字归一化比较 (`$138.00` vs `138`) |
 | nulls / required_empty / 清空 | `empty` | 断言 EMPTY |
-| per_row 公式 / aggregates | `nonempty` | 断言非空 (公式结果编译期不可确定) |
+| per_row 公式 / aggregates / group_aggregates 组锚点 | `nonempty` | 断言非空 (公式结果编译期不可确定) |
 | group 锚点 (映射值/label/清空) | `value` / `empty` | 按锚点写什么断言什么 |
 | plain `merges` (1:{n}) | **无 readback** | merges 只写 merge 属性不写值, 不注册断言 |
 
@@ -367,6 +367,106 @@ formulas:
 
 - 与它们冲突的只有 per_row 公式 (同列 → DUPLICATE_TARGET_WRITE, Q1)。
 
+### Q13: 单块多显式范围聚合 (每组合计显式写法) 的接受边界?
+
+单块内多条 `aggregates` + 显式范围 (如 `1:2`、`3:3`) 能表达每组合计, 但
+**组边界由数据决定, 显式范围必然随数据漂移** — 这是负面表达 (能力映射表
+「每组合计 — 负面表达 (勿用)」), 只作存量兼容。2026-08-13 最小变异实验
+(埃及场景 20 轮 probe) 查明被拒 fixture 的确切触发条件 — **聚合列进 nulls
+→ 锚点格先被 nulls 清空再写公式 → DUPLICATE_TARGET_WRITE (特征 "first as
+empty")**; 同形 spec 去掉该因素即通过:
+
+| 条件 | 结果 |
+|---|---|
+| 聚合列**不进 nulls** + 不与 group_merges/per_row 同列 + 范围不越块 | 编译通过 (埃及 11_FRESH本土 最终方案: 单块 + 显式范围聚合, 执行 readback 627/627) |
+| 聚合列进 nulls (逐行清空含锚点格, 再写公式) | `DUPLICATE_TARGET_WRITE` (特征 "first as empty") |
+| 聚合列与 group_merges / per_row 同列 | `DUPLICATE_TARGET_WRITE` (一格一 owner, Q1) |
+| 显式范围越出数据块 / rows 规格非法 | `AGG_RANGE_INVALID` |
+
+正确终态: 新 spec 优先用 **group_aggregates 一等能力** (Q14); 显式范围
+写法仅在存量兼容时使用, 复制即用片段见 assets/combination_patterns.yaml
+`per_group_total_explicit_ranges`。
+
+### Q14: 每组合计 (group_aggregates) 怎么写？
+
+**一等能力**: 组边界由 group_by 列的**物化值**决定 — 连续同值段为一组,
+聚合公式自动落到各组锚点行 (组内首行), 范围 {r1}:{r2} 按组起止展开:
+
+```yaml
+formulas:
+  group_aggregates:            # 列表: 每个 group_aggregate 一条
+    - group_by: A              # 物化值分组列 (必须有列映射)
+      col: V                   # 聚合落点列 (组锚点行)
+      formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+      style: anchor
+```
+
+- **group_by 必须有列映射** (缺 group_by 或未映射 → `GROUP_BY_COLUMN_UNMAPPED`);
+  模板键只有 `{r1}`/`{r2}`/`{n}` (未知键 → `FORMULA_TEMPLATE_INVALID`)。
+- **组锚点格自动登记 nonempty readback** — 无需手写 checks (见 Q10)。
+- **范围不越块 (静态守卫)**: 组范围由 group_by 物化值 (数据) 派生, 结构上恒
+  在块内 — 越块 → `AGG_RANGE_INVALID` (编译器内部不变量守卫); 观测契约:
+  公式展开范围恒在数据块内 (埃及等价用例逐公式断言)。
+- **冲突语义 (一格一 owner, 同 Q1 规则)**: 与 group_merges 同列 / 与 per_row
+  同列 → `DUPLICATE_TARGET_WRITE`; **组聚合列不进 nulls** — nulls 逐行清空
+  含锚点格, 再写公式即锚点双写 (特征 "first as empty") → `DUPLICATE_TARGET_WRITE`。
+- **声明形态校验**: `group_aggregates` 必须是条目列表 (或
+  `{per_group: [...], whole_run: {...}}` dict); 条目非 mapping / per_group 非
+  列表 → `GROUP_AGGREGATES_INVALID` (结构化拒绝, 不静默吞掉)。
+- **whole_run (跨块总计)**: 落点语义 (末块尾部 vs 独立行) 待 spike 锁定 —
+  **spike 前声明 → `CAPABILITY_NOT_ROLLED_OUT`** (结构化拒绝, 不询问用户)。
+- pptx 的 group_aggregates lowering 未 rollout → `PPTX_CAPABILITY_NOT_ROLLED_OUT`。
+
+## 执行顺序保证 (Execution Order Contract)
+
+> 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
+> 答案 — 答案在本契约, **不要读 compile_fill.py 源码**。每条声明有编译用例
+> 背书 (`tests/test_optimization.py`: ExecutionOrderContractTests)。本契约同时
+> 派生进每个 plan: execution_plan.json `mechanical_facts` + mapping.md「执行
+> 机械事实」栏由编译器机械计算 (removes 与 add 区关系 / 锚点链依赖 / shift
+> 结论), 非自由文本 — 读 plan 即读契约结论, 不用手工模拟。
+
+### E1: op 全局顺序不变量?
+
+- **append-only 形态** (无 inplace): 恒为 **clear → add → remove → merge → fill**
+  — 值写入全部排在结构操作之后。
+- **inplace 混合形态**: 全局序列 = **append 块全部操作 → sets → 终末 inplace
+  块结构操作 (overflow 克隆 add → trim remove) → inplace 值操作** — 与「v2.5:
+  Row Layout Mode」的执行阶段不变量同一事实。注意 **sets 是值写, 却先于
+  inplace 结构操作执行** — 位置由 Excel 行移位搬移, spec 永远不算最终坐标。
+- **两形态共同的不可破坏约束** (防 duplicate_row, KNOWN_TRAPS 2026-08-10
+  实证): 值写入永不穿插 **append 区** add — append 块 adds 连续生成; 结构性
+  op 恒先于其相位内的值写; 标题克隆文本属 fill 阶段 (deferred_values)。
+- 约束: 任意两个 **append 区** add 之间零 cell 写入; append 块 remove 全部在
+  其块 adds 之后; inplace trim removes 在 sets 之后、inplace 值写之前。
+
+### E2: add 之后 remove 的目标是谁?
+
+- `remove_rows` 是**模板坐标**, 不随 add 推移: append 块的 add 全部插在
+  base_last_row 之下 (append 区), remove_rows 只能声明 ≤ base_last_row 的模板
+  既有行 — REMOVE_TARGETS_APPEND_ZONE 静态检查保证两者无交集, remove 命中的
+  永远不是刚插入的新行。
+- 推论: remove op 的行号 == spec 声明的行号, 无需手工模拟行位移
+  (埃及 11_FRESH本土 曾为此模拟 30+ 次, ~1/3 spec 时间)。
+
+### E3: remove 为什么自底向上?
+
+- 每个 append 块的 remove_rows 按行号**降序** (自底向上) 生成 op; 块间按块序。
+- 理由: 删除行元素不重排其余行的 r 值 (留下行号空洞, 与模板 row-gap 同源),
+  但若执行器按位置解析, 先删上行会让下行坐标失效 — 自底向上保证任何解析方式
+  下其余 remove 目标保持有效。
+- inplace Trim 同理由: 尾部裁剪 (编译器推导), 自底向上。
+
+### E4: 坐标翻译边界?
+
+- **ops 用模板坐标**: add/remove/set 的 path 全部是模板坐标 (spec 写什么就是
+  什么), 执行期 Excel 行移位自然发生。
+- **readback 用最终坐标**: inplace 场景 (trim/overflow) 下, readback /
+  row_map / writes / group_boundaries / sets 记录全部翻译为最终坐标
+  (Compiler 的 final_row / spec_final_row_of)。
+- 无 inplace 区 → 无行移位 → readback 坐标 == 模板坐标。
+- 结论: Agent 永远不用计算移位后的行号。
+
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
 > 新增 MOD 规则入库时对照此表: 判断"这条业务规则能否表达、用什么模式表达"。
@@ -376,8 +476,9 @@ formulas:
 | MOD 规则类型 | 标准表达模式 | 支持状态 |
 |---|---|---|
 | 算术派生 (减法/乘法/除法/比率) | `formulas.per_row` + ROUND 精准 (如 `IFERROR(ROUND(X{r}-Y{r},2),0)`) | 一等 |
-| 每组合计 (系列盈亏按产品组合计) | 块级 `aggregates rows: 1:{n}` 只做整块聚合; 组合边界由数据决定, spec 无法表达动态组内范围 | **暂无一等**; 变通: `blocks[]` 每组合一块 + 各自块级 aggregates; 强行声明越块组内范围 → `AGG_RANGE_INVALID` |
-| 每组合计 — 负面表达 (勿用) | 块内硬编码多个显式范围聚合 (如 `1:4`, `5:7`...) — 组边界由数据决定, 硬编码必然漂移; 且与 nulls 同列时锚点双写 | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty") — 正确路径只有拆块 |
+| 每组合计 (系列盈亏按产品组合计) | `formulas.group_aggregates` — group_by + col + formula, 组锚点行落公式, 组边界由数据决定 | **一等** (组范围静态校验留块内; 聚合列独立于 nulls; 同列冲突 → `DUPLICATE_TARGET_WRITE`); 变通 (拆分路径): `blocks[]` 每组合一块 + 块级 aggregates |
+| 每组合计 — 负面表达 (勿用) | 块内硬编码多个显式范围聚合 (如 `1:4`, `5:7`...) — 组边界由数据决定, 硬编码必然漂移; 且与 nulls 同列时锚点双写 | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty") — 正确路径是 group_aggregates 一等能力 (或 `blocks[]` 拆块) |
+| 跨块总计 (whole_run) | `formulas.group_aggregates.whole_run` — 落点语义 (末块尾部 vs 独立行) 待 spike 锁定 | **暂无**: `CAPABILITY_NOT_ROLLED_OUT` (spike 结论落地后解锁) |
 | 字段继承 | `columns.lookup` + `mapping.lookups` (`missing: empty`) | 一等 |
 | 路由 (条件取列) | selectors 行过滤 + `fallback` 列回退 | 一等 |
 | 0-口径 | 常量 `value: "0"` / 空源留空 / 多列求和缺失按 0 | 一等 |
@@ -473,6 +574,30 @@ mapping:
   应用; 单值 `transform` 仍是单变换简写。正则替换的 replacement 含反斜杠转义
   (如 `'\1\n(220-240V,1N,50Hz)'`) 时 YAML 用**单引号**包裹。
 
+## 布局决策树 (以样式为第一判定条件)
+
+> 选布局模式**以 digest 的样式粒度事实为第一判定条件**, 不是"占位块存在
+> 与否" — 占位行带样式 inplace 才成立; 裸行 inplace 会产出无边框块 (违反
+> VAL-007 格式沿用, 埃及 11_FRESH本土 实证: 23-52 裸行占位)。样式事实由
+> prepare 自动检测 (digest「占位行样式: 裸行/带样式」结论行), **不需要
+> unzip sheet XML 考古**。各分支与编译器裁决同源 (缺陷码见「常见编译错误
+> 速查」)。
+
+| 分支 | 前提 (digest 事实) | 布局 |
+|---|---|---|
+| ① 占位区消费 | 占位行**带样式** (结论行: 占位行样式: 带样式) | `mode: inplace` — start_row/capacity/template_row 显式 (模板坐标), N>capacity 克隆补差, N<capacity 尾部 trim (编译器推导) |
+| ② 克隆追加 (append-only 合法终态) | 占位行**裸行** (结论行: 占位行样式: 裸行) | data role 缺省 append — 克隆携带 template_row 格式 (VAL-007 格式沿用), 占位行自然下沉保留, **不写 remove_rows** |
+| ③ 模板既有块收缩 | 源行数 < 模板行数 | append + `remove_rows` (≤ base_last_row, 经典场景, add 区之外不被推移) |
+
+违规形态 → 缺陷码对照:
+
+| 形态 | 缺陷码 |
+|---|---|
+| append 块 remove_rows > base_last_row | `REMOVE_TARGETS_APPEND_ZONE` (corrective_action 首选 append-only 终态) |
+| 占位区坐标/容量与模板不符 | `INPLACE_REGION_OUT_OF_BOUNDS` / `INPLACE_NOT_LAST_BLOCK` |
+| 行号空洞未物化 | `TEMPLATE_ROW_GAP` (repair_row_gaps.py) |
+| 结构 op 落入 append 区 | `STRUCTURAL_OP_OUT_OF_ZONE` |
+
 ## 常见编译错误速查
 
 | 错误码 | 含义 | 修复 |
@@ -481,7 +606,7 @@ mapping:
 | CLONE_SOURCE_IS_ANCHOR | 数据克隆源是合并锚点 | 换非锚点数据行 |
 | CLONE_RESIDUE_UNHANDLED | template_row 携带某列值但未覆盖 | 加 columns mapping 或 nulls |
 | DUPLICATE_TARGET_WRITE | 同一格被写两次 | 检查 columns/nulls/formulas/group/sets 重叠 |
-| MERGE_RANGE_INVALID / AGG_RANGE_INVALID | 范围越过数据块 | 用 `1:{n}` |
+| MERGE_RANGE_INVALID / AGG_RANGE_INVALID | 范围越过数据块 | 用 `1:{n}` (聚合); group_aggregates 的组范围由数据派生, 越块是编译器内部不变量守卫 (观测契约: 公式范围恒在块内, 埃及等价用例断言) |
 | KEY_OUTPUT_UNWRITTEN | key_outputs 指向未写格 | 换成被写的格 |
 | NUMERIC_OVERFLOW_RISK | 直接值 >4 位小数 / >12 位有效数字 (成本 15 位精度) | 加 `transform: round4` 或 `precision: keep` |
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
@@ -499,8 +624,10 @@ mapping:
 | PLACEHOLDER_RESIDUE_UNHANDLED | 保留占位行携带未覆盖值 | 加 columns/null/group label |
 | PLACEHOLDER_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分保留行 | rows: all 或列映射 |
 | GROUP_MERGE_ANCHOR_UNCOVERED | 无映射 group 列缺 label | 声明 label ("" = 清空) |
-| GROUP_BY_COLUMN_UNMAPPED | group_by 列无列映射 | 加 columns 映射 |
+| GROUP_BY_COLUMN_UNMAPPED | group_by 列无列映射 (group_merges / group_aggregates) | 加 columns 映射 |
+| GROUP_AGGREGATES_INVALID | group_aggregates 声明形态非法 (条目非 mapping / per_group 非列表) | 按 Q14 schema 写条目列表 (或 {per_group, whole_run} dict) |
 | MERGE_MODE_CONFLICT | 同列混用 merges + group_merges | 每列只用一种合并模式 |
 | SET_OUT_OF_BOUNDS | sets.path 超出 digest 维度 / 格式非法 | 用模板坐标裸格或完整 DOM 路径 |
 | PROPS_WHITELIST_VIOLATION | props 超出 {numberformat} | 只用白名单键 |
-| PPTX_CAPABILITY_NOT_ROLLED_OUT | pptx 声明 inplace/group_merges | 用 xlsx, 或等 pptx lowering 验证后 rollout |
+| CAPABILITY_NOT_ROLLED_OUT | 声明 spike 未解锁的能力 (如 group_aggregates.whole_run 跨块总计, 落点语义待 spike) | 用已解锁表达 (每组合一块 + 块级 aggregates), 或等 spike 结论落地 |
+| PPTX_CAPABILITY_NOT_ROLLED_OUT | pptx 声明 inplace / group_merges / group_aggregates | 用 xlsx, 或等 pptx lowering 验证后 rollout |

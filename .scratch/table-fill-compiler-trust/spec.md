@@ -1,5 +1,17 @@
 # table-fill-compiler-trust — 编译器信任硬化: 把 Agent 怀疑变成编译裁决
 
+## Comments
+
+- 2026-08-13: 复盘基线归档 (issue 07)。埃及 FRESH 毛利表 → 报价汇总
+  11_FRESH本土 单次完整运行的 run_timing 分解: **机器 63s + Agent ~650s** —
+  mod_resolution 370s (读 3 digest + 3 展平 CSV + 625 行提名输出含两候选
+  全量规则 + 用户裁决墙钟) / spec_authoring 166s / execute_review 55s /
+  gate_wait 59s。**事实修正**: XML 勘察发生在 spec_authoring 相位, 不在
+  mod_resolution。后续优化基线: mod_resolution 的 370s 由 issue 04 的 MOD
+  两段加载 (提名给摘要, 裁决后加载全文) 承接; spec_authoring 的 XML 勘察
+  由 issue 03 的 digest 样式粒度事实消除; gate_wait 59s 为墙钟等待, 不属
+  优化对象。机器侧 63s 含 prepare 双阶段 + 编译 + 执行 + readback, 未细分。
+
 ## Problem Statement
 
 table-fill v2.5 的 Agent 执行效率被"对 compile_fill.py 的不信任"拖累。一次真实运行

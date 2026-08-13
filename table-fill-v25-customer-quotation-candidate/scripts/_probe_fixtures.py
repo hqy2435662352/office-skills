@@ -19,20 +19,23 @@ import json
 from prepare_run import facts_sha256, structure_facts
 
 
-def make_probe_workdir(tmp, n_source_rows: int = 3) -> dict:
+def make_probe_workdir(tmp, n_source_rows: int = 3, n_cols: int = 10,
+                       src_rows: list | None = None) -> dict:
     """Synthetic workdir: source CSV, target meta/csv, manifest, lookup."""
-    src_rows = [
-        ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
-        ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
-        ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
-    ][:n_source_rows]
+    if src_rows is None:
+        src_rows = [
+            ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
+            ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
+            ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
+        ]
+    src_rows = src_rows[:n_source_rows]
     with open(tmp / "source_maoli_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
         for i, row in enumerate(src_rows):
             csv.writer(f).writerow(row + [101 + i])
 
     target_meta = {
         "sheet": "S",
-        "dimensions": {"rows": 20, "cols": 10, "data_rows": 2},
+        "dimensions": {"rows": 20, "cols": n_cols, "data_rows": 2},
         "header_band": {"header_rows": [2], "data_start_row": 3},
         "merged_ranges": ["A5:A6"],
         "merge_anchors": [{"range": "A5:A6", "anchor": "A5", "formula": ""}],
@@ -40,16 +43,24 @@ def make_probe_workdir(tmp, n_source_rows: int = 3) -> dict:
         "columns": [{"col": "A", "nonempty": 2}, {"col": "D", "nonempty": 1}],
         "formulas": {"D3": "B3-C3"},
         "column_numfmt": {"D": "0.00"},
+        # 样式粒度决策事实 (issue 03): 裸行占位形态 — 行 5-20 无样式.
+        "style_granularity": {
+            "placeholder": {"start": 5, "end": 20, "styled": False, "sample": None},
+            "template_rows": {"header": {"row": 2, "styled": True, "sample": "A2"}},
+        },
     }
     with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
         json.dump(target_meta, f, ensure_ascii=False)
 
     with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["标题", "", "", "", "", "", "", "", "", "", "1"])
-        w.writerow(["类别", "规格", "型号", "", "", "", "", "", "", "", "2"])
-        w.writerow(["家用", "12K", "Z001", "F-1", "", "", "", "", "", "", "3"])
-        w.writerow(["家用", "18K", "Z002", "F-2", "", "", "", "", "", "", "4"])
+        for cells, orig in (
+            (["标题"], 1),
+            (["类别", "规格", "型号"], 2),
+            (["家用", "12K", "Z001", "F-1"], 3),
+            (["家用", "18K", "Z002", "F-2"], 4),
+        ):
+            w.writerow(cells + [""] * (n_cols - len(cells)) + [orig])
 
     facts = [structure_facts(target_meta)]
     manifest = {
@@ -73,6 +84,10 @@ def make_probe_workdir(tmp, n_source_rows: int = 3) -> dict:
             "source_structure": facts_sha256(facts),
             "target_structure": facts_sha256(facts),
         },
+        "style_granularity": {"target": {
+            "placeholder": {"start": 5, "end": 20, "styled": False, "sample": None},
+            "template_rows": {"header": {"row": 2, "styled": True, "sample": "A2"}},
+        }},
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
@@ -109,6 +124,12 @@ def make_probe_inplace_workdir(tmp, n_source_rows: int = 3) -> dict:
         "columns": [{"col": "A", "nonempty": 4}, {"col": "B", "nonempty": 4}],
         "formulas": {},
         "column_numfmt": {},
+        # 样式粒度决策事实 (issue 03): 带样式占位形态 — 行 7-10 占位区带样式
+        # (MXP 报价单形态, 占位行携带值 + 合并 A7:A10).
+        "style_granularity": {
+            "placeholder": {"start": 7, "end": 10, "styled": True, "sample": "A7"},
+            "template_rows": {"header": {"row": 2, "styled": True, "sample": "A2"}},
+        },
     }
     with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
         json.dump(target_meta, f, ensure_ascii=False)
@@ -151,10 +172,30 @@ def make_probe_inplace_workdir(tmp, n_source_rows: int = 3) -> dict:
             "source_structure": facts_sha256(facts),
             "target_structure": facts_sha256(facts),
         },
+        "style_granularity": {"target": {
+            "placeholder": {"start": 7, "end": 10, "styled": True, "sample": "A7"},
+            "template_rows": {"header": {"row": 2, "styled": True, "sample": "A2"}},
+        }},
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
     return {"manifest": manifest}
+
+
+EGYPT_SRC_ROWS = [
+    ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
+    ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
+    ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
+    ["商用", "28K", "Z004", "F-4", "C-4", "10", "11", "12"],
+    ["工程", "32K", "Z005", "F-5", "C-5", "13", "14", "15"],
+]
+
+
+def make_egypt_workdir(tmp) -> dict:
+    """Egypt-equivalent contract workdir: 3 product groups (家用×2 / 商用×2 /
+    工程×1) with a 22-col target so the V column (col 22) is in width."""
+    return make_probe_workdir(tmp, src_rows=EGYPT_SRC_ROWS, n_cols=22,
+                              n_source_rows=len(EGYPT_SRC_ROWS))
 
 
 BASE_SPEC = {
@@ -412,6 +453,21 @@ def _per_group_total_hardcoded_ranges(spec, wd):
     return spec
 
 
+def _per_group_total_explicit_ranges(spec, wd):
+    """每组合计显式写法 (存量兼容, Q13 接受边界): 单块多条显式范围聚合,
+    聚合列不进 nulls、不与 group_merges/per_row 同列、范围不越块 → 编译
+    通过. 最小变异 (聚合列进 nulls) → DUPLICATE_TARGET_WRITE, 见
+    test_per_group_total_trigger_minimal_mutation (issue 05)."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"aggregates": [
+             {"col": "E", "rows": "1:2",
+              "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+             {"col": "E", "rows": "3:3",
+              "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+         ]})
+    return spec
+
+
 def _append_remove_out_of_zone(spec, wd):
     """append 块 remove_rows > base_last_row (4): add 全部插在 base 之下推移
     行号, remove 用裸模板坐标命中刚插入的新数据行 → 自毁 plan → 拒绝."""
@@ -423,6 +479,74 @@ def _append_remove_within_base(spec, wd):
     """remove_rows ≤ base_last_row (4): add 区之外不被推移 — 经典收缩场景
     (源行数 < 模板行数) 保持合法."""
     _set(spec, "mapping.targets.0.remove_rows", [3])
+    return spec
+
+
+def _group_aggregates_egypt(spec, wd):
+    """每组合计 (一等): 3 产品组 (家用×2 / 商用×2 / 工程×1), V 列组聚合 —
+    聚合公式落各组锚点行, 组边界由 group_by 物化值决定."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": [
+             {"group_by": "A", "col": "V",
+              "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"}]})
+    return spec
+
+
+def _group_aggregates_whole_run(spec, wd):
+    """whole_run (跨块总计) 落点语义 (末块尾部 vs 独立行) 需 spike 锁定 —
+    spike 前声明 → CAPABILITY_NOT_ROLLED_OUT."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": {
+             "per_group": [{"group_by": "A", "col": "G",
+                            "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}],
+             "whole_run": {"col": "G", "formula": "SUM(A5:A9)",
+                           "rows": "last_block_tail"}}})
+    return spec
+
+
+def _group_aggregates_gm_same_col(spec, wd):
+    """组聚合与 group_merges 同列: 组锚点双写 → DUPLICATE_TARGET_WRITE."""
+    _set(spec, "mapping.targets.0.group_merges",
+         [{"col": "G", "group_by": "A", "label": "X"}])
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": [{"group_by": "A", "col": "G",
+                                "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _group_aggregates_per_row_same_col(spec, wd):
+    """组聚合与 per_row 公式同列: 锚点格双写 → DUPLICATE_TARGET_WRITE."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"per_row": {"G": "A{r}*2"},
+          "group_aggregates": [{"group_by": "A", "col": "G",
+                                "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _group_aggregates_nulls_same_col(spec, wd):
+    """组聚合列进 nulls: nulls 逐行清空 (含锚点格) 再写公式 → 锚点双写
+    (特征 "first as empty") → DUPLICATE_TARGET_WRITE."""
+    _set(spec, "mapping.targets.0.nulls",
+         [{"col": "D", "rows": "all"}, {"col": "G", "rows": "all"}])
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": [{"group_by": "A", "col": "G",
+                                "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _group_aggregates_group_by_unmapped(spec, wd):
+    """group_by 列无列映射: 组无从计算 → GROUP_BY_COLUMN_UNMAPPED."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": [{"group_by": "F", "col": "G",
+                                "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _group_aggregates_malformed_shape(spec, wd):
+    """声明形态非法 (条目非 mapping) → GROUP_AGGREGATES_INVALID 结构化拒绝."""
+    _set(spec, "mapping.targets.0.formulas",
+         {"group_aggregates": ["SUM(A{r1}:A{r2})"]})
     return spec
 
 
@@ -466,7 +590,10 @@ PROBE_CASES = [
      "build": _nulls_aggregate_same_col},
     {"id": "per_group_total_hardcoded_ranges", "expect": "DUPLICATE_TARGET_WRITE",
      "build": _per_group_total_hardcoded_ranges},
-    # ── Q13: append 块 remove_rows 边界 (REMOVE_TARGETS_APPEND_ZONE) ──
+    # ── Q13: 每组合计显式写法 (存量兼容) 的接受边界 ──
+    {"id": "per_group_total_explicit_ranges", "expect": "accept",
+     "build": _per_group_total_explicit_ranges},
+    # ── 01: append 块 remove_rows 边界 (REMOVE_TARGETS_APPEND_ZONE) ──
     {"id": "append_remove_rows_out_of_zone", "expect": "REMOVE_TARGETS_APPEND_ZONE",
      "build": _append_remove_out_of_zone},
     {"id": "append_remove_rows_within_base", "expect": "accept",
@@ -475,4 +602,19 @@ PROBE_CASES = [
      "build": _pptx_group_merges},
     {"id": "pptx_inplace", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
      "build": _pptx_inplace},
+    # ── Q14: group_aggregates 一等能力 (组聚合写组锚点行) ──
+    {"id": "group_aggregates_egypt_3_groups", "expect": "accept",
+     "build": _group_aggregates_egypt, "workdir_factory": make_egypt_workdir},
+    {"id": "group_aggregates_whole_run_gate", "expect": "CAPABILITY_NOT_ROLLED_OUT",
+     "build": _group_aggregates_whole_run},
+    {"id": "group_aggregates_gm_same_col", "expect": "DUPLICATE_TARGET_WRITE",
+     "build": _group_aggregates_gm_same_col},
+    {"id": "group_aggregates_per_row_same_col", "expect": "DUPLICATE_TARGET_WRITE",
+     "build": _group_aggregates_per_row_same_col},
+    {"id": "group_aggregates_nulls_same_col", "expect": "DUPLICATE_TARGET_WRITE",
+     "build": _group_aggregates_nulls_same_col},
+    {"id": "group_aggregates_group_by_unmapped", "expect": "GROUP_BY_COLUMN_UNMAPPED",
+     "build": _group_aggregates_group_by_unmapped},
+    {"id": "group_aggregates_malformed_shape", "expect": "GROUP_AGGREGATES_INVALID",
+     "build": _group_aggregates_malformed_shape},
 ]

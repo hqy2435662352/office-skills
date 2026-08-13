@@ -70,8 +70,8 @@
 
 | 陷阱 | 症状 | 正确路径 |
 |------|------|------|
-| **nulls × aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合再写公式) | 聚合列不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
-| **块内硬编码多范围聚合表达"每组合计"** | 完整业务列集下 V/W 锚点 8× DUPLICATE, 组合敏感, 最小 spec 不复现 (2026-08-12 埃及场景 20 轮 probe 才定位) | 组边界由数据决定 — 每组合计只有 `blocks[]` 拆块一条路 (见 FILLSPEC 能力映射表负面表达行) |
+| **nulls × aggregates/group_aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合/组聚合再写公式) | 聚合列 (含组聚合落点列) 不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
+| **块内硬编码多范围聚合表达"每组合计"** | 完整业务列集下 V/W 锚点 8× DUPLICATE, 组合敏感, 最小 spec 不复现 (2026-08-12 埃及场景 20 轮 probe 才定位) | 组边界由数据决定 — 用 **group_aggregates 一等能力** (group_by + col + formula, 组锚点行落公式, 组边界数据驱动, 2026-08-13 落地); 硬编码显式范围仍是负面表达 |
 | **append 块 remove_rows 越界 (2026-08-13)** | remove_rows > base_last_row 编译通过, 执行删掉刚插入的新数据行 (adds 推移行号; 行数断言 rows+adds−removes 恒等抓不住; 埃及 11_FRESH本土 为此手工模拟 30+ 次行位移) | 编译器现以 REMOVE_TARGETS_APPEND_ZONE 静态拒绝; remove_rows 只声明 ≤ base_last_row 的模板既有行。首选 **append-only 合法终态** (占位行自然下沉保留, 无需删除); inplace 只在占位行带样式时成立 (裸行占位 inplace → 无边框块, 违反 VAL-007) |
 | **`nulls rows` 用 `["1:2","3:4"]` 混合列表** | probe 抛 Python traceback 而非缺陷清单 (int("1:2") 崩溃) | 用 `rows: all` / int 列表 / `"a:b"` 字符串; 编译器现以 NULLS_ROWS_INVALID 结构化拒绝 |
 | **`officecli get --depth 0` 查不到 mergeCell** | 合并验证漏报 | 用 `officecli query merge` (或 execute readback 的组边界断言), 别靠 get 的单元格属性 |
@@ -83,6 +83,9 @@
 |------|------|
 | **克隆携带合并区** | `add --from` 复制 template_row 的格式+值+**mergeCell** (实测: 克隆合并标题行 A1:F1 → 克隆行 A41:F41 带合并) — 标题/表头克隆源选合并行无需额外合并 op; data 行克隆携带的旧合并是 group_merges unmerge 的对象 |
 | **merges × aggregates 同列** | `merges 1:{n}` + `aggregates 1:{n}` 同列编译通过 (聚合锚点=合并锚点=块首行); 同列多条 aggregates 用显式范围 (2:2、3:3) 做块内多组小计; merges+多组显式范围同列**不建议** (聚合锚点落合并区非锚点格, 执行期未验证) |
+| **remove/add 交互 (执行顺序契约, 2026-08-13)** | append 块 remove_rows ≤ base_last_row → 模板坐标在 add 区之外, **不被 add 推移** (REMOVE_TARGETS_APPEND_ZONE 保证与 add 区无交集); op 恒序 clear→add→remove→merge→fill (值写入不穿插 add, 防 duplicate_row); remove 自底向上; ops 用模板坐标, readback 用最终坐标 (inplace 移位由编译器翻译)。每份 plan 自带机械事实: execution_plan.json `mechanical_facts` / mapping.md「执行机械事实」栏 — 埃及 11_FRESH本土 式行位移考古不再需要, 先查 FILLSPEC「执行顺序保证」 |
+| **裸行占位 → append-only 终态 (2026-08-13, issue 03/04 重放 oracle)** | digest 报「占位行样式: 裸行」(无边框/填充/字体) → clone-append: 克隆携带格式满足 VAL-007, 占位行自然下沉保留, **不写 remove_rows**; inplace 只在 digest 报「占位行样式: 带样式」时成立 — 裸行 inplace = 无边框块 (埃及 23-52 占位行实证)。样式事实直接读 digest 结论行, 不 unzip sheet XML |
+| **group_aggregates lowering (2026-08-13)** | 组锚点行落公式: 组由 group_by 物化值连续同值段 (compute_groups) 派生, {r1}:{r2} 按组起止展开且必须留块内 (AGG_RANGE_INVALID 为数据派生恒真不变量); 各锚点自动登记 nonempty readback; 与 group_merges/per_row 同列或组聚合列进 nulls → DUPLICATE_TARGET_WRITE (一格一 owner)。**whole_run 跨块总计落点语义 (末块尾部 vs 独立行) 未 spike — 声明 → CAPABILITY_NOT_ROLLED_OUT**, 免重复 spike |
 
 ## 行号空洞与失败诊断陷阱 (2026-08-12 埃及复盘)
 

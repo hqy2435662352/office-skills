@@ -1,8 +1,15 @@
 # 01 — Compiler 拦截 append 块 remove_rows 越界 (REMOVE_TARGETS_APPEND_ZONE)
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by:
+
+## Comments
+
+- 2026-08-13: 已落地 (commit 8f774f9, 与 04 合并提交)。compile_fill.py 静态验证段
+  新增 REMOVE_TARGETS_APPEND_ZONE (行 442-457), corrective_action 为
+  append-only 语义; contract tests 并入 test_optimization.py (+166 行含 01/04
+  测试)。全量 152 测试绿。
 
 ## 问题
 

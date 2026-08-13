@@ -906,6 +906,60 @@ def compute_groups(values: list) -> list[tuple[int, int]]:
     return groups
 
 
+def split_group_aggregates(ga_spec: object, defects: list | None = None,
+                           where: str = "") -> tuple[list, bool]:
+    """Normalize `formulas.group_aggregates` → (per_group entries, whole_run?).
+
+    Shapes accepted:
+      list — canonical per-group entries `[{group_by, col, formula, style}]`;
+             an entry carrying the key `whole_run` marks the cross-block total
+             declaration (gated pre-spike in the static validation phase).
+      dict — `{per_group: [...], whole_run: {...}}` (spec draft shape);
+             per_group entries are lowered, whole_run is gated.
+
+    Malformed shapes (per_group not a list / entry not a mapping) are skipped
+    so lowering never crashes; when `defects` is given (static phase), each is
+    reported as GROUP_AGGREGATES_INVALID instead of being silently absorbed."""
+    if ga_spec is None:
+        return [], False
+    if isinstance(ga_spec, dict):
+        per = ga_spec.get("per_group") or []
+        if "per_group" in ga_spec and not isinstance(per, list):
+            _ga_shape_defect(defects, where,
+                             "per_group must be a list of per-group entries")
+            per = []
+        return per, ga_spec.get("whole_run") is not None
+    if isinstance(ga_spec, list):
+        per: list = []
+        whole = False
+        for entry in ga_spec:
+            if not isinstance(entry, dict):
+                _ga_shape_defect(defects, where,
+                                 f"entry {entry!r} must be a mapping "
+                                 "({group_by, col, formula, style})")
+                continue
+            if "whole_run" in entry:
+                whole = True
+            else:
+                per.append(entry)
+        return per, whole
+    _ga_shape_defect(defects, where,
+                     f"group_aggregates must be a list or a dict, got "
+                     f"{type(ga_spec).__name__}")
+    return [], False
+
+
+def _ga_shape_defect(defects: list | None, where: str, detail: str) -> None:
+    if defects is None:
+        return
+    defects.append({
+        "code": "GROUP_AGGREGATES_INVALID", "where": where or "group_aggregates",
+        "message": f"{where or 'group_aggregates'}: {detail}",
+        "corrective_action": "Write formulas.group_aggregates as a list of "
+                             "{group_by, col, formula, style} entries (or a "
+                             "{per_group: [...], whole_run: {...}} dict)"})
+
+
 PROPS_WHITELIST = ("numberformat",)
 
 
@@ -1056,10 +1110,9 @@ def build_ops_xlsx(target: dict, blocks: list, roles: list, data_rows: list,
                         "after": f"/{sheet}/row[{row - 1}]"})
     for b in inplace_blocks:
         n, cap, start = b["count"], b["inplace"]["capacity"], b["inplace"]["start_row"]
-        if n < cap:
-            trim_count = cap - n
-            for rn in range(start + cap - 1, start + n - 1, -1):
-                ops.append({"command": "remove", "path": f"/{sheet}/row[{rn}]"})
+        for rn in inplace_trim_rows(n, cap, start):
+            trim_count += 1
+            ops.append({"command": "remove", "path": f"/{sheet}/row[{rn}]"})
 
     # ── 6. inplace value writes (per block: merge-clear → group_merges →
     #    merges → fills → aggregates). Inplace rows are coordinate-stable:
@@ -1160,8 +1213,8 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
                     defects: list, final_row=None, sheet: str = "",
                     ops: list | None = None) -> None:
     """One block's value ops: merge-clear → group_merges → merges → fills →
-    aggregates. Shared by append blocks (phase 3) and the inplace block
-    (phase 6); the phase ORDER is decided by the caller."""
+    aggregates → group_aggregates. Shared by append blocks (phase 3) and the
+    inplace block (phase 6); the phase ORDER is decided by the caller."""
     if ops is None:
         raise TypeError("_emit_block_ops requires the ops list")
     n = b["count"]
@@ -1171,8 +1224,11 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
     gm = cfg.get("group_merges", [])
     gm_by_col = {g.get("col"): g for g in gm}
     group_cols = set(gm_by_col)
+    ga_entries, _ = split_group_aggregates(
+        cfg.get("formulas", {}).get("group_aggregates"))
     merge_cols = sorted({m.get("col") for m in cfg.get("merges", [])}
                         | {a.get("col") for a in cfg.get("formulas", {}).get("aggregates", [])}
+                        | {g.get("col") for g in ga_entries}
                         | group_cols)
 
     # 1. merge-clears on every data row (per-block merge/group/agg columns) —
@@ -1340,6 +1396,51 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
         ops.append({"command": "set", "path": cell_path(col, first_row + r1 - 1),
                     "props": props})
         register(col, first_row + r1 - 1, "nonempty", None)
+
+    # 6. group_aggregates: per-group formulas at group anchor rows.
+    #    Groups come from the materialized group_by values (compute_groups);
+    #    {r1}:{r2} expands per group start/end and must stay inside the block
+    #    (AGG_RANGE_INVALID). Anchor cells register nonempty readback. The
+    #    whole_run gate fires in the static validation phase, before ops.
+    for ga in ga_entries:
+        col = ga.get("col")
+        gcol = ga.get("group_by")
+        if not gcol:
+            defects.append({"code": "GROUP_BY_COLUMN_UNMAPPED", "col": col,
+                            "message": f"group_aggregates[{col}] needs group_by — "
+                                       "the mapped target column whose materialized "
+                                       "values define the groups",
+                            "corrective_action": "Declare group_by"})
+            continue
+        if gcol not in mapped_cols:
+            defects.append({"code": "GROUP_BY_COLUMN_UNMAPPED", "col": gcol,
+                            "message": f"group_aggregates group_by column {gcol} has no "
+                                       "column mapping — groups need the column's "
+                                       "logical materialized value",
+                            "corrective_action": "Add a columns mapping for the "
+                                                 "group_by column"})
+            continue
+        groups = compute_groups([dr.get("values", {}).get(gcol, "")
+                                 for dr in blk_rows])
+        gstyle = style_for(cfg, ga.get("style", "anchor"))
+        for (s, e) in groups:
+            if s < 1 or e > n:
+                defects.append({"code": "AGG_RANGE_INVALID", "col": col,
+                                "message": f"group_aggregates[{col}] group range "
+                                           f"{s}:{e} crosses the data block boundary "
+                                           f"(1:{n}) — group ranges must stay inside "
+                                           "the block",
+                                "corrective_action": "Check the group_by materialized "
+                                                     "values and block selectors"})
+                continue
+            anchor_row = first_row + s - 1
+            props = {"formula": expand_template(ga["formula"], {"r1": first_row + s - 1,
+                                                                "r2": first_row + e - 1,
+                                                                "n": n})}
+            props.update(gstyle)
+            ops.append({"command": "set", "path": cell_path(col, anchor_row),
+                        "props": props})
+            register(col, anchor_row, "nonempty", None)
 
 
 def final_row_of(block_infos: list, row: int) -> int:
@@ -1536,9 +1637,129 @@ def validate_formula_references(formulas: dict, n_rows: int, defects: list) -> N
         except ValueError as e:
             defects.append({"code": "FORMULA_TEMPLATE_INVALID", "col": col,
                             "message": str(e), "corrective_action": "Fix the formula template"})
+    ga_entries, _ = split_group_aggregates(formulas.get("group_aggregates"))
+    for ga in ga_entries:
+        col = ga.get("col")
+        tpl = ga.get("formula")
+        if not isinstance(tpl, str):
+            defects.append({"code": "FORMULA_TEMPLATE_INVALID", "col": col,
+                            "message": f"group_aggregates[{col}] needs a formula "
+                                       "template ({r1}:{r2} expand per group)",
+                            "corrective_action": "Add the formula template"})
+            continue
+        try:
+            expand_template(tpl, {"r1": 1, "r2": n_rows, "n": n_rows})
+        except ValueError as e:
+            defects.append({"code": "FORMULA_TEMPLATE_INVALID", "col": col,
+                            "message": str(e), "corrective_action": "Fix the formula template"})
 
 
 # ── Outputs ────────────────────────────────────────────────────────────
+
+def inplace_trim_rows(count: int, capacity: int, start_row: int) -> list[int]:
+    """Tail-trim row numbers for an inplace region (template coordinates,
+    bottom-up). Single source shared by the op generator and the mechanical
+    facts — both must produce the same trim."""
+    if count >= capacity:
+        return []
+    return list(range(start_row + capacity - 1, start_row + count - 1, -1))
+
+
+def derive_mechanical_facts(ops: list, target_cfg: dict, blocks_cfg: list,
+                            block_infos: list) -> dict:
+    """执行机械事实栏 — 从「执行顺序保证」契约派生, 非自由文本.
+
+    execution_plan.json.mechanical_facts 与 mapping.md「执行机械事实」栏的唯一
+    来源: removes 与 add 区关系 / 锚点链依赖 / shift 结论. 数值字段从已生成的
+    ops 与布局机械计算; 契约常量 (op_order_invariant / bottom_up /
+    gap_checked) 由 contract test 背书 — gap_checked 是 plan 存在性不变量
+    (TEMPLATE_ROW_GAP 缺陷先于 plan 产出, exit 3)."""
+    base = target_cfg.get("base_last_row", 0)
+    append_remove_rows = sorted({
+        rn for b in blocks_cfg if not inplace_roles(b)
+        for rn in b.get("remove_rows", [])})
+    # Phase-1 append adds form the leading run of ops; any later add is an
+    # inplace overflow clone (phase 5, after sets).
+    leading = 0
+    while leading < len(ops) and ops[leading]["command"] == "add":
+        leading += 1
+    add_after_rows: list[int] = []
+    add_from_rows: list[int] = []
+    spacer_adds = 0
+    append_insert_rows: list[int] = []
+    overflow_insert_rows: list[int] = []
+    for i, op in enumerate(ops):
+        if op.get("command") != "add":
+            continue
+        m = re.search(r"/row\[(\d+)\]$", op.get("after", ""))
+        if m:
+            add_after_rows.append(int(m.group(1)))
+        m = re.search(r"/row\[(\d+)\]$", op.get("from", ""))
+        if m:
+            add_from_rows.append(int(m.group(1)))
+        if op.get("after"):
+            (append_insert_rows if i < leading else overflow_insert_rows).append(
+                int(re.search(r"/row\[(\d+)\]$", op["after"]).group(1)) + 1)
+        else:
+            spacer_adds += 1
+    append_insert_rows = sorted(set(append_insert_rows))
+    overflow_insert_rows = sorted(set(overflow_insert_rows))
+    shift = 0
+    region = None
+    trim_rows: list[int] = []
+    for b in block_infos:
+        ip = b.get("inplace")
+        if ip:
+            shift = b["count"] - ip["capacity"]
+            region = f"{ip['start_row']}-{ip['region_end']}"
+            trim_rows = inplace_trim_rows(b["count"], ip["capacity"],
+                                          ip["start_row"])
+            break
+    all_within_base = all(rn <= base for rn in append_remove_rows)
+    return {
+        "op_order_invariant": "clear → add → remove → merge → fill",
+        "base_last_row": base,
+        "add_zone": {
+            "append_insert_rows": append_insert_rows,
+            "overflow_insert_rows": overflow_insert_rows,
+            "spacer_adds": spacer_adds,
+            "conclusion": ("全部 add 插入 base_last_row 之下 (append 区) — 不推移 "
+                           "base 及以上的模板坐标" if region is None else
+                           "append 区 add 插在 base_last_row 之下; overflow 克隆插在 "
+                           "区末端之后 — 均不推移区内的模板坐标"),
+        },
+        "removes": {
+            "rows": append_remove_rows,
+            "all_within_base": all_within_base,
+            "bottom_up": True,
+            "conclusion": ("与 add 区无交互 — 全部 ≤ base_last_row, 模板坐标在 add "
+                           "区之外, 不被 add 推移" if all_within_base else
+                           "与 add 区交互 — 编译器已以 REMOVE_TARGETS_APPEND_ZONE "
+                           "拒绝, 不会产出本 plan"),
+        },
+        "trim": {
+            "present": bool(trim_rows),
+            "rows": trim_rows,
+            "conclusion": "尾部裁剪 (编译器推导), 自底向上" if trim_rows else "无",
+        },
+        "shift": {
+            "present": region is not None,
+            "region": region,
+            "value": shift,
+            "readback_translated": region is not None,
+            "conclusion": ("无 inplace 区 → 无行移位; readback 坐标 == 模板坐标"
+                           if region is None else
+                           f"inplace 区 {region} → 区下所有行 (append 区/sets) "
+                           f"最终坐标 = 模板坐标 {'+' if shift >= 0 else ''}{shift} "
+                           "(trim 为负 / overflow 为正); readback 已翻译为最终坐标"),
+        },
+        "anchor_chain": {
+            "after_rows": sorted(set(add_after_rows)),
+            "from_rows": sorted(set(add_from_rows)),
+            "gap_checked": True,
+        },
+    }
+
 
 def render_mapping(spec: dict, plan: dict, manifest: dict) -> str:
     target = spec["mapping"]["targets"][0]
@@ -1580,6 +1801,33 @@ def render_mapping(spec: dict, plan: dict, manifest: dict) -> str:
         mode = b.get("mode") or ""
         lines.append(f"| {kind} | {rows} | {tpl} | {mode} |")
     lines.append("")
+
+    mf = plan.get("mechanical_facts")
+    if mf:
+        lines.append("## 执行机械事实 (derived from the execution-order contract)")
+        lines.append("")
+        lines.append(f"- op 顺序不变量: `{mf['op_order_invariant']}` — 值写入不穿插 append 区 add (防 duplicate_row)")
+        lines.append(f"- base_last_row: {mf['base_last_row']}")
+        az = mf["add_zone"]
+        lines.append(f"- add 区: append 插入行 {az['append_insert_rows'] or '∅'}"
+                     + (f" + spacer×{az['spacer_adds']} (执行时追加到 sheet 末尾)"
+                        if az["spacer_adds"] else "")
+                     + (f" + overflow 克隆 {az['overflow_insert_rows']}"
+                        if az["overflow_insert_rows"] else "")
+                     + f" — {az['conclusion']}")
+        rm = mf["removes"]
+        lines.append(f"- removes: {rm['rows'] or '∅'}"
+                     + (f" — {rm['conclusion']}" if rm["rows"] else " — 无 remove_rows"))
+        tr = mf["trim"]
+        lines.append(f"- trim: {tr['conclusion']}" + (f" (行 {tr['rows']})" if tr["rows"] else ""))
+        sh = mf["shift"]
+        lines.append(f"- shift: {sh['conclusion']}"
+                     + (f" (值 {sh['value']:+d})" if sh["present"] else ""))
+        ac = mf["anchor_chain"]
+        lines.append(f"- 锚点链: add after 引用行 {ac['after_rows'] or '∅'}, "
+                     f"clone from 引用行 {ac['from_rows'] or '∅'}"
+                     + (" — TEMPLATE_ROW_GAP 检查已过 (plan 存在即已通过)" if ac["gap_checked"] else ""))
+        lines.append("")
 
     cov = plan["source_coverage"]
     if isinstance(cov, dict):
@@ -1824,6 +2072,13 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                                            "the spike fixture before rollout",
                                 "corrective_action": "Use xlsx for group_merges, or wait "
                                                      "for the pptx lowering rollout"})
+            if b["cfg"].get("formulas", {}).get("group_aggregates"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": "group_aggregates lowering for pptx is staged — "
+                                           "formula cells are xlsx-only; verify against "
+                                           "the spike fixture before rollout",
+                                "corrective_action": "Use xlsx for group_aggregates, or "
+                                                     "wait for the pptx lowering rollout"})
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
@@ -1838,6 +2093,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     else:
         anchors = {a["anchor"] for a in target_meta.get("merge_anchors", [])}
         anchor_rows = {int(re.search(r"\d+$", a).group()) for a in anchors}
+        whole_run_gated = False
         for b in block_infos:
             cfg = b["cfg"]
             validate_nulls_rows(cfg, defects)  # 先于任何 parse_rel_rows 调用
@@ -1874,9 +2130,22 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                     b["count"], workdir / manifest_target["csv"], num_cols,
                     b["rows"], defects)
             validate_formula_references(cfg.get("formulas", {}), b["count"], defects)
+            ga_entries, ga_whole_run = split_group_aggregates(
+                cfg.get("formulas", {}).get("group_aggregates"), defects, b["label"])
+            if ga_whole_run and not whole_run_gated:
+                whole_run_gated = True
+                defects.append({"code": "CAPABILITY_NOT_ROLLED_OUT",
+                                "message": "group_aggregates.whole_run (跨块总计) 落点"
+                                           "语义 (末块尾部 vs 独立行) 需一次 spike 锁定 — "
+                                           "spike 前声明被结构化拒绝",
+                                "corrective_action": "用逐块块级 aggregates (每组合一块) "
+                                                     "表达, 或等 whole_run spike 结论"
+                                                     "落地后再声明"})
             for col in (set(per_row) | set(null_specs)
                         | {m.get("col") for m in cfg.get("merges", [])}
                         | gm_cols
+                        | {g.get("col") for g in ga_entries}
+                        | {g.get("group_by") for g in ga_entries if g.get("group_by")}
                         | {g.get("group_by") for g in cfg.get("group_merges", []) if g.get("group_by")}):
                 if col and col_letter_to_idx(col) >= num_cols:
                     defects.append({"code": "COL_OUT_OF_DIGEST", "col": col,
@@ -2054,6 +2323,8 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                               "inplace_overflow": inplace_overflow},
         "group_boundaries": group_boundaries,
         "sets": set_records,
+        "mechanical_facts": derive_mechanical_facts(
+            ops, target_cfg, blocks_cfg, block_infos),
         "render_qa": {"region": render_region},
     }
     return plan
@@ -2106,7 +2377,7 @@ def run_probe_cases(workdir: Path) -> list[dict]:
     import _probe_fixtures as pf
     out = []
     for case in pf.PROBE_CASES:
-        wd = pf.make_probe_workdir(workdir)  # fresh per case
+        wd = (case.get("workdir_factory") or pf.make_probe_workdir)(workdir)  # fresh per case
         spec = case["build"](pf.base_probe_spec(), wd)
         spec["fingerprints"] = {
             "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
