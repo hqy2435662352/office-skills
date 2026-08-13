@@ -23,6 +23,7 @@ from _officecli import (  # noqa: E402
     ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
     sha256_file,
 )
+from flatten_table import CLONE_ROLES  # noqa: E402
 
 try:
     import yaml
@@ -97,7 +98,8 @@ def fmt_num(v) -> str:
     return str(v)
 
 
-def build_digest(meta: dict, csv_path: Path, candidates: dict | None) -> list[str]:
+def build_digest(meta: dict, csv_path: Path, candidates: dict | None,
+                 for_target: bool = False) -> list[str]:
     dims = meta.get("dimensions", {})
     lines = []
     sheet = meta.get("sheet", "")
@@ -108,6 +110,31 @@ def build_digest(meta: dict, csv_path: Path, candidates: dict | None) -> list[st
         f" | {dims.get('formulas',0)}公式 | {dims.get('errorCells',0)}错误"
         f" | OLE:{dims.get('oleObjects',0)} 图表:{dims.get('charts',0)} 表:{dims.get('tables',0)}"
     )
+
+    gaps = meta.get("row_gaps") or []
+    if gaps:
+        lines.append(f"- 行号空洞: {gaps} — row 元素 r 值不连续, "
+                     f"`add ... after: /row[N]` 锚点链会断裂, 需 materialize 后重跑 prepare")
+
+    if for_target:
+        sg = meta.get("style_granularity") or {}
+        segs = sg.get("placeholder_segments") or []
+        if segs:
+            verdict = "带样式" if any(s.get("styled") for s in segs) else "裸行"
+            if verdict == "带样式":
+                sample = next((s.get("sample") for s in segs if s.get("styled")), None)
+                lines.append(f"- 占位行样式: 带样式 (样例: {sample})")
+            else:
+                ranges = ", ".join(f"{s.get('start')}-{s.get('end')}" for s in segs)
+                lines.append(f"- 占位行样式: 裸行 ({ranges})")
+        for c in sg.get("clone_source_rows") or []:
+            parts = []
+            for role, _off in CLONE_ROLES:
+                rinfo = c.get(role)
+                if rinfo:
+                    v = "带样式" if rinfo.get("styled") else "裸行"
+                    parts.append(f"{role}={rinfo.get('row')} {v}")
+            lines.append(f"- 克隆源行样式: B{c.get('block')}(" + " | ".join(parts) + ")")
 
     hb = meta.get("header_band") or {}
     col_names = parse_csv_headers(csv_path, hb)
@@ -211,12 +238,14 @@ def main():
     parser.add_argument("--meta", type=Path, required=True, help="flatten meta.json")
     parser.add_argument("--csv", type=Path, default=None, help="展平 CSV (提取表头名)")
     parser.add_argument("--candidates", type=Path, default=None, help="classify_columns 列候选 YAML (可选)")
+    parser.add_argument("--target", action="store_true",
+                        help="目标 sheet: 输出样式粒度决策事实 (占位行/克隆源行样式)")
     parser.add_argument("--out", type=Path, required=True, help="输出摘要 md")
     args = parser.parse_args()
 
     meta = load_meta(args.meta)
     cands = load_candidates(args.candidates)
-    lines = build_digest(meta, args.csv, cands)
+    lines = build_digest(meta, args.csv, cands, for_target=args.target)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps({"status": "SUCCESS", "code": "DIGEST_WRITTEN",

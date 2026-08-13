@@ -16,6 +16,7 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 import compile_fill  # noqa: E402
 import mod_nominate  # noqa: E402
 import promote_output  # noqa: E402
+from _mod_catalog import parse_mod_index  # noqa: E402
 from _probe_fixtures import (  # noqa: E402
     BASE_SPEC,
     make_probe_inplace_workdir as make_inplace_workdir,
@@ -867,6 +868,231 @@ class PrepareMergeTests(unittest.TestCase):
         by_name = {e["name"]: e for e in again}
         self.assertEqual(by_name["source_maoli_FRESH"]["csv"], "a2.csv")
         self.assertEqual(len(again), 3)
+
+
+class PrepareStyleGranularityTests(unittest.TestCase):
+    """Issue 03: prepare 阶段 B 样式粒度决策事实 (占位行裸行 vs 带样式).
+
+    埃及形态: 占位行 23-52 裸行 (无边框/填充/字体) → clone-append 正确终态;
+    MXP 报价单形态: 占位行带样式 (空单元格持边框/填充) → inplace 成立。
+    指纹计算不变: style_granularity 不入 structure_facts。
+    """
+
+    def _make_template(self, path, content_rows, placeholder_runs, styled_empty):
+        """Synthetic xlsx: content rows (borders+fill) + placeholder runs.
+
+        styled_empty=True → 占位行空单元格携带样式 (MXP 报价单形态);
+        False → 裸行 (row 元素仅行高, 无单元格, 埃及形态)."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Border, PatternFill, Side
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "S"
+        thin = Side(style="thin")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        fill = PatternFill("solid", fgColor="FFF2F2F2")
+        for r in range(1, content_rows + 1):
+            for c in ("A", "B", "C"):
+                cell = ws[f"{c}{r}"]
+                cell.value = f"v{r}"
+                cell.border = border
+                cell.fill = fill
+        for (start, end) in placeholder_runs:
+            for r in range(start, end + 1):
+                if styled_empty:
+                    for c in ("A", "B", "C"):
+                        ws[f"{c}{r}"].border = border
+                else:
+                    ws.row_dimensions[r].height = 24
+        wb.save(path)
+
+    def _detect(self, path, blocks, flat_rows, num_cols=6):
+        from flatten_table import detect_style_granularity
+        return detect_style_granularity(str(path), "S", blocks, flat_rows, num_cols)
+
+    def test_egypt_form_placeholder_bare_rows(self):
+        """埃及形态: 占位行 23-52 裸行 (无单元格 → 无样式), 克隆源行带样式."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "egypt.xlsx"
+            self._make_template(p, content_rows=21, placeholder_runs=[(23, 52)],
+                                styled_empty=False)
+            blocks = [{"start": 1, "end": 5, "title": "B1"},
+                      {"start": 7, "end": 15, "title": "B2"},
+                      {"start": 17, "end": 21, "title": "B3"}]
+            flat_rows = [[f"v{i}", str(i)] for i in range(1, 22)]
+            sg = self._detect(p, blocks, flat_rows)
+            self.assertEqual(
+                sg["placeholder_segments"],
+                [{"start": 23, "end": 52, "styled": False, "sample": None}])
+            # 克隆源行 (title/header/data) 全部带样式 — 克隆携带格式的事实依据
+            b1 = sg["clone_source_rows"][0]
+            for role in ("title", "header", "data"):
+                self.assertTrue(b1[role]["styled"], role)
+                self.assertEqual(b1[role]["row"],
+                                 {"title": 1, "header": 2, "data": 3}[role])
+            self.assertEqual(len(sg["clone_source_rows"]), 3)
+
+    def test_mxp_form_placeholder_styled_rows(self):
+        """MXP 报价单形态: 占位行空单元格带样式 → 带样式 (样例: A7)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "mxp.xlsx"
+            self._make_template(p, content_rows=6, placeholder_runs=[(7, 24)],
+                                styled_empty=True)
+            blocks = [{"start": 1, "end": 6, "title": "报价单"}]
+            flat_rows = [[f"v{i}", str(i)] for i in range(1, 7)]
+            sg = self._detect(p, blocks, flat_rows)
+            self.assertEqual(
+                sg["placeholder_segments"],
+                [{"start": 7, "end": 24, "styled": True, "sample": "A7"}])
+
+    def test_digest_lines_both_forms(self):
+        """digest 输出结论行: 裸行 (带段范围) / 带样式 (样例坐标); 克隆源行行."""
+        from structure_digest import build_digest
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "egypt.xlsx"
+            self._make_template(p, content_rows=21, placeholder_runs=[(23, 52)],
+                                styled_empty=False)
+            blocks = [{"start": 1, "end": 5, "title": "B1"}]
+            flat_rows = [[f"v{i}", str(i)] for i in range(1, 22)]
+            sg = self._detect(p, blocks, flat_rows)
+            meta = {"file": str(p), "sheet": "S",
+                    "dimensions": {"rows": 52, "cols": 6},
+                    "style_granularity": sg}
+            lines = build_digest(meta, None, None, for_target=True)
+            self.assertTrue(any("占位行样式: 裸行 (23-52)" in l for l in lines))
+            self.assertTrue(any(l.startswith("- 克隆源行样式: B1(") for l in lines))
+
+            p2 = tmp / "mxp.xlsx"
+            self._make_template(p2, content_rows=6, placeholder_runs=[(7, 24)],
+                                styled_empty=True)
+            sg2 = self._detect(p2, [{"start": 1, "end": 6, "title": "报价单"}],
+                               [[f"v{i}", str(i)] for i in range(1, 7)])
+            meta2 = {"file": str(p2), "sheet": "S",
+                     "dimensions": {"rows": 24, "cols": 6},
+                     "style_granularity": sg2}
+            lines2 = build_digest(meta2, None, None, for_target=True)
+            self.assertTrue(any("占位行样式: 带样式 (样例: A7)" in l for l in lines2))
+
+    def test_style_granularity_not_in_fingerprint(self):
+        """style_granularity 不入指纹: 带/不带该事实的 meta 指纹相同 (旧 spec
+        重编译不触发 fingerprint 失效)."""
+        from prepare_run import facts_sha256, structure_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "egypt.xlsx"
+            self._make_template(p, content_rows=21, placeholder_runs=[(23, 52)],
+                                styled_empty=False)
+            blocks = [{"start": 1, "end": 5, "title": "B1"}]
+            flat_rows = [[f"v{i}", str(i)] for i in range(1, 22)]
+            sg = self._detect(p, blocks, flat_rows)
+            base_meta = {"sheet": "S",
+                         "dimensions": {"rows": 52, "cols": 6, "data_rows": 21},
+                         "header_band": None,
+                         "merged_ranges": [],
+                         "blocks": blocks,
+                         "columns": [{"col": "A", "nonempty": 21, "numeric_ratio": 0.0}],
+                         "formulas": {}, "column_numfmt": {},
+                         "merge_anchors": []}
+            self.assertEqual(facts_sha256([structure_facts(base_meta)]),
+                             facts_sha256([structure_facts(
+                                 {**base_meta, "style_granularity": sg})]))
+
+    def test_fill_id_1_gray125_not_styled(self):
+        """fillId=1 (gray125 占位填充) 不算带样式: 仅 fillId>=2 的真实填充才
+        判带样式 (LibreOffice/默认样式引用 gray125 时不得误报 带样式)."""
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "gray125.xlsx"
+            # 手写最小 xlsx: styles.xml 定义 3 个样式 (0=默认, 1=gray125,
+            # 2=真实填充), sheet 的占位行单元格引用 s=1
+            styles_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<fonts count="1"><font><sz val="11"/></font></fonts>'
+                '<fills count="3">'
+                '<fill><patternFill patternType="none"/></fill>'
+                '<fill><patternFill patternType="gray125"/></fill>'
+                '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2F2"/></patternFill></fill>'
+                '</fills>'
+                '<borders count="1"><border/></borders>'
+                '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                '<cellXfs count="3">'
+                '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+                '<xf numFmtId="0" fontId="0" fillId="1" borderId="0" xfId="0" applyFill="1"/>'
+                '<xf numFmtId="0" fontId="0" fillId="2" borderId="0" xfId="0" applyFill="1"/>'
+                '</cellXfs>'
+                '</styleSheet>'
+            )
+            sheet_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData>'
+                '<row r="1"><c r="A1" t="inlineStr"><is><t>v1</t></is></c></row>'
+                '<row r="2"><c r="A2" s="1"/></row>'
+                '<row r="3"><c r="A3" s="2"/></row>'
+                '</sheetData></worksheet>'
+            )
+            wb_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                      '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                      '<sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>')
+            rels_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+                        'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                        '</Relationships>')
+            ct_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.'
+                      'relationships+xml"/>'
+                      '<Default Extension="xml" ContentType="application/xml"/>'
+                      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-'
+                      'officedocument.spreadsheetml.sheet.main+xml"/>'
+                      '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.'
+                      'openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                      '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-'
+                      'officedocument.spreadsheetml.styles+xml"/>'
+                      '</Types>')
+            with zipfile.ZipFile(p, "w") as z:
+                z.writestr("[Content_Types].xml", ct_xml)
+                z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                            'relationships"><Relationship Id="rId1" Type="http://schemas.'
+                            'openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                            'Target="xl/workbook.xml"/></Relationships>')
+                z.writestr("xl/workbook.xml", wb_xml)
+                z.writestr("xl/_rels/workbook.xml.rels", rels_xml)
+                z.writestr("xl/styles.xml", styles_xml)
+                z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            sg = self._detect(p, [{"start": 1, "end": 1, "title": "B1"}],
+                              [["v1", "1"]], num_cols=3)
+            # 占位行段: row 2 (gray125 → 裸行) 与 row 3 (solid → 带样式)
+            # 连续成一段, 但 gray125 单元格不得使段判带样式 — 样例必须来自
+            # row 3 的真实填充 (A3).
+            self.assertEqual(sg["placeholder_segments"],
+                             [{"start": 2, "end": 3, "styled": True, "sample": "A3"}])
+
+    def test_collect_style_granularity_manifest_wiring(self):
+        """prepare_run 把 flatten meta 的样式粒度事实并入 manifest (按条目名)."""
+        from prepare_run import collect_style_granularity
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            p = tmp / "egypt.xlsx"
+            self._make_template(p, content_rows=21, placeholder_runs=[(23, 52)],
+                                styled_empty=False)
+            sg = self._detect(p, [{"start": 1, "end": 5, "title": "B1"}],
+                              [[f"v{i}", str(i)] for i in range(1, 22)])
+            out = collect_style_granularity({
+                "src": {"columns": []},
+                "target": {"style_granularity": sg},
+            })
+            self.assertNotIn("src", out)
+            self.assertIn("target", out)
+            self.assertEqual(out["target"]["placeholder_segments"][0]["start"], 23)
 
 
 class DecisionStringTests(unittest.TestCase):
@@ -2231,6 +2457,43 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("一次列出全部源 sheet", text)
         self.assertIn("兜底", text)
+
+
+class ModCatalogIndexTests(unittest.TestCase):
+    """MOD_INDEX.md 目录解析: 转义管道 + 修订号漂移守护."""
+
+    def test_escaped_pipe_keeps_revision_column(self):
+        """信号格含 \\| 转义时, 列对齐不被破坏, revision 解析正确."""
+        text = (
+            "## Registered MODs\n\n"
+            "| MOD Name | Aliases | Scope Signals (+) | Exclusion Signals (-) | Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| m1 | alias | semantic_type::quotation,sheet_marker::三三三\\|333 |  | MOD_m1.md | 5 | private |\n"
+        )
+        entries = parse_mod_index(text)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.mod_name, "m1")
+        self.assertEqual(e.scope_signals, "semantic_type::quotation,sheet_marker::三三三|333")
+        self.assertEqual(e.revision, 5)
+        self.assertEqual(e.path, "MOD_m1.md")
+        self.assertEqual(e.visibility, "private")
+
+    def test_live_index_revisions_synced_with_mod_files(self):
+        """真实 MOD_INDEX 与 MOD 文件头修订号一致 (漂移守护)."""
+        refs = SKILL_ROOT / "references"
+        index_text = (refs / "MOD_INDEX.md").read_text(encoding="utf-8")
+        entries = parse_mod_index(index_text)
+        self.assertTrue(entries, "MOD_INDEX 无已注册 MOD")
+        for entry in entries:
+            mod_file = refs / entry.path
+            self.assertTrue(mod_file.is_file(), f"索引指向缺失文件: {entry.path}")
+            mod_text = mod_file.read_text(encoding="utf-8")
+            m = re.search(r"^Revision:\s*(\d+)", mod_text, re.MULTILINE)
+            self.assertIsNotNone(m, f"{entry.path} 缺 Revision 头")
+            self.assertEqual(
+                entry.revision, int(m.group(1)),
+                f"{entry.mod_name} 修订号漂移: 索引 {entry.revision} vs 文件 {m.group(1)}")
 
 
 if __name__ == "__main__":

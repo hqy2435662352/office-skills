@@ -227,6 +227,16 @@ def merge_flattened(existing: list, new_entries: list) -> list:
     return list(merged.values())
 
 
+def collect_style_granularity(metas_by_name: dict) -> dict:
+    """从已加载的 flatten meta 收集样式粒度决策事实 (按条目名).
+
+    决策事实, 不入指纹 — 指纹只覆盖 structure_facts 选取的结构键, 该事实
+    的加入不影响旧 spec 重编译 (2026-08-13 埃及复盘 issue 03)。"""
+    return {name: m["style_granularity"]
+            for name, m in metas_by_name.items()
+            if m.get("style_granularity")}
+
+
 def flatten_pptx_table(staged: Path, table_id: str, name: str, workdir: Path) -> None:
     """Flatten one PPTX table into CSV + meta (structure facts for the compiler).
 
@@ -349,7 +359,8 @@ def run_flatten_stage(workdir: Path, sheets_arg: str, target: str) -> None:
             r = _sp.run(
                 [sys.executable, str(Path(__file__).resolve().parent / "structure_digest.py"),
                  "--meta", str(meta_path), "--csv", str(workdir / entry["csv"]),
-                 "--candidates", str(cand_path), "--out", str(workdir / entry["digest"])],
+                 "--candidates", str(cand_path), "--out", str(workdir / entry["digest"])]
+                + (["--target"] if fname == target else []),
                 capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 fail("DIGEST_FAILED",
@@ -381,6 +392,20 @@ def run_flatten_stage(workdir: Path, sheets_arg: str, target: str) -> None:
         "source_structure": facts_sha256(source_facts),
         "target_structure": facts_sha256(target_facts),
     }
+    # 行号空洞 + 样式粒度决策事实 (一次读 meta, 两类事实):
+    # - row_gaps: row 元素 r 值不连续 (officecli add-after 锚点会断链),
+    #   供编译期校验 (TEMPLATE_ROW_GAP) 与 repair_row_gaps.py 修复;
+    # - style_granularity: 目标 sheet 占位行/克隆源行是否携带单元格样式
+    #   (带样式 → inplace 成立; 裸行 → clone-append 克隆携带格式)。
+    #   决策事实, 不入指纹 — 旧 spec 不因 digest 增强失效 (2026-08-13 埃及复盘).
+    metas_by_name = {
+        e["name"]: json.loads((workdir / e["meta"]).read_text(encoding="utf-8"))
+        for e in manifest["flattened"]
+    }
+    manifest["row_gaps"] = {
+        name: m["row_gaps"] for name, m in metas_by_name.items() if m.get("row_gaps")
+    }
+    manifest["style_granularity"] = collect_style_granularity(metas_by_name)
     save_manifest(workdir, manifest)
     _record_timing(workdir, "prepare_flatten")
     print(json.dumps({"status": "PASS", "code": "FLATTEN_STAGE_DONE",

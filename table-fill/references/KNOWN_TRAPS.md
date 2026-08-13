@@ -82,3 +82,18 @@
 |------|------|
 | **克隆携带合并区** | `add --from` 复制 template_row 的格式+值+**mergeCell** (实测: 克隆合并标题行 A1:F1 → 克隆行 A41:F41 带合并) — 标题/表头克隆源选合并行无需额外合并 op; data 行克隆携带的旧合并是 group_merges unmerge 的对象 |
 | **merges × aggregates 同列** | `merges 1:{n}` + `aggregates 1:{n}` 同列编译通过 (聚合锚点=合并锚点=块首行); 同列多条 aggregates 用显式范围 (2:2、3:3) 做块内多组小计; merges+多组显式范围同列**不建议** (聚合锚点落合并区非锚点格, 执行期未验证) |
+
+## 占位行样式粒度决策事实 (2026-08-13 埃及复盘)
+
+| 事实 | 结论 |
+|------|------|
+| **占位行样式决定 append vs inplace** | 占位行**裸行** (无边框/填充/字体) → inplace 填入即无边框块 (违反 VAL-007 格式沿用), 正确终态是 **clone-append** (克隆携带格式, 占位行自然下沉保留, 不写 remove_rows); 占位行**带样式** (空单元格持边框/填充) → inplace 才成立 |
+| **样式粒度事实已入 digest** | prepare 阶段 B 自动检测, 不用 unzip sheet XML 考古: digest 输出 `占位行样式: 裸行 (23-52)` / `占位行样式: 带样式 (样例: A23)` + 各 block 克隆源行 (title/header/data) 样式结论; manifest `style_granularity` 字段同源, **不入指纹** (旧 spec 不失效) |
+
+## 行号空洞与失败诊断陷阱 (2026-08-12 埃及复盘)
+
+| 陷阱 | 症状 | 根因 | 修复 |
+|------|------|------|------|
+| **模板行号空洞 (row gap)** | 执行报 `Anchor row N not found in <sheet>`; outline/digest 报 51 行但 row 元素 r 值不连续 (如 1..21, 23..52, 缺 22) | 模板 XML 缺失某 r 值 row 元素 (历史删除行残留), 空洞可能在**用户原始文件**里就存在 | `scripts/repair_row_gaps.py --workdir <dir>` 物化缺失行 → 重跑 `prepare_run.py --flatten` (指纹变化) → 更新 spec 指纹 → 重编译 → 重执行。已实证: `add after` 无法闭合空洞 (插入行落在空洞后的 r 值, 锚点链永久断裂); style-only 写 (`set /Sheet/A<r> numberformat=0.00`) 可物化空行元素不留内容, `value:null` 只在 officecli 保存过的文件上有效 |
+| **best-effort 部分成功不是证据** | `--best-effort` 跑完整 chunk "看起来成功" (行连续、值落位), 误导修复方向 | 部分 op 失败后 officecli 重排行号, 产生假象连续布局 | 只以原子模式 (默认) 执行结果为准; best-effort 仅用于定位失败 op, 其结果不得作为修复生效的证据 |
+| **诊断顺序纪律** | 前两轮修复全部落空 (盲猜 spacer role → key_outputs) | 失败后直接改 spec, 没先看完整错误行 + 模板 XML 层 | 失败 → ① 读 `_draft_failure.json` 的 `failing_op_error` / `failing_op` (完整错误行, 非 stdout_tail) → ② 解包目标 sheet XML 检查 row 元素 r 值连续性 → ③ 才动 spec。禁止在未看 XML 层的情况下猜 spec 层原因 |
