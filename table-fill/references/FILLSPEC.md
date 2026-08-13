@@ -421,6 +421,18 @@ formulas:
   **spike 前声明 → `CAPABILITY_NOT_ROLLED_OUT`** (结构化拒绝, 不询问用户)。
 - pptx 的 group_aggregates lowering 未 rollout → `PPTX_CAPABILITY_NOT_ROLLED_OUT`。
 
+### Q15: lookup 索引坏了 / 整列未命中怎么办?
+
+| 情形 | 行为 |
+|---|---|
+| 索引文件归一化后为空 (0 entries — 清洗脚本重写 inheritance.json 丢了 `field_consensus`, 或文件本身为空) | ❌ 编译拒绝 `LOOKUP_TABLE_EMPTY` (exit 3) — **不再静默全空** (埃及 FRESH 坑 1: 曾全部静默留空, 计划照常产出, 唯一暴露点是 Agent 审 mapping.md 发现 Written values 全空) |
+| 索引非空, 但某声明 lookup 列**所有行**都未命中 | ⚠️ 编译警告 `LOOKUP_COLUMN_ALL_MISSING` (不阻断, 记 warnings, Gate 呈现) — 拦截整列静默空, 同时允许合法缺失 (如某 SKU 确实不在索引里, 记 gaps) |
+
+- 修复 `LOOKUP_TABLE_EMPTY`: 检查索引结构 (`field_consensus` 是否存在 / 是否被
+  手工改写), 用 `build_inheritance_index.py` **重建索引** — 禁止手改 JSON。
+- `LOOKUP_COLUMN_ALL_MISSING` 出现时判断: 真缺失 (keys 不在索引 → 记 gaps) 还是
+  索引坏了 (结构问题 → 重建索引)。
+
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
@@ -610,6 +622,8 @@ digest, 不要 unzip sheet XML 考古。
 | KEY_OUTPUT_UNWRITTEN | key_outputs 指向未写格 | 换成被写的格 |
 | NUMERIC_OVERFLOW_RISK | 直接值 >4 位小数 / >12 位有效数字 (成本 15 位精度) | 加 `transform: round4` 或 `precision: keep` |
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
+| LOOKUP_TABLE_EMPTY | 索引归一化后为空 (field_consensus 丢失 / 文件被手工改写) | 检查索引结构, 用 build_inheritance_index.py 重建 — 禁止手改 JSON |
+| LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建) |
 | REQUIRED_COVERAGE_UNMATCHED | 必需源行未消费 | 修 selectors 或记入 gaps |
 | SPEC_TARGETS_TOO_MANY | 声明了多个目标 | 每次运行只编译一个目标 |
 | CLONE_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分行, 其余行残留克隆值 | 用 rows: all 或加列映射 |

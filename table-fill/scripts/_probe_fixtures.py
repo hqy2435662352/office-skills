@@ -181,6 +181,27 @@ def make_egypt_workdir(tmp) -> dict:
                               n_source_rows=len(EGYPT_SRC_ROWS))
 
 
+def make_empty_lookup_workdir(tmp) -> dict:
+    """Broken index: entries present but field_consensus dropped (hand-rewritten
+    JSON) → normalization produces an EMPTY table → LOOKUP_TABLE_EMPTY."""
+    wd = make_probe_workdir(tmp)
+    (tmp / "inheritance.json").write_text(json.dumps({
+        "schema": "table-fill-inheritance-index-v1",
+        "index": {"Z001": {}, "Z002": {}, "Z003": {}},
+    }), encoding="utf-8")
+    return wd
+
+
+def make_all_missing_lookup_workdir(tmp) -> dict:
+    """Non-empty index with none of the source keys → every declared lookup
+    column resolves to empty (legit-gap or broken-index case): compile proceeds
+    with LOOKUP_COLUMN_ALL_MISSING warnings."""
+    wd = make_probe_workdir(tmp)
+    (tmp / "inheritance.json").write_text(
+        json.dumps({"Z999": {"compressor": "C-9"}}), encoding="utf-8")
+    return wd
+
+
 BASE_SPEC = {
     "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
     "inputs": {"sources": ["source_maoli.xlsx"], "target": "target.xlsx",
@@ -585,6 +606,11 @@ PROBE_CASES = [
      "build": _lookup_missing_error},
     {"id": "lookup_field_missing", "expect": "LOOKUP_FIELD_MISSING",
      "build": _lookup_field_missing},
+    # ── Q15: lookup 索引完整性 (空索引 / 整列未命中) ──
+    {"id": "lookup_table_empty", "expect": "LOOKUP_TABLE_EMPTY",
+     "build": _lookup_missing_empty, "workdir_factory": make_empty_lookup_workdir},
+    {"id": "lookup_column_all_missing", "expect": "accept",
+     "build": _lookup_missing_empty, "workdir_factory": make_all_missing_lookup_workdir},
     # ── Q7: precision ──
     {"id": "precision_keep", "expect": "accept",
      "build": _precision_keep},

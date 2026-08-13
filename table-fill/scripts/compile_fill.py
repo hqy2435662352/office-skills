@@ -603,7 +603,8 @@ def _resolve_transform(tname: str, transforms: dict):
 
 def materialize_values(rows: list[tuple[list[str], int]], target: dict,
                        num_cols: int, lookups: dict, transforms: dict,
-                       defects: list) -> list[dict]:
+                       defects: list,
+                       lookup_stats: dict | None = None) -> list[dict]:
     """Per matched source row → {row_values: {target_col: value}, key_values}."""
     out = []
     for values, orig in rows:
@@ -630,7 +631,8 @@ def materialize_values(rows: list[tuple[list[str], int]], target: dict,
                 row_values[tcol] = v
             elif lookup and src is None:
                 # Lookup-only mapping: value comes from the lookup table alone.
-                v = resolve_lookup(lookup, values, lookups, defects)
+                v = resolve_lookup(lookup, values, lookups, defects,
+                                   lookup_stats, tcol)
                 if v is not None:
                     row_values[tcol] = v
             elif isinstance(src, list):
@@ -686,7 +688,8 @@ def materialize_values(rows: list[tuple[list[str], int]], target: dict,
                     v = fn(v)
                 lookup = col_map.get("lookup")
                 if lookup:
-                    v = resolve_lookup(lookup, values, lookups, defects)
+                    v = resolve_lookup(lookup, values, lookups, defects,
+                                       lookup_stats, tcol)
                     if v is None:
                         continue
                 row_values[tcol] = v
@@ -769,7 +772,8 @@ def apply_precision_policy(target: dict, data_rows: list,
             })
 
 
-def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list) -> str | None:
+def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list,
+                   stats: dict | None = None, tcol: str = "") -> str | None:
     """Resolve a lookup for one row. Returns the field value, '' on missing
     (when missing=empty), or None when a defect was recorded (caller skips)."""
     tbl = lookups.get(lookup["name"])
@@ -783,6 +787,10 @@ def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list) -> 
     key = values[col_letter_to_idx(kcol)] if kcol else None
     hit = tbl["data"].get(str(key), {}) if key is not None else {}
     if not hit:
+        # Key miss: a hit-vs-miss is unambiguous here, so count before the
+        # missing policy decides the outcome ("" vs LOOKUP_KEY_MISSING defect).
+        if stats is not None:
+            _note_lookup_outcome(stats, lookup["name"], tcol, miss=True)
         if lookup.get("missing") == "error":
             defects.append({"code": "LOOKUP_KEY_MISSING", "key": key,
                             "message": f"lookup key {key!r} not found in {lookup['name']}",
@@ -800,8 +808,47 @@ def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list) -> 
                                        + ("" if schema_has else " (not in the index schema)"),
                             "corrective_action": "Check inheritance index fields"})
             return None
+        if stats is not None:
+            _note_lookup_outcome(stats, lookup["name"], tcol, miss=True)
         return ""
+    if stats is not None:
+        _note_lookup_outcome(stats, lookup["name"], tcol, miss=False)
     return hit.get(field, "")
+
+
+def _note_lookup_outcome(stats: dict, name: str, tcol: str, miss: bool) -> None:
+    """Count per-(lookup, column) resolutions for the all-missing guard.
+
+    Recorded where the hit/miss semantics are known (inside resolve_lookup):
+    a key that is found in the table counts as a hit even when its stored
+    field value is empty; only actual misses (key/field absent) count against
+    the column. Defect resolutions never reach this — they already failed."""
+    cur = stats.setdefault((name, tcol), {"total": 0, "missing": 0})
+    cur["total"] += 1
+    if miss:
+        cur["missing"] += 1
+
+
+def note_lookup_all_missing(stats: dict, warnings: list) -> None:
+    """Declared lookup columns that resolved to empty for EVERY row → warning.
+
+    LOOKUP_COLUMN_ALL_MISSING (warn-only, compile proceeds): a non-empty index
+    whose keys never hit may be a genuine absence (record as gaps — e.g. the
+    Egypt FRESH 商用风管 SKU really is not in the index) or a broken index;
+    either way an entire column of silent blanks must not pass unremarked."""
+    for (name, tcol), cur in sorted(stats.items()):
+        if cur["total"] > 0 and cur["missing"] == cur["total"]:
+            warnings.append({
+                "code": "LOOKUP_COLUMN_ALL_MISSING", "lookup": name, "column": tcol,
+                "message": f"lookup column {tcol} (lookup {name!r}) resolved to "
+                           f"empty for ALL {cur['total']} row(s) — either the keys "
+                           "are genuinely absent from the index (record them as "
+                           "gaps) or the index file is broken",
+                "corrective_action": "Check the index file (field_consensus still "
+                                     "present? rebuilt with "
+                                     "build_inheritance_index.py?); if the keys "
+                                     "really are absent, record them as gaps",
+            })
 
 
 def normalize_lookup_data(data: dict, name: str) -> dict:
@@ -841,8 +888,20 @@ def build_lookup_tables(spec_mapping: dict, target_cfg: dict, workdir: Path) -> 
         except ValueError as e:
             fail("LOOKUP_INVALID", f"lookup source {lk['from']} not JSON: {e}",
                  "Fix the lookup file")
-        tables[lk["name"]] = {"data": normalize_lookup_data(data, lk["name"]),
-                              "key_column": lk.get("key_column")}
+        normalized = normalize_lookup_data(data, lk["name"])
+        if not normalized:
+            # Egypt FRESH pitfall 1 (2026-08-13): a cleaning script rewrote
+            # inheritance.json and dropped field_consensus → the table normalized
+            # to 0 entries → every lookup silently resolved to "" (missing:
+            # empty), D/F/X all blank, compile passed. Never silent again.
+            fail("LOOKUP_TABLE_EMPTY",
+                 f"lookup {lk['name']!r} ({lk['from']}) normalized to an EMPTY "
+                 "table (0 entries) — every lookup on it would resolve to missing",
+                 "Check the index file structure: does build_inheritance_index.py "
+                 "output still carry field_consensus (was the JSON hand-rewritten "
+                 "by a cleaning script)? Rebuild with build_inheritance_index.py "
+                 "— never hand-edit the index JSON")
+        tables[lk["name"]] = {"data": normalized, "key_column": lk.get("key_column")}
     return tables
 
 
@@ -2012,6 +2071,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     lookups = build_lookup_tables(spec["mapping"], target_cfg, workdir)
     transforms = build_transforms(spec["mapping"], target_cfg)
     warnings: list = []
+    lookup_stats: dict = {}
 
     # Materialize per block and attach block data (rows, source, block index).
     block_infos: list[dict] = []
@@ -2022,7 +2082,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         matched = match_block_sources(bcfg, label)
         materialized = materialize_values(
             [r for m in matched for r in m["matched"]], bcfg, num_cols,
-            lookups, transforms, defects)
+            lookups, transforms, defects, lookup_stats)
         drs = []
         # map materialized rows back to their source csv
         src_of = []
@@ -2040,6 +2100,8 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         matched_all.extend(matched)
         block_infos.append({"cfg": bcfg, "rows": drs, "count": len(drs),
                             "matched": matched, "label": label})
+
+    note_lookup_all_missing(lookup_stats, warnings)
 
     for b in block_infos:
         b["cfg"]["_rows"] = b["rows"]

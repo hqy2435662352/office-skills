@@ -25,6 +25,7 @@
 | **验证对象=模板基线 issue 噪音** | 输出仍有几百条 issues，误判失败 | 模板自带基线 issue（埃及模板 235 条） | 只认 issue **delta**（输出 − 模板）；`issues_delta` 内置 |
 | **flatten 标题行虚假数据** | 展平 CSV 中横向合并标题行显示上一数据行值 | 旧前向填充把合并区覆盖当纵向合并 | flatten 已修复（仅纵向合并传播锚点值）；重新 flatten |
 | **全表继承查询重复扫描** | 逐码 get D/F/X，耗时和上下文暴涨 | SKU 命中不携带相邻角色字段 | 用 `build_inheritance_index.py` 一次 `officecli view text`；索引生成后封闭取数 |
+| **索引被手工改写 → 静默全空 (2026-08-13)** | 清洗脚本重写 inheritance.json 丢 `field_consensus` → normalize 后索引表为空 → D/F/X 全部静默留空 (missing: empty), 编译照常产出, 唯一暴露点是 Agent 审 mapping.md 发现 Written values 全空 | normalize_lookup_data 只认 field_consensus; 手改 JSON 丢字段 | 编译器现以 LOOKUP_TABLE_EMPTY (exit 3) 编译拒绝; 整列未命中 (索引非空) → LOOKUP_COLUMN_ALL_MISSING 警告 (Gate 呈现) — 索引清洗一律用 `build_inheritance_index.py` 重建, **禁止手改 JSON** |
 | **stale spec 静默执行** | 结构变了还在用旧 spec 填充 | 无 fingerprint 校验 | Compiler 强制 fingerprint 匹配 (FILLSPEC_FINGERPRINT_MISMATCH)；结构变化 → 重跑 prepare_run |
 | **resident 延迟写被 taskkill 丢尾部 chunk (2026-08-12)** | readback 全过但最终文件缺最后一批值 (如 13 行填了前 8 行) | 坐标探针 `officecli get` 启动 resident 后, 后续 batch 在内存中应用、磁盘写延迟到 save/close/idle；结尾 `clean_residents()` taskkill 把未刷盘的 chunk 丢了 | `execute_batch.py` 已在 chunk 循环尾部与主流程结尾显式 `officecli close` 刷盘 (无 resident 时 close 是 no-op)；遇此症状先重跑执行并核对 `_draft_failure.json` |
 | **selectors 用目标列数校验 (2026-08-12)** | 27 列源表进 6 列目标时报 `selector column 'L' out of range` | selector 校验误用目标 dims.cols | Compiler 已改按**源表实际宽度**校验 selector 列 |
@@ -84,6 +85,7 @@
 | **克隆携带合并区** | `add --from` 复制 template_row 的格式+值+**mergeCell** (实测: 克隆合并标题行 A1:F1 → 克隆行 A41:F41 带合并) — 标题/表头克隆源选合并行无需额外合并 op; data 行克隆携带的旧合并是 group_merges unmerge 的对象 |
 | **merges × aggregates 同列** | `merges 1:{n}` + `aggregates 1:{n}` 同列编译通过 (聚合锚点=合并锚点=块首行); 同列多条 aggregates 用显式范围 (2:2、3:3) 做块内多组小计; merges+多组显式范围同列**不建议** (聚合锚点落合并区非锚点格, 执行期未验证) |
 | **remove/add 交互 (执行顺序契约, 2026-08-13)** | append 块 remove_rows ≤ base_last_row → 模板坐标在 add 区之外, **不被 add 推移** (REMOVE_TARGETS_APPEND_ZONE 保证与 add 区无交集); op 恒序 clear→add→remove→merge→fill (值写入不穿插 add, 防 duplicate_row); remove 自底向上; ops 用模板坐标, readback 用最终坐标 (inplace 移位由编译器翻译)。每份 plan 自带机械事实: execution_plan.json `mechanical_facts` / mapping.md「执行机械事实」栏 — 埃及 11_FRESH本土 式行位移考古不再需要, 先查 FILLSPEC「执行顺序保证」 |
+| **lookup 索引完整性 (2026-08-13)** | 索引归一化后为空 (0 entries — 手改 JSON 丢 field_consensus) → 编译器 LOOKUP_TABLE_EMPTY (exit 3) 拒绝, **不再静默全空**; 索引非空但声明 lookup 列全部未命中 → LOOKUP_COLUMN_ALL_MISSING 警告 (可继续编译, Gate 呈现) — 索引清洗一律用 build_inheritance_index.py 重建, **禁止手改 JSON** (见 FILLSPEC Q15) |
 | **group_aggregates lowering (2026-08-13)** | 组锚点行落公式: 组由 group_by 物化值连续同值段 (compute_groups) 派生, {r1}:{r2} 按组起止展开且必须留块内 (AGG_RANGE_INVALID 为数据派生恒真不变量); 各锚点自动登记 nonempty readback; 与 group_merges/per_row 同列或组聚合列进 nulls → DUPLICATE_TARGET_WRITE (一格一 owner)。**whole_run 跨块总计落点语义 (末块尾部 vs 独立行) 未 spike — 声明 → CAPABILITY_NOT_ROLLED_OUT**, 免重复 spike |
 
 ## 占位行样式粒度决策事实 (2026-08-13 埃及复盘)

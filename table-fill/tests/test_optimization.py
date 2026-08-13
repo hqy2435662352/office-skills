@@ -19,6 +19,8 @@ import promote_output  # noqa: E402
 from _mod_catalog import parse_mod_index  # noqa: E402
 from _probe_fixtures import (  # noqa: E402
     BASE_SPEC,
+    make_all_missing_lookup_workdir,
+    make_empty_lookup_workdir,
     make_egypt_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
@@ -64,6 +66,20 @@ def compile_fail_codes(wd: dict, spec: dict) -> list[str]:
         return re.findall(r'"code": "([A-Z_]+)"', buf.getvalue())
     finally:
         sys.stderr = old
+
+
+def lookup_column_spec(wd: dict, field: str = "compressor",
+                       missing: str = "empty", key_column: str = "C",
+                       target: str = "F") -> dict:
+    """Base spec + one lookup-only column mapping (Q6/Q15 tests)."""
+    spec = spec_with(wd)
+    spec["mapping"]["targets"][0]["columns"].append(
+        {"target": target, "lookup": {"name": "fields",
+                                      "field": field, "missing": missing}})
+    spec["mapping"]["targets"][0]["lookups"] = [
+        {"name": "fields", "from": "inheritance.json", "key_column": key_column,
+         "fields": [field], "missing": missing}]
+    return spec
 
 
 INPLACE_BASE_SPEC = {
@@ -702,6 +718,67 @@ class LookupNormalizeTests(unittest.TestCase):
         }
         out = compile_fill.normalize_lookup_data(data, "x")
         self.assertEqual(out, {"Z001": {"compressor": "C-1"}})
+
+    # ── Q15: lookup 索引完整性 (埃及 FRESH 坑 1) ──
+    def test_lookup_table_empty_rejected(self):
+        """索引归一化后为空 (field_consensus 被清洗脚本重写丢失) →
+        LOOKUP_TABLE_EMPTY (exit 3), 不再静默全空留白."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_empty_lookup_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            codes = compile_fail_codes(wd, lookup_column_spec(wd))
+            self.assertIn("LOOKUP_TABLE_EMPTY", codes)
+
+    def test_lookup_table_plain_empty_rejected(self):
+        """扁平索引文件本身为空 ({}) → 同样 LOOKUP_TABLE_EMPTY (0 entries)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            (Path(tmp) / "inheritance.json").write_text("{}", encoding="utf-8")
+            self.assertIn("LOOKUP_TABLE_EMPTY",
+                          compile_fail_codes(wd, lookup_column_spec(wd)))
+
+    def test_lookup_column_all_missing_warns(self):
+        """索引非空但声明 lookup 列全部未命中 → LOOKUP_COLUMN_ALL_MISSING 警告
+        (编译继续, Gate 呈现) — 拦截整列静默空, 允许合法缺失."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_all_missing_lookup_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], Path(tmp))
+            codes = [w["code"] for w in plan["warnings"]]
+            self.assertIn("LOOKUP_COLUMN_ALL_MISSING", codes)
+            self.assertEqual(
+                [w["value"] for w in plan["writes"] if w["col"] == "F"],
+                ["", "", ""])  # 全列留空但不再静默
+            self.assertGreater(len(plan["operations"]), 0)  # 警告不阻断编译
+
+    def test_lookup_column_partial_miss_no_warning(self):
+        """部分命中 (部分行缺失是合法 gaps) → 不触发全列警告."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            (Path(tmp) / "inheritance.json").write_text(
+                json.dumps({"Z001": {"compressor": "C-1"}}), encoding="utf-8")
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], Path(tmp))
+            self.assertNotIn("LOOKUP_COLUMN_ALL_MISSING",
+                             [w["code"] for w in plan["warnings"]])
+
+    def test_lookup_column_all_hit_empty_values_no_warning(self):
+        """键全部命中但索引存储值本身为空串 (真命中) → 不触发全列警告
+        (命中 ≠ 缺失; 统计在 resolve_lookup 内按命中/缺失语义计数)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            (Path(tmp) / "inheritance.json").write_text(json.dumps({
+                "Z001": {"compressor": ""}, "Z002": {"compressor": ""},
+                "Z003": {"compressor": ""},
+            }), encoding="utf-8")
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], Path(tmp))
+            self.assertNotIn("LOOKUP_COLUMN_ALL_MISSING",
+                             [w["code"] for w in plan["warnings"]])
 
 
 class NumericPrecisionTests(unittest.TestCase):
@@ -2762,7 +2839,8 @@ class CapabilitiesTests(unittest.TestCase):
                     "lookup_missing_empty", "precision_keep", "per_group_total_blocks",
                     "per_group_total_hardcoded_ranges", "nulls_aggregate_same_col",
                     "pptx_group_merges", "group_aggregates_egypt_3_groups",
-                    "group_aggregates_whole_run_gate"):
+                    "group_aggregates_whole_run_gate", "lookup_table_empty",
+                    "lookup_column_all_missing"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
 
 
@@ -3064,6 +3142,32 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("一次列出全部源 sheet", text)
         self.assertIn("兜底", text)
+
+    def test_fillspec_q15_lookup_integrity_section(self):
+        """契约章节含 Q15: 空索引 → LOOKUP_TABLE_EMPTY (exit 3); 整列未命中 →
+        LOOKUP_COLUMN_ALL_MISSING 警告 (防章节误删 / 静默全空回退)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q15:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q15 小节")
+        q15 = section[m.end():]
+        self.assertIn("LOOKUP_TABLE_EMPTY", q15)
+        self.assertIn("LOOKUP_COLUMN_ALL_MISSING", q15)
+        self.assertIn("field_consensus", q15)
+
+    def test_fillspec_error_code_table_has_lookup_integrity(self):
+        """LOOKUP_TABLE_EMPTY / LOOKUP_COLUMN_ALL_MISSING 在「常见编译错误速查」
+        表内 (防章节误删)."""
+        table = self._error_code_table()
+        self.assertIn("LOOKUP_TABLE_EMPTY", table)
+        self.assertIn("LOOKUP_COLUMN_ALL_MISSING", table)
+
+    def test_known_traps_lookup_index_rebuild(self):
+        """KNOWN_TRAPS 沉淀索引清洗机械事实: LOOKUP_TABLE_EMPTY 拦截 + 禁止手改
+        JSON, 用 build_inheritance_index.py 重建."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
+        self.assertIn("LOOKUP_TABLE_EMPTY", text)
+        self.assertIn("手改 JSON", text)
+        self.assertIn("build_inheritance_index.py", text)
 
     def test_fillspec_layout_decision_tree_style_first(self):
         """FILLSPEC 布局决策树: 以样式为第一判定条件 (带样式分支先于裸行分支),
