@@ -873,6 +873,68 @@ class NumericPrecisionTests(unittest.TestCase):
             self.assertEqual(plan["operation_count"] > 0, True)
             self.assertEqual(plan["warnings"], [])  # explicit keep → untouched
 
+    def _set_column_width(self, tmp: Path, widths: dict | None) -> None:
+        """重写 fixture 的 target_meta.json 的 column_width (不入指纹, 无需重算)."""
+        meta_path = tmp / "target_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if widths is None:
+            meta.pop("column_width", None)
+        else:
+            meta["column_width"] = widths
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    def _keep_spec(self, wd: dict) -> dict:
+        spec = spec_with(wd)
+        spec["mapping"]["targets"][0]["columns"].append(
+            {"target": "E", "value": "168.715100569657", "precision": "keep"})
+        return spec
+
+    def test_precision_keep_narrow_column_rejected(self):
+        """prepare 已采集列宽 (E=8) 且该列最宽渲染值 (16 字符) 超出列宽 →
+        PRECISION_KEEP_NARROW_COLUMN 编译拒绝 (exit 3) — 不再执行期才发现
+        text_overflow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            self._set_column_width(Path(tmp), {"E": 8})
+            codes = compile_fail_codes(wd, self._keep_spec(wd))
+            self.assertIn("PRECISION_KEEP_NARROW_COLUMN", codes)
+
+    def test_precision_keep_wide_column_ok(self):
+        """列宽 20 > 最宽渲染值 16 → keep 编译通过, 无警告."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            self._set_column_width(Path(tmp), {"E": 20})
+            plan = compile_spec_with(wd, self._keep_spec(wd))
+            self.assertGreater(plan["operation_count"], 0)
+            self.assertEqual(plan["warnings"], [])
+
+    def test_precision_keep_width_unknown_warns(self):
+        """旧 meta 无 column_width → 保持豁免 (编译通过) + 警告提示无法验证."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            self._set_column_width(Path(tmp), None)
+            plan = compile_spec_with(wd, self._keep_spec(wd))
+            self.assertGreater(plan["operation_count"], 0)
+            codes = [w["code"] for w in plan["warnings"]]
+            self.assertIn("PRECISION_KEEP_WIDTH_UNVERIFIED", codes)
+
+    def test_precision_keep_narrow_round4_clears_defect(self):
+        """corrective_action 落地: 同一窄列 (E=8) 改用 transform: round4 →
+        编译通过, 无警告."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = make_workdir(Path(tmp))
+            wd["workdir"] = Path(tmp)
+            self._set_column_width(Path(tmp), {"E": 8})
+            spec = spec_with(wd)
+            spec["mapping"]["targets"][0]["columns"].append(
+                {"target": "E", "value": "168.715100569657", "transform": "round4"})
+            plan = compile_spec_with(wd, spec)
+            vals = [w["value"] for w in plan["writes"] if w["col"] == "E"]
+            self.assertEqual(vals, ["168.7151"] * 3)
+
     def test_overlong_integer_still_hard_fails(self):
         """>12-digit integers cannot be shortened by rounding → hard defect."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -900,6 +962,66 @@ class NumericPrecisionTests(unittest.TestCase):
             spec = spec_with(wd)  # base spec values are short
             plan = compile_fill.compile_spec(spec, wd["manifest"], Path(tmp))
             self.assertGreater(plan["operation_count"], 0)
+
+
+class PrecisionWidthEstimatorTests(unittest.TestCase):
+    """estimate_rendered_width 边界固定 (启发式的机器可验证确定性边界 —
+    低估才会放行执行期溢出, 高估只会建议 round4 = 文档首选, 安全方向).
+
+    与 Q7 契约同源: keep 列宽校验的渲染宽度就是这里的估算."""
+
+    def test_general_uses_raw_length(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.715100569657"), 16)
+        self.assertEqual(est("168.715100569657", "General"), 16)
+        # 无 0/# 占位符的格式 (如日期/纯文本) → 按原始字符串长度保守计
+        self.assertEqual(est("168.715100569657", "yyyy-mm-dd"), 16)
+
+    def test_format_truncates_decimals(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.715100569657", "0.00"), 6)       # 168.72
+        self.assertEqual(est("-168.7151", "0.00"), 7)              # -168.72
+
+    def test_thousands_separators(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("1234567.89", "#,##0.00"), 12)        # 1,234,567.89
+
+    def test_zero_pad_integer(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.5", "000000.00"), 9)             # 000168.50
+
+    def test_quoted_literals(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.5", '0"万元"'), 5)               # 168万元
+
+    def test_parenthesized_negative(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("-168.5", "(0.00)"), 8)               # (168.50), 无负号
+
+    def test_exponent_suffix_counted(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.715100569657", "0.00E+00"), 10)  # 保守高估 (安全方向)
+
+    def test_currency_and_percent_symbols(self):
+        est = compile_fill.estimate_rendered_width
+        self.assertEqual(est("168.5", '"$"#,##0.00'), 7)           # $168.50 (引号内 $ 不双计)
+        self.assertEqual(est("0.1685", "0.00%"), 6)                # 16.85% (×100 缩放计入)
+        self.assertEqual(est("168.7151", "0.00%"), 9)              # 16871.51%
+
+
+class OverflowDetectorBackingTests(unittest.TestCase):
+    """执行期 text_overflow 检测器仍有单测背书 — keep 窄列前移到编译期拒绝后,
+    execute 期检测器是第二道防线, 不得静默回归 (issue 04 契约闭环)."""
+
+    def test_classify_issue_overflow_messages(self):
+        from _defect_class import classify_issue
+        self.assertEqual(classify_issue("A5", "overflow",
+                                        "value overflows column width"), "text_overflow")
+        self.assertEqual(classify_issue("A5", "",
+                                        "需要 24pt 才能显示"), "text_overflow")
+        self.assertEqual(classify_issue("A5", "empty",
+                                        "cell value is empty"), "empty_cell")
+        self.assertEqual(classify_issue("A5", "", "ok"), "unknown")
 
 
 class NotePhaseTests(unittest.TestCase):
@@ -3025,6 +3147,18 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("round4", q7)
         self.assertIn("keep", q7)
         self.assertLess(q7.index("round4"), q7.index("keep"))
+
+    def test_fillspec_q7_keep_column_width_check(self):
+        """Q7 含 keep 列宽实测背书契约 (issue 04): 缺陷码 + 列宽未知豁免
+        语义都必须在正文 (防契约条目被误删)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q7:.*\n", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q7 小节")
+        q7 = section[m.end():]
+        self.assertIn("PRECISION_KEEP_NARROW_COLUMN", q7)
+        self.assertIn("PRECISION_KEEP_WIDTH_UNVERIFIED", q7)
+        self.assertIn("column_width", q7)
+        self.assertIn("PRECISION_KEEP_NARROW_COLUMN", self._error_code_table())
 
     def test_fillspec_capability_mapping_table(self):
         """能力映射表章节覆盖 MOD 规则类型 × 支持状态."""

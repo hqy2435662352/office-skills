@@ -8,6 +8,7 @@
 | **验证跑在错误文件** | 验证通过但输出文件为空 | 验证脚本读取了临时文件而不是最终文件 | 验证/readback 一律指向 `validated_draft.<ext>`（执行后）与 final（提升后）路径 |
 | **add 之间穿插 cell 写入 → 重复行 (2026-08-10)** | XML 出现两个 `<row r=N>`；部分格的值/公式/合并落到错误元素，readback 与 validate 表现不一致 | 在 `add` 操作之间对已克隆行写 value 破坏 officecli 行簿记（如标题克隆后立即写标题文本，随后继续 add 表头/数据行） | 所有 cell 写入必须排在全部 add/remove 之后 — `compile_fill.py` 内置此全局排序；标题克隆文本在 fills 阶段写入。**禁止手写 batch 绕过** |
 | **`precision: keep` 对抗 overflow 无效 (2026-08-10)** | 保留 15 位面价后新格全触发 overflow | "旧块也存全精度"不构成豁免 — issue delta 按路径计数, 旧块同款问题是基线噪音, 新格全算新增 | 真消除换行: 直接值 `round4` + 公式 ROUND 精准 (见 FAILURE_CLASSES); `precision: keep` 只在列宽确有余量时用 |
+| **`precision: keep` 需要列宽实测背书 (2026-08-13)** | 编译期放行 keep → 执行期 P/R 全部 text_overflow (埃及 FRESH 白烧一轮 execute) | 编译器不知道模板列宽, keep 的"列宽够"前提只能靠 Agent 猜 | 机械事实: prepare 已采集 `meta.column_width` (flatten 从 worksheet XML `<cols>` 读取, 不入指纹) — 编译期估算 keep 列最宽渲染值, 超列宽 → `PRECISION_KEEP_NARROW_COLUMN` (exit 3, corrective_action 改用 round4); 列宽未知 (旧 meta) → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告 (见 FILLSPEC Q7) |
 | **ROUND 扫射放大毛利 (2026-08-10)** | 给 R 结算价=P+Q 加 ROUND → 168.7151 截成 168.72 → 毛利 (O−R)×数量 从 −115181.63 漂到 −115200 | ROUND 加在了无残值的加法上 | ROUND 只加在减法/乘法/除法/SUM; P+Q 保持原式 |
 | **模板行高 20pt + 长值 → text overflow (2026-08-10)** | 数据行固定 customHeight=20pt, 长值换行 2 行 24pt > 20pt 判溢出 | 模板行高窄 + 超长渲染文本 | round4/ROUND 消除换行; 行高调整属模板层, 不动 |
 | **克隆源=合并锚点行 → 公式残留** | 新块非锚点单元格残留克隆公式（如 V28 残留 `SUM(T28:T30)`），validate/issues/readback 均不报 | `add --from` 把锚点行公式随行复制到新行；合并后非锚点单元格残留公式 | data 的 template_row 一律选**非锚点数据行**（同格式即可）。Compiler 静态检查 CLONE_SOURCE_IS_ANCHOR |

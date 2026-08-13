@@ -232,7 +232,10 @@ SUM 聚合 (如 O/S/T 用 ROUND(...,2), 比率 U/V/W 用 ROUND(...,4)); 无残�
 **精度约定**: 直接写入的数值若 >4 位小数或 >12 位有效数字 (如源面价
 `168.715100569657`), Compiler 在**编译期**报 `NUMERIC_OVERFLOW_RISK` —
 加内置 `transform: round4` (或 round2) 即可, 不必等到执行期溢出再修一轮;
-`precision: keep` 显式接受长精度。
+`precision: keep` 显式接受长精度, 但**需要列宽实测背书** — prepare 已采集
+模板列宽 (`meta.column_width`) 时, 编译器估算 keep 列最宽渲染值并与列宽
+比较: 超出 → `PRECISION_KEEP_NARROW_COLUMN` (exit 3, corrective_action 改用
+round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
 
 **撰写规程 (先写后编译循环)**:
 

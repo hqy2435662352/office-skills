@@ -532,6 +532,31 @@ def _read_sheet_xml(filepath, sheet):
         return None, None
 
 
+def detect_column_widths(filepath, sheet):
+    """检测 sheet 的显式列宽: worksheet XML `<cols>` 元素 (width 属性).
+
+    列宽是 `precision: keep` 编译期校验的机械前提 — 编译器不能靠 Agent 猜
+    "列宽够不够"。直读 xlsx XML (同 detect_row_gaps), 不依赖 officecli。
+    解析失败 / 无 `<cols>` → {} (旧 meta 无宽度字段时编译端豁免并警告)。
+    返回 {列字母: width} (Excel 列宽单位 ≈ 默认字体数字字符宽)。
+    """
+    zf, xl = _read_sheet_xml(filepath, sheet)
+    if zf is None:
+        return {}
+    widths = {}
+    for m in re.finditer(r'<(?:x:)?col\b[^>]*?/>', xl):
+        tag = m.group(0)
+        minc = re.search(r'min="(\d+)"', tag)
+        maxc = re.search(r'max="(\d+)"', tag)
+        wm = re.search(r'width="([\d.]+)"', tag)
+        if not (minc and maxc and wm):
+            continue
+        w = float(wm.group(1))
+        for ci in range(int(minc.group(1)), int(maxc.group(1)) + 1):
+            widths[col_idx_to_letter(ci - 1)] = w
+    return widths
+
+
 def detect_row_gaps(filepath, sheet):
     """检测 sheet 的行号空洞: row 元素 r 值不连续 (如 1..21, 23..52 → [22]).
 
@@ -682,6 +707,7 @@ def build_meta(filepath, sheet, cells, num_cols, num_rows, flat_rows, outline_da
     meta["column_numfmt"] = facts["column_numfmt"]
     meta["merge_anchors"] = build_merge_anchors(meta["merged_ranges"], facts["formulas"])
     meta["row_gaps"] = detect_row_gaps(filepath, sheet)
+    meta["column_width"] = detect_column_widths(filepath, sheet)
     meta["style_granularity"] = detect_style_granularity(
         filepath, sheet, meta["blocks"], flat_rows, num_cols)
     for k in ("formulas", "errorCells", "tables", "charts", "oleObjects"):

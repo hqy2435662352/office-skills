@@ -697,8 +697,54 @@ def materialize_values(rows: list[tuple[list[str], int]], target: dict,
     return out
 
 
+def estimate_rendered_width(num, numfmt=None):
+    """估算数字在某列 numFmt 下的渲染字符数.
+
+    Excel 列宽单位 ≈ 默认字体 (Calibri 11) 数字字符宽, 因此渲染字符数可
+    与 meta.column_width 直接比较。无 numFmt (General / 纯文本格式) →
+    原始字符串长度; 有 numFmt → 按格式形态估算: 整数位数 (含零填充) +
+    千分位逗号 + 小数位 + 小数点 + 百分号/货币符号 + 括号 + 引号字面量 +
+    指数后缀 (负号计入)。启发式偏保守 (高估安全方向: 高估只会导致编译
+    建议 round4 — 文档首选; 低估才会放行执行期溢出); 不执行真实 Excel
+    渲染 (机器可验证的确定性估算, 边界由契约测试固定, 见 FILLSPEC Q7)。
+    日期等无数字占位符的格式按原始字符串长度计。
+    """
+    s = str(num).strip()
+    if not numfmt or ("0" not in numfmt and "#" not in numfmt):
+        return len(s)
+    nf = str(numfmt).split(";")[0]
+    fmt_int, _, fmt_dec = nf.partition(".")
+    parens = 2 if "(" in nf and ")" in nf else 0
+    body = s.lstrip("-")
+    int_part, _, _dec = body.partition(".")
+    int_digits = max(len(int_part), len(re.findall(r"0", fmt_int)))
+    # 百分号/千分号格式 ×100/×1000 缩放 (按值实算整数位数, 确定且保守)
+    if "%" in nf or "‰" in nf:
+        try:
+            int_digits = max(int_digits, len(str(int(float(body) * 100))))
+        except (ValueError, OverflowError):
+            int_digits += 2
+    # 指数后缀先从格式中摘除再数小数位 (E+00 的 00 是后缀, 不是小数位)
+    exp_m = re.search(r"[Ee][+-]\d+", nf)
+    exponent = len(exp_m.group(0)) if exp_m else 0
+    if exp_m:
+        fmt_dec = re.sub(r"[Ee][+-]\d+", "", fmt_dec)
+    dec_show = len(re.findall(r"[0?]", fmt_dec)) if fmt_dec else 0
+    commas = (int_digits - 1) // 3 if "," in fmt_int and int_digits > 3 else 0
+    # 引号字面量计数; 符号计数排除引号内 (防双计)
+    literals = sum(len(q) for q in re.findall(r'"([^"]*)"', nf))
+    nf_unquoted = re.sub(r'"[^"]*"', "", nf)
+    symbols = len(re.findall(r"[%‰$€£¥￥]", nf_unquoted))
+    sign = 0 if parens else (1 if s.startswith("-") else 0)
+    return (sign + int_digits + commas + dec_show
+            + (1 if dec_show > 0 else 0)
+            + parens + literals + exponent + symbols)
+
+
 def apply_precision_policy(target: dict, data_rows: list,
-                           defects: list, warnings: list) -> None:
+                           defects: list, warnings: list,
+                           col_widths: dict | None = None,
+                           col_numfmt: dict | None = None) -> None:
     """Compile-time precision policy for the recurring text-overflow repair.
 
     Direct column values with > 4 decimal places or > 12 significant digits
@@ -712,7 +758,14 @@ def apply_precision_policy(target: dict, data_rows: list,
         rediscover it is pure waste).
       - over-long integers (≤ 4 decimals, > 12 digits) → round4 cannot help:
         hard defect (use `precision: keep` only with deliberate column width).
-      - a mapping `transform: roundN` or `precision: keep` exempts the column."""
+      - a mapping `transform: roundN` or `precision: keep` exempts the column.
+    `precision: keep` 的豁免以列宽实测背书为前提 (issue 04): prepare 采集
+    meta.column_width 后, 本函数对 keep 列估算最宽渲染值并与列宽比较 —
+    超出 → PRECISION_KEEP_NARROW_COLUMN (exit 3, corrective_action 改用
+    round4); 列宽缺失 (旧 meta) → 豁免 + PRECISION_KEEP_WIDTH_UNVERIFIED
+    警告 (编译器不靠 Agent 猜列宽, 不再执行期才发现 text overflow)."""
+    col_widths = col_widths or {}
+    col_numfmt = col_numfmt or {}
     by_col: dict[str, tuple[int, str]] = {}
     for dr in data_rows:
         for col, val in (dr.get("values") or {}).items():
@@ -738,7 +791,42 @@ def apply_precision_policy(target: dict, data_rows: list,
         if transform and re.fullmatch(r"round\d+", str(transform)):
             continue  # already rounded by a built-in transform
         if mapping.get("precision") == "keep":
-            continue  # explicit acceptance (wide column / deliberate precision)
+            # keep 的机械前提是列宽实测背书: 估算该列最宽渲染值, 与模板列宽
+            # 比较 — 不足 → 编译拒绝 (不再执行期才发现 text_overflow)。
+            widths = [
+                estimate_rendered_width(str(dr["values"][col]),
+                                        col_numfmt.get(col))
+                for dr in data_rows
+                if (dr.get("values") or {}).get(col) is not None
+                and str(dr["values"][col]).strip()
+            ]
+            max_w = max(widths, default=0)
+            col_width = col_widths.get(col)
+            if col_width is None:
+                warnings.append({
+                    "code": "PRECISION_KEEP_WIDTH_UNVERIFIED", "column": col,
+                    "message": f"column {col} uses `precision: keep` but prepare "
+                               f"did not measure the template column width — the "
+                               f"value (sample {sample!r}) cannot be verified to "
+                               f"fit; re-run prepare (flatten) to collect "
+                               f"meta.column_width",
+                    "corrective_action": "Re-run prepare_run.py --flatten to "
+                                         "measure column widths, or prefer "
+                                         "`transform: round4`",
+                })
+            elif max_w > col_width:
+                defects.append({
+                    "code": "PRECISION_KEEP_NARROW_COLUMN", "column": col,
+                    "message": f"column {col} is {col_width} chars wide but the "
+                               f"longest `precision: keep` value renders ~{max_w} "
+                               f"chars (sample {sample!r}) — it will overflow at "
+                               f"execution; the measured width backing for keep "
+                               f"is insufficient",
+                    "corrective_action": "Use `transform: round4` (or widen the "
+                                         "column) — `precision: keep` needs "
+                                         "measured column width backing",
+                })
+            continue
         decimals = len(sample.split(".")[1]) if "." in sample else 0
         if decimals > 4:
             # auto-round in place (floating long tail — deterministic fix)
@@ -2104,7 +2192,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             dr["src"] = src
             drs.append(dr)
         if not defects:
-            apply_precision_policy(bcfg, drs, defects, warnings)
+            apply_precision_policy(bcfg, drs, defects, warnings,
+                                   col_widths=target_meta.get("column_width") or {},
+                                   col_numfmt=target_meta.get("column_numfmt") or {})
         if defects:
             fail("MATERIALIZE_DEFECTS", f"{len(defects)} value materialization defect(s)",
                  "Fix the column mappings/lookups/transforms", defects)

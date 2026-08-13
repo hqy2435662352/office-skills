@@ -1,12 +1,17 @@
-"""Execute-period backing for Q7 (precision: keep vs round4).
+"""Compile/execute backing for Q7 (precision: keep vs round4).
 
-Compile-time contract tests prove `precision: keep` compiles; this test
-proves the CROSS-LAYER trap the 2026-08-12 retrospective documented: a
-15-digit cost value written with `precision: keep` into a normal-width
-column fails at EXECUTE with text_overflow, while the documented
-`transform: round4` pattern passes. The contract chapter's Q7 recommendation
-order (round4 first, keep only for wide columns) is thus locked against
-future regression at the layer where it actually broke.
+The 2026-08-12 retrospective documented a cross-layer trap: a 15-digit cost
+value written with `precision: keep` into a normal-width column passed
+compile and failed at EXECUTE with text_overflow. Issue 04 converts that
+trap into a COMPILE-TIME check: prepare now measures the template column
+width (meta.column_width), and the compiler rejects `precision: keep` when
+the widest rendered value exceeds the measured column width
+(PRECISION_KEEP_NARROW_COLUMN, exit 3). These tests back the contract at
+the layer that used to break:
+
+- keep + narrow column  → compile rejected (PRECISION_KEEP_NARROW_COLUMN)
+- keep + wide column    → compiles and executes green
+- round4 + narrow column → the documented pattern, compiles and executes green
 
 Skips cleanly when officecli is unavailable (unit-only environments).
 Run with:
@@ -38,7 +43,7 @@ def run_py(workdir: Path, script: str, *args) -> subprocess.CompletedProcess:
         errors="replace", timeout=900)
 
 
-def build_fixtures(dirpath: Path) -> None:
+def build_fixtures(dirpath: Path, col_width: float = 12.0) -> None:
     """Tiny template + source: 4-row template (col A default width, data row
     wrapText + fixed height like the real quote template), 3 source rows
     carrying a 15-digit cost value."""
@@ -53,7 +58,7 @@ def build_fixtures(dirpath: Path) -> None:
     ws["A4"] = "Total"           # base_last_row
     ws.row_dimensions[3].height = 20   # 固定行高 (真实模板 customHeight)
     ws["A3"].alignment = Alignment(wrap_text=True)  # 换行 → 长数值触发 text overflow
-    ws.column_dimensions["A"].width = 12  # round4 值 (8 字符) 可容纳; keep 值 (16 字符) 换行溢出
+    ws.column_dimensions["A"].width = col_width  # 列宽实测 (prepare 采集到 meta.column_width)
     tpl.save(dirpath / "template.xlsx")
 
     src = Workbook()
@@ -66,7 +71,8 @@ def build_fixtures(dirpath: Path) -> None:
 
 @unittest.skipIf(shutil.which("officecli") is None, "officecli not on PATH")
 class PrecisionExecutionContractTests(unittest.TestCase):
-    """Q7 执行期背书: keep → execute text_overflow 失败; round4 → 通过."""
+    """Q7 契约背书: keep 窄列 → 编译期拒绝 (不再执行期 text_overflow);
+    keep 宽列 / round4 → 全链路通过."""
 
     def setUp(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -92,7 +98,7 @@ class PrecisionExecutionContractTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _prepare_and_compile(self, column_extra: dict | None) -> Path:
+    def _prepare(self) -> None:
         wd = self.workdir
         proc = run_py(wd, "prepare_run.py", "--workdir", ".",
                       "--files", "source.xlsx|source.xlsx,template.xlsx|template.xlsx",
@@ -102,13 +108,16 @@ class PrecisionExecutionContractTests(unittest.TestCase):
                       "--flatten", "--sheets", "source.xlsx:SRC;template.xlsx:S",
                       "--target", "template.xlsx")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def _write_spec(self, column_extra: dict | None) -> Path:
+        wd = self.workdir
         manifest = json.loads((wd / "prepare_manifest.json").read_text(encoding="utf-8"))
         fp = manifest["fingerprints"]
         mapping = {"source": "A", "target": "A"}
         if column_extra:
             mapping.update(column_extra)
         spec = {
-            "task": {"intent": "precision 执行期契约", "selected_mod": "NONE",
+            "task": {"intent": "precision 契约", "selected_mod": "NONE",
                      "selected_mod_revision": None},
             "inputs": {"sources": ["source.xlsx"], "target": "template.xlsx",
                        "source_sheets": [{"source": "source.xlsx", "sheets": ["SRC"]}],
@@ -130,30 +139,45 @@ class PrecisionExecutionContractTests(unittest.TestCase):
         (wd / "fill_spec.yaml").write_text(
             yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
             encoding="utf-8")
-        proc = run_py(wd, "compile_fill.py", "--spec", "fill_spec.yaml",
+        return wd / "fill_spec.yaml"
+
+    def _compile(self, column_extra: dict | None) -> subprocess.CompletedProcess:
+        self._prepare()
+        spec_path = self._write_spec(column_extra)
+        return run_py(self.workdir, "compile_fill.py", "--spec", spec_path.name,
                       "--workdir", ".")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
-        return wd / "execution_plan.json"
 
     def _execute(self) -> subprocess.CompletedProcess:
         return run_py(self.workdir, "execute_batch.py", "--plan",
                       "execution_plan.json", "--template", "template.xlsx",
                       "--workdir", ".", "--round", "1", "--render", "html")
 
-    def test_precision_keep_fails_at_execute_with_text_overflow(self):
-        """跨层陷阱: keep 编译通过, 但 15 位值在常规列宽下 execute 期
-        text_overflow → DRAFT_VERIFY_FAILED (defect_class=text_overflow)."""
-        self._prepare_and_compile({"precision": "keep"})
-        proc = self._execute()
+    def test_precision_keep_narrow_column_rejected_at_compile(self):
+        """跨层陷阱已前移: 15 位值 + 12 宽列 + precision: keep → 编译期
+        PRECISION_KEEP_NARROW_COLUMN (exit 3), 不再白烧一轮 execute."""
+        proc = self._compile({"precision": "keep"})
         self.assertEqual(proc.returncode, 3, proc.stdout[-800:] + proc.stderr[-800:])
-        failure = json.loads(
-            (self.workdir / "_draft_failure.json").read_text(encoding="utf-8"))
-        self.assertEqual(failure["code"], "DRAFT_VERIFY_FAILED")
-        self.assertIn("text_overflow", failure["defect_classes"])
+        self.assertIn("PRECISION_KEEP_NARROW_COLUMN", proc.stderr)
+        self.assertFalse((self.workdir / "execution_plan.json").exists())
+
+    def test_precision_keep_wide_column_passes_e2e(self):
+        """keep 的机械前提成立: 列宽 20 > 16 渲染字符 → 编译 + 执行全链路通过."""
+        (self.workdir / "template.xlsx").unlink(missing_ok=True)
+        (self.workdir / "source.xlsx").unlink(missing_ok=True)
+        build_fixtures(self.workdir, col_width=20.0)
+        proc = self._compile({"precision": "keep"})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-800:] + proc.stderr[-800:])
+        proc = self._execute()
+        self.assertEqual(proc.returncode, 0, proc.stdout[-800:] + proc.stderr[-800:])
+        receipt = json.loads(
+            (self.workdir / "draft_receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["issue_delta"]["new_issues"], 0)
+        self.assertEqual(receipt["readback"]["passed"], receipt["readback"]["total"])
 
     def test_precision_round4_passes_at_execute(self):
         """文档推荐模式: transform: round4 → 编译 + 执行全链路通过, 无新增 issue."""
-        self._prepare_and_compile({"transform": "round4"})
+        proc = self._compile({"transform": "round4"})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-800:] + proc.stderr[-800:])
         proc = self._execute()
         self.assertEqual(proc.returncode, 0, proc.stdout[-800:] + proc.stderr[-800:])
         receipt = json.loads(

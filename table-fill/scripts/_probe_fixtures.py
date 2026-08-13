@@ -45,6 +45,7 @@ def make_probe_workdir(tmp, n_source_rows: int = 3, n_cols: int = 10,
         "columns": [{"col": "A", "nonempty": 2}, {"col": "D", "nonempty": 1}],
         "formulas": {"D3": "B3-C3"},
         "column_numfmt": {"D": "0.00"},
+        "column_width": {"E": 20},
     }
     with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
         json.dump(target_meta, f, ensure_ascii=False)

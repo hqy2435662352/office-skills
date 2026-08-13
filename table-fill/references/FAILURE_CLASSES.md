@@ -58,6 +58,7 @@ repair 预算内的验证次数)。
 | `NO_MATCHED_ROWS` | selector 匹配 0 行 → 修 pattern 或检查源展平/来源名 |
 | `REQUIRED_COVERAGE_UNMATCHED` | 必需源行未消费 → 修 selectors 或记入 gaps |
 | `NUMERIC_OVERFLOW_RISK` | 直接值 >4 位小数/>12 位有效数字 → 加 `transform: round4` 或 `precision: keep` (编译期拦截, 不等执行期溢出) |
+| `PRECISION_KEEP_NARROW_COLUMN` | `precision: keep` 列最宽渲染值超出 prepare 实测列宽 → 改用 `transform: round4` (keep 需要列宽实测背书, 不再执行期才发现溢出) |
 | `TRANSFORM_UNKNOWN` / `LOOKUP_*` / `FILLSPEC_FINGERPRINT_MISMATCH` 等 | 按 stderr corrective_action 定向修 |
 
 ## 防再犯 (写 spec 时就避免)

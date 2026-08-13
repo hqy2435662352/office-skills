@@ -322,6 +322,14 @@ formulas:
 3. 反例教训 (2026-08-12): Agent 读了 `apply_precision_policy` 源码后自选
    `precision: keep` 绕过文档推荐的 round4 → 第一轮 text_overflow 失败。
    **源码阅读给出错误安全感 — 按文档推荐序写, 用编译验证。**
+4. **`precision: keep` 何时被编译拒绝?** (2026-08-13 增强): prepare 已采集
+   模板列宽 (`meta.column_width`, flatten 阶段从 worksheet XML `<cols>` 读取,
+   不入结构指纹) 时, 编译器对 keep 列估算最宽渲染值 (数字位数 + numFmt
+   格式符号, `estimate_rendered_width`) — 超出列宽 → 静态缺陷码
+   `PRECISION_KEEP_NARROW_COLUMN` (exit 3, corrective_action: 改用
+   `transform: round4`); 列宽未知 (旧 meta) → 保持豁免 + 
+   `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。列宽实测背书是 keep 的机械
+   前提 — 编译器不靠 Agent 猜"列宽够", 不再执行期才发现 text overflow。
 
 ### Q8: CLONE_SOURCE_IS_ANCHOR 检查作用域?
 
@@ -629,6 +637,8 @@ digest, 不要 unzip sheet XML 考古。
 | MERGE_RANGE_INVALID / AGG_RANGE_INVALID | 范围越过数据块 | 用 `1:{n}` (聚合); group_aggregates 的组范围由数据派生, 越块是编译器内部不变量守卫 (观测契约: 公式范围恒在块内, 埃及等价用例断言) |
 | KEY_OUTPUT_UNWRITTEN | key_outputs 指向未写格 | 换成被写的格 |
 | NUMERIC_OVERFLOW_RISK | 直接值 >4 位小数 / >12 位有效数字 (成本 15 位精度) | 加 `transform: round4` 或 `precision: keep` |
+| PRECISION_KEEP_NARROW_COLUMN | `precision: keep` 列最宽渲染值超出 prepare 实测列宽 (meta.column_width) | 改用 `transform: round4` (或加宽列) — keep 需要列宽实测背书 |
+| PRECISION_KEEP_WIDTH_UNVERIFIED | `precision: keep` 但 meta 无列宽 (旧 prepare 产物, 警告不阻断) | 重跑 prepare_run --flatten 采集列宽, 或改用 round4 |
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
 | LOOKUP_TABLE_EMPTY | 索引归一化后为空 (field_consensus 丢失 / 文件被手工改写) | 检查索引结构, 用 build_inheritance_index.py 重建 — 禁止手改 JSON |
 | LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建); 重建前检查索引输入是否误含目标 sheet (自引用 → 共识 conflict → 缺失) |
