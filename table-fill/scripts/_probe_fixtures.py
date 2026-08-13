@@ -25,6 +25,8 @@ def make_probe_workdir(tmp, n_source_rows: int = 3) -> dict:
         ["家用", "12K", "Z001", "F-1", "C-1", "1", "2", "3"],
         ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
         ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
+        ["家用", "32K", "Z004", "F-4", "C-4", "10", "11", "12"],
+        ["商用", "36K", "Z005", "F-5", "C-5", "13", "14", "15"],
     ][:n_source_rows]
     with open(tmp / "source_maoli_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
         for i, row in enumerate(src_rows):
@@ -398,9 +400,11 @@ def _nulls_aggregate_same_col(spec, wd):
 
 
 def _per_group_total_hardcoded_ranges(spec, wd):
-    """每组合计的负面表达: 块内硬编码多个显式范围聚合 + nulls →
-    DUPLICATE_TARGET_WRITE (组合边界由数据决定, 硬编码范围必然漂移;
-    正确路径只有 blocks[] 拆块)."""
+    """每组合计的负面表达 (触发条件已定位, 2026-08-13 契约修正):
+    DUPLICATE_TARGET_WRITE 的确切触发因素是 **聚合列 (F) 进了 nulls** —
+    nulls 逐行清空先注册锚点格 empty, 聚合再写锚点公式注册 nonempty →
+    锚点双写 (特征 "first as empty"). 同形 spec 去掉该因素 (聚合列不进
+    nulls) 即编译通过, 见 _per_group_total_explicit_ranges."""
     _inplace_base(spec, wd)
     _set(spec, "mapping.targets.0.formulas",
          {"aggregates": [
@@ -409,6 +413,42 @@ def _per_group_total_hardcoded_ranges(spec, wd):
              {"col": "F", "rows": "3:3",
               "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
          ]})
+    return spec
+
+
+def _per_group_total_explicit_ranges(spec, wd):
+    """每组合计的通过表达 (埃及案例最终方案的同形脱敏): 单块 + 多条
+    显式范围聚合, 每组合计一行; 聚合列 (V/W) 不进 nulls、不与
+    group_merges 同列、范围不越块 → 编译通过. 复制即用片段见
+    combination_patterns.yaml `per_group_total_explicit_ranges`."""
+    _set(spec, "mapping.targets.0.clone_roles", [
+        {"role": "spacer"},
+        {"role": "title", "template_row": 1, "value": "块标题"},
+        {"role": "header", "template_row": 2},
+        {"role": "data", "template_row": 3},
+    ])
+    _set(spec, "mapping.targets.0.columns", [
+        {"source": "A", "target": "A"},
+        {"source": "B", "target": "B"},
+        {"source": "C", "target": "C"},
+        {"source": "D", "target": "E"},
+    ])
+    _set(spec, "mapping.targets.0.formulas",
+         {"aggregates": [
+             {"col": "V", "rows": "1:2",
+              "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"},
+             {"col": "W", "rows": "1:2",
+              "formula": "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"},
+             {"col": "V", "rows": "3:3",
+              "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"},
+             {"col": "W", "rows": "3:3",
+              "formula": "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"},
+         ]})
+    _set(spec, "validation.key_outputs", ["A8", "V8", "W8", "V10", "W10"])
     return spec
 
 
@@ -447,11 +487,13 @@ PROBE_CASES = [
      "build": _zero_policy},
     {"id": "per_group_total_blocks", "expect": "accept",
      "build": _per_group_total_blocks},
-    # ── Q1 补充: nulls × aggregates 同列 / 每组合计硬编码范围 (负面表达) ──
+    # ── Q1 补充: nulls × aggregates 同列 / 每组合计显式范围聚合 (正反两形态) ──
     {"id": "nulls_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
      "build": _nulls_aggregate_same_col},
     {"id": "per_group_total_hardcoded_ranges", "expect": "DUPLICATE_TARGET_WRITE",
      "build": _per_group_total_hardcoded_ranges},
+    {"id": "per_group_total_explicit_ranges", "expect": "accept",
+     "build": _per_group_total_explicit_ranges},
     {"id": "pptx_group_merges", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
      "build": _pptx_group_merges},
     {"id": "pptx_inplace", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",

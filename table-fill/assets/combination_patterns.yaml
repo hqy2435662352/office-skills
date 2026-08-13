@@ -89,7 +89,7 @@ patterns:
   # ── Q6: lookup missing ──
   - id: lookup_missing_empty
     question: 查表键缺失时怎么处理?
-    answer: missing: empty → 缺失格留空; missing: error → 编译失败 (LOOKUP_KEY_MISSING)
+    answer: "missing: empty → 缺失格留空; missing: error → 编译失败 (LOOKUP_KEY_MISSING)"
     fragment: |
       columns:
         - target: D
@@ -104,17 +104,46 @@ patterns:
   # ── Q7: 精度 ──
   - id: round4_precision
     question: 15 位成本值怎么处理?
-    answer: 首选 transform: round4; precision: keep 只在列宽确有余量时用
+    answer: "首选 transform: round4; precision: keep 只在列宽确有余量时用"
     fragment: |
       columns:
         - source: D
           target: B
           transform: round4
 
-  # ── 能力映射表: 每组合计 (变通) ──
+  # ── 能力映射表: 每组合计 (单块 + 显式范围聚合 — 复制即用) ──
+  - id: per_group_total_explicit_ranges
+    question: 每组合计 (块内多组、每组一行合计) 怎么写?
+    answer: 单块 + 多条显式范围聚合 — 每组一行合计, V/W 同块各写各组范围;
+      聚合列不进 nulls (进 nulls → 锚点双写 DUPLICATE_TARGET_WRITE, 特征
+      "first as empty")、不与 group_merges 同列、范围不越块 (相对块内数据行);
+      rows 改为你各组实际行数即可
+    fragment: |
+      formulas:
+        aggregates:
+          - col: V
+            rows: "1:2"                    # 组 1 的数据行范围
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: W
+            rows: "1:2"                    # 组 1 的第二聚合列 (同块同范围)
+            formula: "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: V
+            rows: "3:5"                    # 组 2 的数据行范围
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: W
+            rows: "3:5"                    # 组 2 的第二聚合列
+            formula: "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+
+  # ── 能力映射表: 每组合计 (动态边界 → 拆块变通) ──
   - id: per_group_total_blocks
-    question: 系列盈亏按产品组合计 (每组合计) 怎么写?
-    answer: 暂无一等表达 — 按组合拆 blocks[], 每块各自 aggregates (组合边界由数据决定)
+    question: 组合边界由数据决定 (范围不可静态枚举) 的每组合计怎么写?
+    answer: 动态组边界无法用显式范围表达 — 按组合拆 blocks[], 每块各自
+      aggregates 1:{n} (组合边界由数据决定); 静态范围优先用
+      per_group_total_explicit_ranges
     fragment: |
       blocks:
         - clone_roles: [spacer, title, header, data]

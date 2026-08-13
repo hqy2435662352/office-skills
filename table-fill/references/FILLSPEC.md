@@ -366,6 +366,28 @@ formulas:
 
 - 与它们冲突的只有 per_row 公式 (同列 → DUPLICATE_TARGET_WRITE, Q1)。
 
+### Q13: 每组合计 (单块 + 显式范围聚合) 的接受边界?
+
+单块内写多条显式范围聚合 = 每组合计行, **编译通过** (埃及案例最终方案
+「单块 + 显式范围聚合」编译、执行、readback 627/627 全过; 同形脱敏模板见
+`combination_patterns.yaml` → `per_group_total_explicit_ranges`, 改列名即可)。
+接受边界 (违反任一 → 对应缺陷码):
+
+| 边界 | 违反 → |
+|---|---|
+| **聚合列不进 `nulls`** | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 逐行清空先注册锚点格 empty, 聚合再写锚点公式注册 nonempty, 锚点双写) — 这是被拒 fixture 的真实触发因素 |
+| **不与 group_merges 同列** | ❌ `DUPLICATE_TARGET_WRITE` (Q1 — 组锚点写与聚合锚点写都落块首行) |
+| **范围不越块** (rows 相对块内数据行) | ❌ `AGG_RANGE_INVALID` |
+| **不与 per_row 公式同列** | ❌ `DUPLICATE_TARGET_WRITE` (Q1 — 首行锚点格双写) |
+
+- 显式范围 = 各组实际数据行范围 (如组1 `1:2`、组2 `3:5`), 范围随数据定;
+  数据驱动且范围不可静态枚举时, 用 `blocks[]` 每组合一块 + 块级 `1:{n}`
+  (见能力映射表「每组合计 (动态边界)」行)。
+- 历史纠偏 (2026-08-13): 曾误判「硬编码范围必然漂移 → 正确路径只有拆块」;
+  实际拒绝 fixture 的触发因素是**聚合列进了 nulls**, 与"硬编码范围"无关 —
+  同形 spec 去掉该因素即编译通过 (probe 实证, capabilities 矩阵
+  `per_group_total_explicit_ranges` = accept 背书)。
+
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
 > 新增 MOD 规则入库时对照此表: 判断"这条业务规则能否表达、用什么模式表达"。
@@ -375,8 +397,9 @@ formulas:
 | MOD 规则类型 | 标准表达模式 | 支持状态 |
 |---|---|---|
 | 算术派生 (减法/乘法/除法/比率) | `formulas.per_row` + ROUND 精准 (如 `IFERROR(ROUND(X{r}-Y{r},2),0)`) | 一等 |
-| 每组合计 (系列盈亏按产品组合计) | 块级 `aggregates rows: 1:{n}` 只做整块聚合; 组合边界由数据决定, spec 无法表达动态组内范围 | **暂无一等**; 变通: `blocks[]` 每组合一块 + 各自块级 aggregates; 强行声明越块组内范围 → `AGG_RANGE_INVALID` |
-| 每组合计 — 负面表达 (勿用) | 块内硬编码多个显式范围聚合 (如 `1:4`, `5:7`...) — 组边界由数据决定, 硬编码必然漂移; 且与 nulls 同列时锚点双写 | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty") — 正确路径只有拆块 |
+| 每组合计 (系列盈亏按产品组合计, 静态范围) | 单块 + 多条显式范围聚合 (每组合计一行, 见 Q13); 聚合列不进 nulls | 一等 (复制即用: `combination_patterns.yaml` → `per_group_total_explicit_ranges`, 改列名即可) |
+| 每组合计 (动态组边界, 范围不可静态枚举) | `blocks[]` 每组合一块 + 各自块级 `aggregates 1:{n}` | 变通 (组合边界由数据决定) |
+| 每组合计 — 负面表达 (勿用) | 聚合列进 `nulls` → 锚点格先被清空 (empty) 又被聚合写 (nonempty) | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty") — 聚合列不进 nulls |
 | 字段继承 | `columns.lookup` + `mapping.lookups` (`missing: empty`) | 一等 |
 | 路由 (条件取列) | selectors 行过滤 + `fallback` 列回退 | 一等 |
 | 0-口径 | 常量 `value: "0"` / 空源留空 / 多列求和缺失按 0 | 一等 |

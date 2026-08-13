@@ -1747,6 +1747,80 @@ class CapabilityMappingContractTests(unittest.TestCase):
         # block1: spacer5 title6 header7 data8-9 → 聚合 G8; block2: spacer10 title11 header12 data13
         self.assertEqual(agg, ["/S/G8", "/S/G13"])
 
+    def test_per_group_total_explicit_ranges_same_block(self):
+        """每组合计 → 一等: 单块 + 多条显式范围聚合 (V/W 同块, 聚合列不进
+        nulls) — 埃及案例最终方案的同形脱敏, 编译通过."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "spacer"},
+            {"role": "title", "template_row": 1, "value": "块标题"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        spec["mapping"]["targets"][0]["columns"] = [
+            {"source": "A", "target": "A"},
+            {"source": "B", "target": "B"},
+            {"source": "C", "target": "C"},
+            {"source": "D", "target": "E"},
+        ]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [
+                {"col": "V", "rows": "1:2",
+                 "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+                 "style": "anchor"},
+                {"col": "W", "rows": "1:2",
+                 "formula": "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)",
+                 "style": "anchor"},
+                {"col": "V", "rows": "3:3",
+                 "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+                 "style": "anchor"},
+                {"col": "W", "rows": "3:3",
+                 "formula": "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)",
+                 "style": "anchor"},
+            ]}
+        spec["validation"]["key_outputs"] = ["A8", "V8", "W8", "V10", "W10"]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        formulas = {op["path"]: op["props"]["formula"] for op in plan["operations"]
+                    if "formula" in op.get("props", {})}
+        # spacer5 title6 header7 data8-10: 组1 = 行 8-9, 组2 = 行 10
+        self.assertIn("/S/V8", formulas)
+        self.assertIn("/S/W8", formulas)
+        self.assertIn("/S/V10", formulas)
+        self.assertIn("/S/W10", formulas)
+        self.assertEqual(formulas["/S/V8"], "IFERROR(ROUND(SUM(T8:T9)/SUM(S8:S9),4),0)")
+        self.assertEqual(formulas["/S/V10"], "IFERROR(ROUND(SUM(T10:T10)/SUM(S10:S10),4),0)")
+
+    def test_per_group_total_aggregate_col_in_nulls_rejected(self):
+        """每组合计负面表达: 同形 spec 聚合列 (F) 进 nulls → 锚点双写
+        ("first as empty" — nulls 先清空锚点格, 聚合再写公式)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "spacer"},
+            {"role": "title", "template_row": 1, "value": "块标题"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        spec["mapping"]["targets"][0]["columns"] = [
+            {"source": "A", "target": "A"},
+            {"source": "B", "target": "B"},
+            {"source": "C", "target": "C"},
+            {"source": "D", "target": "E"},
+        ]
+        spec["mapping"]["targets"][0]["nulls"] = [
+            {"col": "D", "rows": "all"}, {"col": "F", "rows": "all"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [
+                {"col": "F", "rows": "1:2",
+                 "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+                {"col": "F", "rows": "3:3",
+                 "formula": "SUM(A{r1}:A{r2})", "style": "anchor"},
+            ]}
+        spec["validation"]["key_outputs"] = ["A8"]
+        codes = self._fail_codes(spec)
+        self.assertIn("DUPLICATE_TARGET_WRITE", codes)
+        self.assertNotIn("AGG_RANGE_INVALID", codes)
+
     def test_pptx_group_merges_not_rolled_out(self):
         """暂无表达 (pptx group_merges) → PPTX_CAPABILITY_NOT_ROLLED_OUT."""
         self.wd["manifest"]["target"]["sheet"] = "slide[1]/table[@id=1]"
@@ -1842,6 +1916,33 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse((self.tmp / "execution_plan.json").exists())
         self.assertFalse((self.tmp / "mapping.md").exists())
         self.assertFalse((self.tmp / "run_timing.json").exists())
+
+    def test_combination_pattern_renamed_columns_compiles(self):
+        """组合模式片段复制即用实证: combination_patterns.yaml
+        `per_group_total_explicit_ranges` 片段改列名 (V→G, W→H) 后直接编译
+        通过 — 零 probe 起步承诺 (2026-08-13 契约修正)."""
+        import yaml
+        patterns = yaml.safe_load(
+            (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(encoding="utf-8"))
+        frag = next(p["fragment"] for p in patterns["patterns"]
+                    if p["id"] == "per_group_total_explicit_ranges")
+        block = yaml.safe_load(frag)["formulas"]["aggregates"]
+        rename = {"V": "G", "W": "H"}
+        aggregates = [dict(a, col=rename.get(a["col"], a["col"])) for a in block]
+        self.wd = make_workdir(self.tmp, n_source_rows=5)  # 片段范围 1:2 / 3:5 需 ≥5 行
+        self.wd["workdir"] = self.tmp
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "spacer"},
+            {"role": "title", "template_row": 1, "value": "块标题"},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ]
+        spec["mapping"]["targets"][0]["formulas"] = {"aggregates": aggregates}
+        spec["validation"]["key_outputs"] = ["A8", "G8", "H8", "G10", "H10"]
+        r = self._probe(spec)
+        self.assertTrue(r["accepted"], f"改列名后应编译通过: {r}")
+        self.assertEqual(r["defects"], [])
 
 
 class CapabilitiesTests(unittest.TestCase):
@@ -2044,6 +2145,7 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = p.read_text(encoding="utf-8")
         self.assertIn("group_merges", text)
         self.assertIn("round4", text)
+        self.assertIn("per_group_total_explicit_ranges", text)
 
     def test_fillspec_q8_anchor_scope_words(self):
         """契约章节含 Q8 小节: data role 作用域 + title/header 无检查边界."""
@@ -2077,6 +2179,18 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIsNotNone(re.search(r"^### Q12:", section, re.MULTILINE), "缺 Q12")
         self.assertIn("mergeCell", section)
         self.assertIn("显式范围", section)
+
+    def test_fillspec_q13_per_group_total_boundary(self):
+        """契约章节含 Q13: 每组合计接受边界 — 聚合列不进 nulls 是触发因素
+        (负面表达与通过形态同源, fixture 漂移以 Q&A 文字锁定)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q13:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "缺 Q13")
+        q13 = section[m.end():]
+        self.assertIn("nulls", q13)
+        self.assertIn("DUPLICATE_TARGET_WRITE", q13)
+        self.assertIn("first as empty", q13)
+        self.assertIn("per_group_total_explicit_ranges", q13)
 
     def test_known_traps_spike_facts(self):
         """KNOWN_TRAPS 沉淀已 spike 机械事实 (克隆携带合并 / merges×aggregates)."""
