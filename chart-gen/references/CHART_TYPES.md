@@ -1,61 +1,106 @@
 # Chart Types
 
-18 种图表类型速查。Step 1 推断图表类型时对照此表。
+Quick reference for 18 chart types. Use this table when inferring chart type in Step 1.
 
-## Phase 1 核心类型（详细匹配规则）
+## Phase 1 Core Types (detailed matching rules)
 
-| 图表类型 | officecli chartType | 典型场景 | 数据形状匹配规则 | 何时避免 |
-|---------|---------------------|---------|----------------|---------|
-| **柱状图** | `column` | 对比、排行、分类数据比较 | 一列分类轴（文本/日期）+ 一列或多列数值。分类数 3-20 最佳。多系列时系列名在首行。 | 分类超过 30 个（柱太密）；时间序列（用折线） |
-| **条形图** | `bar` | 横向对比、长分类标签 | 同柱状图，但分类轴标签较长（>10 字符）或分类数 >15。横向排列避免标签重叠。 | 需要展示趋势（用折线）；分类极少（<3，用饼图） |
-| **折线图** | `line` | 趋势、时间序列、连续数据 | 一列连续型分类轴（日期/月份/季度）+ 一列或多列数值。数据点 >= 6 才有趋势感。 | 分类不连续（用柱状）；只有 2-3 个点（无趋势意义） |
-| **饼图** | `pie` | 占比、构成、部分与整体 | 一列分类 + 一列数值，且数值总和有意义（=100% 或总量）。分类数 3-7 最佳。 | 分类 >8（扇区过小）；有负数；需要精确比较大小（用柱状） |
+| Chart Type | officecli chartType | Typical Scenario | Data Shape Matching Rules | When to Avoid |
+|-----------|---------------------|-----------------|--------------------------|---------------|
+| **Column** | `column` | Comparison, ranking, categorical comparison | One category axis (text/date) + one or more value columns. 3-20 categories optimal. Series names in first row for multi-series. | >30 categories (columns too dense); time series (use line) |
+| **Bar** | `bar` | Horizontal comparison, long category labels | Same as column, but category labels are long (>10 chars) or count >15. Horizontal layout avoids label overlap. | Need to show trends (use line); very few categories (<3, use pie) |
+| **Line** | `line` | Trends, time series, continuous data | One continuous category axis (dates/months/quarters) + one or more value columns. ≥6 data points for meaningful trend. | Non-continuous categories (use column); only 2-3 points (no trend meaning) |
+| **Pie** | `pie` | Proportions, composition, part-to-whole | One category column + one value column, where sum has meaning (=100% or total). 3-7 categories optimal. | >8 categories (slices too small); negative values; need precise comparison (use column) |
 
-## 扩展类型（简要速查）
+## Extended Types (quick reference)
 
-| 图表类型 | officecli chartType | 典型场景 | 数据形状匹配规则 | 何时避免 |
-|---------|---------------------|---------|----------------|---------|
-| **面积图** | `area` | 趋势 + 累积感 | 同折线，但强调量级。多系列时堆叠展示总量。 | 系列间量级差异大（小系列被压扁） |
-| **散点图** | `scatter` | 相关性、分布 | 两列数值（X, Y），可选第三列控制气泡大小。 | 数据无相关性需求；分类数据（用柱状） |
-| **气泡图** | `bubble` | 三维关系（X, Y, 大小） | 三列数值：X、Y、气泡大小。大小列必须为正数。 | 只有两维数据（用散点）；大小差异过大 |
-| **雷达图** | `radar` | 多维评估、能力模型 | 一列维度标签 + 一列数值，或多系列对比。维度数 4-8 最佳。 | 维度 >10（过于拥挤）；维度间量纲不同 |
-| **股价图** | `stock` | 金融 OHLC 数据 | 五列：日期、开盘、最高、最低、收盘。必须按此顺序。 | 非金融数据；缺少任一价格列 |
-| **组合图** | `combo` | 混合展示（柱+线） | 至少两列数值，指定一列为柱、一列为线。通常柱=量级，线=比率/趋势。 | 只有单系列；系列间无互补关系 |
-| **瀑布图** | `waterfall` | 增减累积、财务拆解 | 一列分类（含"合计"）+ 一列数值，正负交替表示增减。首/末行通常为合计。 | 无增减逻辑的数据；无合计锚点 |
-| **漏斗图** | `funnel` | 流程转化、阶段递减 | 一列阶段名称 + 一列数值，数值严格递减。 | 数值非递减；阶段 >8 |
-| **树状图** | `treemap` | 层级占比、磁盘/预算分配 | 两列：层级路径（如"A/B/C"）+ 数值。支持多级嵌套。 | 无层级关系；需要精确比较（用柱状） |
-| **旭日图** | `sunburst` | 多层环形占比 | 同树状图，但视觉为同心圆。层级深度 2-4 最佳。 | 层级过深（>5 环不可读）；数据量小 |
-| **箱线图** | `boxWhisker` | 统计分布、异常值检测 | 一列数值或多组数值。自动计算四分位数、中位数、异常点。 | 数据量 <10（统计意义弱）；只需展示均值（用柱状） |
-| **直方图** | `histogram` | 频率分布、数据分组 | 一列数值。自动分箱统计频数，无需预先聚合。 | 已聚合的频数数据（用柱状）；分类数据 |
-| **帕累托图** | `pareto` | 二八分析、关键少数 | 一列分类 + 一列数值，按数值降序排列，自动叠加累积百分比线。 | 已排序数据无需再排；无累积百分比需求 |
-| **圆环图** | `doughnut` | 占比（饼图变体） | 同饼图。中心空白可放总计文字。 | 同饼图限制；多系列时 readability 下降 |
+| Chart Type | officecli chartType | Typical Scenario | Data Shape Matching Rules | When to Avoid |
+|-----------|---------------------|-----------------|--------------------------|---------------|
+| **Area** | `area` | Trend + accumulation feel | Same as line, but emphasizes magnitude. Stacked display for multi-series totals. | Large magnitude differences between series (small series gets flattened) |
+| **Scatter** | `scatter` | Correlation, distribution | Two numeric columns (X, Y), optional third for bubble size. | No correlation requirement; categorical data (use column) |
+| **Bubble** | `bubble` | 3D relationship (X, Y, size) | Three numeric columns: X, Y, bubble size. Size column must be positive. | Only 2 dimensions (use scatter); extreme size differences |
+| **Radar** | `radar` | Multi-dimensional assessment, capability model | One dimension label column + one value column, or multi-series comparison. 4-8 dimensions optimal. | >10 dimensions (too crowded); incompatible units across dimensions |
+| **Stock** | `stock` | Financial OHLC data | Five columns: Date, Open, High, Low, Close. Must be in this exact order. | Non-financial data; missing any price column |
+| **Combo** | `combo` | Mixed display (column + line) | At least two value columns, one designated as column, one as line. Typically column=magnitude, line=ratio/trend. | Single series only; no complementary relationship between series |
+| **Waterfall** | `waterfall` | Cumulative increase/decrease, financial breakdown | One category column (including "Total") + one value column, positive/negative alternation for gain/loss. First/last row typically totals. | No gain/loss logic in data; no total anchor |
+| **Funnel** | `funnel` | Process conversion, stage-wise decrease | One stage name column + one value column, values strictly decreasing. | Non-decreasing values; >8 stages |
+| **Treemap** | `treemap` | Hierarchical proportions, disk/budget allocation | Two columns: hierarchy path (e.g., "A/B/C") + value. Supports multi-level nesting. | No hierarchy; need precise comparison (use column) |
+| **Sunburst** | `sunburst` | Multi-layer ring proportions | Same as treemap, but visual is concentric rings. 2-4 hierarchy depth optimal. | Too deep hierarchy (>5 rings unreadable); small dataset |
+| **Box & Whisker** | `boxWhisker` | Statistical distribution, outlier detection | One numeric column or multiple groups. Auto-calculates quartiles, median, outlier points. | <10 data points (weak statistical meaning); only need mean (use column) |
+| **Histogram** | `histogram` | Frequency distribution, data binning | One numeric column. Auto-bins and counts frequencies; no pre-aggregation needed. | Pre-aggregated frequency data (use column); categorical data |
+| **Pareto** | `pareto` | 80/20 analysis, vital few | One category column + one value column, sorted descending by value, auto-overlays cumulative percentage line. | Already-sorted data; no cumulative percentage need |
+| **Doughnut** | `doughnut` | Proportions (pie variant) | Same as pie. Center hole can display total text. | Same limits as pie; readability drops with multi-series |
 
-## 快速决策流程
+## Quick Decision Flow
 
 ```
-数据有趋势/时间轴？
-  → 是 → 折线 (line) / 面积 (area)
-  → 否 → 数据求占比？
-      → 是 → 分类 <=7 ? 饼图 (pie) / 圆环 (doughnut)
-              分类 >7 或层级 ? 树状 (treemap) / 旭日 (sunburst)
-      → 否 → 对比大小？
-          → 是 → 标签长 ? 条形 (bar) : 柱状 (column)
-          → 否 → 多维评估 ? 雷达 (radar)
-              → 财务增减 ? 瀑布 (waterfall)
-              → 流程转化 ? 漏斗 (funnel)
-              → 相关性 ? 散点 (scatter) / 气泡 (bubble)
-              → 统计分布 ? 箱线 (boxWhisker) / 直方 (histogram)
-              → 二八分析 ? 帕累托 (pareto)
-              → 金融 ? 股价 (stock)
-              → 混合展示 ? 组合 (combo)
+Does the data have trends / a time axis?
+  → Yes → Line / Area
+  → No → Showing proportions?
+      → Yes → Categories ≤7? Pie / Doughnut
+               Categories >7 or hierarchical? Treemap / Sunburst
+      → No → Comparing magnitudes?
+          → Yes → Long labels? Bar : Column
+          → No → Multi-dimensional assessment? Radar
+              → Financial gain/loss? Waterfall
+              → Process conversion? Funnel
+              → Correlation? Scatter / Bubble
+              → Statistical distribution? BoxWhisker / Histogram
+              → 80/20 analysis? Pareto
+              → Financial? Stock
+              → Mixed display? Combo
 ```
 
-## 数据形状检查清单
+## Data Shape Checklist
 
-创建图表前确认：
+Confirm before creating a chart:
 
-1. **分类轴存在且非空**：至少 3 个有效分类标签
-2. **数值列无空行**：dataRange 首尾采样验证（Step 1 内联 `officecli get`）
-3. **系列名在首行或首列**：officecli 自动推断系列名位置
-4. **无隐藏合计行混入**：合计行应排除在 dataRange 外，或作为独立系列
-5. **量纲一致**：同一系列内的数值单位相同（如都是"万元"）
+1. **Category axis exists and is non-empty**: At least 3 valid category labels
+2. **No empty rows in value columns**: Sample head and tail of dataRange (Step 1 inline `officecli get`)
+3. **Series names in first row or column**: officecli auto-infers series name position
+4. **No hidden total rows mixed in**: Total rows should be excluded from dataRange, or treated as a separate series
+5. **Consistent units**: All values within a series use the same unit (e.g., all in "10k CNY")
+
+## Pivot Table & Auxiliary Table
+
+**When to use an auxiliary table**: Source data comes from a WPS/Excel pivot table and the category columns needed for the chart are non-contiguous in the source (e.g., need column A for month, C for sales, E for profit, but B and D are unrelated columns).
+
+**Preferred approach (explicit binding)**: Even with non-contiguous source columns, if each series can be expressed as a single column range, use explicit `seriesN.values` binding instead of an auxiliary table. This avoids the extra sheet clutter and keeps the chart bound directly to source data.
+
+```bash
+# Explicit binding for non-contiguous columns (B, D are data; C is gap)
+officecli add file.xlsx /Sheet1 --type chart \
+  --prop chartType=column \
+  --prop categories="Sheet1!$A$2:$A$13" \
+  --prop series1.name="Sales" --prop series1.values="Sheet1!$B$2:$B$13" \
+  --prop series2.name="Profit" --prop series2.values="Sheet1!$D$2:$D$13"
+```
+
+**Fallback (auxiliary table)**: Use only when categories themselves need reconstruction, data spans multiple sheets, or value transformation is required before charting.
+
+**Process** (Step 1 detects + Step 3 creates):
+
+1. Step 1 detects non-contiguous categories → proposal marks `auxiliary_table.needed = true`
+2. Step 3 creates an auxiliary table to the right of the chart anchor, each cell writes a formula `=Sheet1!SourceCell` (e.g., `=Sheet1!C12`, `=Sheet1!E12`)
+3. Once the auxiliary table forms a contiguous region, the chart's `dataRange` references the auxiliary table instead of the source data
+4. **Critical constraint**: Auxiliary table cells must use formulas; never hardcode numbers (ensures chart auto-syncs when source data updates)
+
+**Example**:
+
+```
+Source pivot table (Sheet1):       Auxiliary table (Sheet1, AB8:AC13):
+  A(Month) B(empty) C(Sales)        AB8 =Sheet1!A2(Jan)  AC8 =Sheet1!C2(120)
+  A3 ...                             AB9 =Sheet1!A3(Feb)  AC9 =Sheet1!C3(135)
+                                     ...
+```
+
+Chart dataRange becomes `Sheet1!AB8:AC13` (contiguous rectangular region, no column gaps).
+
+## Data Magnitude Differences
+
+**Problem**: Different series in the same chart differ by 2 or more orders of magnitude (e.g., series A range 10-100, series B range 10,000-50,000). Result: the smaller series becomes nearly invisible in the chart (column height approaches 0, line hugs the axis).
+
+**Recommended handling**: **Split charts** rather than using a log axis. Split one chart into 2, each using an appropriate Y-axis range.
+
+**Detection threshold**: `max(series_A) / max(series_B) >= 100` or `min(series_A) / min(series_B) <= 0.01` → mark `split_reason: "magnitude_diff"`, output multiple chart_options.
+
+**Log axis exception**: Only consider a log axis when business semantics genuinely require comparing magnitude-different data side by side (e.g., comparing national GDP with a province's GDP). Default recommendation: do not use log axis.

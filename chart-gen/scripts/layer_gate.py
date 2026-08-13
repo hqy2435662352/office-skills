@@ -8,10 +8,10 @@ between Step 1 (analysis) and Step 3 (generation).
 
 Usage:
   python scripts/layer_gate.py --target 1 --input <file.xlsx>
-  python scripts/layer_gate.py --target 2 --workdir <展平元数据输出/>
-  python scripts/layer_gate.py --target 3 --workdir <展平元数据输出/>
-  python scripts/layer_gate.py --set-gate 1 --workdir <展平元数据输出/>
-  python scripts/layer_gate.py --confirm-gate 1 --workdir <展平元数据输出/>
+  python scripts/layer_gate.py --target 2 --workdir <flat_output/>
+  python scripts/layer_gate.py --target 3 --workdir <flat_output/>
+  python scripts/layer_gate.py --set-gate 1 --workdir <flat_output/>
+  python scripts/layer_gate.py --confirm-gate 1 --workdir <flat_output/>
 
 Exit codes:
   0 = pass (prerequisites satisfied)
@@ -96,6 +96,27 @@ def _format_error(tag: str, root_cause: str, corrective: str, context: str) -> s
     )
 
 
+def _detect_file_lock(filepath: Path) -> bool:
+    """Check if file is likely locked by WPS/Excel.
+
+    Tries to open the file in append mode (non-destructive). If denied,
+    the file is almost certainly open in another application.
+    """
+    try:
+        with open(filepath, "a") as f:
+            pass
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+_WPS_LOCK_MESSAGE = (
+    "File appears to be locked by WPS/Excel (open-in-app lock detected). "
+    "Please close the file in WPS/Excel before retrying. "
+    "Do NOT attempt to kill the host process."
+)
+
+
 def _officecli_close(filepath: Path) -> tuple[bool, str]:
     """Run officecli close on file to release lingering locks."""
     try:
@@ -109,8 +130,14 @@ def _officecli_close(filepath: Path) -> tuple[bool, str]:
     except FileNotFoundError:
         return False, "officecli executable not found on PATH"
     except subprocess.TimeoutExpired:
+        # Timeout may indicate file is held by another process (WPS/Excel)
+        if _detect_file_lock(filepath):
+            return False, _WPS_LOCK_MESSAGE
         return False, "officecli close timed out (file may be locked by another process)"
     except Exception as e:
+        # On Windows, PermissionError often means WPS/Excel has the file open
+        if "Permission" in str(e) or "denied" in str(e).lower():
+            return False, _WPS_LOCK_MESSAGE
         return False, f"officecli close failed: {e}"
 
 
@@ -286,7 +313,7 @@ def main() -> int:
         "--workdir",
         type=Path,
         required=True,
-        help="展平元数据输出 directory (intermediate outputs)",
+        help="Flat output directory for intermediate files (e.g., chart proposals)",
     )
     parser.add_argument(
         "--input",

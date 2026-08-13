@@ -6,8 +6,12 @@ Verifies that charts were successfully created in the output xlsx and that
 their data bindings (series valuesRef) are intact. Must pass before reporting
 completion to the user.
 
+Supports two binding modes:
+  - explicit: categories + seriesN.values (primary)
+  - dataRange: auto-inference from contiguous range (fallback)
+
 Usage:
-  python scripts/verify_output.py --output <file.xlsx> --workdir <展平元数据输出/>
+  python scripts/verify_output.py --output <file.xlsx> --workdir <flat_output/>
 
 Exit codes:
   0 = pass (chart exists, data binding verified)
@@ -20,6 +24,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+
+_GHOST_SERIES_NAMES = {"汇总", "总计", "Total", "Sum", "Grand Total"}
 
 
 def _run_officecli(args: list[str], timeout: int = 30) -> tuple[bool, dict | None, str]:
@@ -136,6 +142,51 @@ def _unwrap_result(data: dict) -> dict:
     return result
 
 
+def _load_proposal(workdir: Path) -> dict | None:
+    """Load the chart proposal YAML. Returns None if not found or unparseable."""
+    try:
+        import yaml
+    except ImportError:
+        print("[VERIFY_INFO] PyYAML not installed; explicit binding checks skipped.")
+        return None
+
+    proposals = list(workdir.glob("*_chart_proposal.yaml"))
+    if not proposals:
+        print("[VERIFY_INFO] No chart proposal found; explicit binding checks skipped.")
+        return None
+
+    proposal_path = proposals[0]
+    try:
+        with open(proposal_path, "r", encoding="utf-8") as f:
+            proposal = yaml.safe_load(f)
+        if not isinstance(proposal, dict):
+            return None
+        return proposal
+    except Exception as e:
+        print(f"[VERIFY_INFO] Failed to load proposal: {e}")
+        return None
+
+
+def _check_ghost_series(output_path: Path, chart_path: str) -> list[str]:
+    """Check for ghost aggregate series (汇总, Total, etc.). Returns list of ghost series names found."""
+    ghosts = []
+    # Try up to 20 series — find where the series list ends
+    for i in range(1, 21):
+        full_path = f"{chart_path}/series[{i}]"
+        ok, data, err = _run_officecli(["get", str(output_path), full_path, "--json", "--depth", "0"])
+        if not ok:
+            break  # series list exhausted
+
+        result = _unwrap_result(data)
+        name = result.get("name", "") or result.get("seriesName", "")
+        if not name.strip():
+            break  # empty name = end of series
+
+        if name.strip() in _GHOST_SERIES_NAMES:
+            ghosts.append(name.strip())
+    return ghosts
+
+
 def check_chart_exists(output_path: Path, chart_index: int) -> tuple[bool, str, str]:
     """Verify at least one chart exists. Returns (ok, chart_path, error)."""
     if not output_path.exists():
@@ -184,11 +235,102 @@ def check_series_binding(output_path: Path, chart_path: str) -> tuple[bool, str]
         return False, (
             f"Series[1] at {full_path} has empty valuesRef. "
             "The chart may have been created without data binding. "
-            "Delete the chart and re-create with a valid dataRange."
+            "Delete the chart and re-create with a valid dataRange/categories/values."
         )
 
     print(f"[VERIFY] Series[1] binding confirmed: valuesRef={values_ref}")
     return True, ""
+
+
+def check_explicit_binding(
+    output_path: Path, chart_path: str, proposal: dict
+) -> list[str]:
+    """Verify explicit binding: series count, categoriesRef, each series name and valuesRef.
+
+    Returns a list of error strings (empty = all good).
+    """
+    errors = []
+    chart_options = proposal.get("chart_options", [])
+    selected_idx = proposal.get("selected_index", 0)
+
+    if selected_idx >= len(chart_options):
+        errors.append(f"selected_index {selected_idx} out of range (max {len(chart_options)-1})")
+        return errors
+
+    option = chart_options[selected_idx]
+    eb = option.get("explicit_binding", {})
+    if not eb:
+        errors.append("binding_mode is explicit but explicit_binding section is missing")
+        return errors
+
+    expected_series = eb.get("series", [])
+    expected_count = len(expected_series)
+    expected_categories = eb.get("categories_range", "")
+
+    # 1. Verify seriesCount
+    ok, data, err = _run_officecli(["get", str(output_path), chart_path, "--json", "--depth", "0"])
+    if not ok:
+        errors.append(f"Failed to read chart object: {err}")
+        return errors
+
+    result = _unwrap_result(data)
+    actual_count = result.get("seriesCount", 0)
+    if isinstance(actual_count, str):
+        try:
+            actual_count = int(actual_count)
+        except ValueError:
+            actual_count = 0
+
+    if actual_count != expected_count:
+        errors.append(
+            f"seriesCount mismatch: expected {expected_count}, got {actual_count}"
+        )
+    else:
+        print(f"[VERIFY] Explicit binding: seriesCount={actual_count} matches proposal")
+
+    # 2. Verify categoriesRef
+    actual_categories = result.get("categoriesRef", "")
+    if expected_categories and actual_categories:
+        if actual_categories != expected_categories:
+            errors.append(
+                f"categoriesRef mismatch: expected {expected_categories}, got {actual_categories}"
+            )
+        else:
+            print(f"[VERIFY] Explicit binding: categoriesRef={actual_categories} matches proposal")
+
+    # 3. Verify each series name and valuesRef
+    for i, expected in enumerate(expected_series, 1):
+        full_path = f"{chart_path}/series[{i}]"
+        ok_s, data_s, err_s = _run_officecli(
+            ["get", str(output_path), full_path, "--json", "--depth", "0"]
+        )
+        if not ok_s:
+            errors.append(f"Series[{i}]: {err_s}")
+            continue
+
+        series_result = _unwrap_result(data_s)
+        actual_name = series_result.get("name", "")
+        actual_values = series_result.get("valuesRef", "")
+        expected_name = expected.get("name", "")
+        expected_values = expected.get("values_range", "")
+
+        if actual_name != expected_name:
+            errors.append(
+                f"Series[{i}] name mismatch: expected '{expected_name}', got '{actual_name}'"
+            )
+        else:
+            print(f"[VERIFY] Series[{i}] name: '{actual_name}' matches proposal")
+
+        if expected_values and actual_values != expected_values:
+            errors.append(
+                f"Series[{i}] valuesRef mismatch: expected {expected_values}, got {actual_values}"
+            )
+        elif actual_values:
+            print(f"[VERIFY] Series[{i}] valuesRef: {actual_values} matches proposal")
+        else:
+            errors.append(f"Series[{i}] has empty valuesRef")
+
+    return errors
 
 
 def check_workdir_completeness(workdir: Path) -> list[str]:
@@ -217,7 +359,7 @@ def main() -> int:
         "--workdir",
         type=Path,
         required=True,
-        help="展平元数据输出 directory (intermediate outputs)",
+        help="Flat output directory for intermediate files (e.g., chart proposals)",
     )
     parser.add_argument(
         "--chart-index",
@@ -243,13 +385,51 @@ def main() -> int:
         if not ok:
             errors.append(f"[FATAL] {err}")
 
-    # 3. Series data binding
-    if chart_path:
+    # 3. Load proposal for binding mode detection
+    proposal = _load_proposal(args.workdir)
+
+    # 4. Series data binding — mode-aware
+    if chart_path and proposal:
+        chart_options = proposal.get("chart_options", [])
+        selected_idx = proposal.get("selected_index", 0)
+        if selected_idx < len(chart_options):
+            option = chart_options[selected_idx]
+            binding_mode = option.get("binding_mode", "dataRange")
+
+            if binding_mode == "explicit":
+                # Explicit binding verification
+                print("[VERIFY] Binding mode: explicit — verifying series count, categoriesRef, each series")
+                explicit_errors = check_explicit_binding(args.output, chart_path, proposal)
+                errors.extend(explicit_errors)
+            else:
+                # dataRange fallback: verify series[1] binding
+                print("[VERIFY] Binding mode: dataRange (fallback) — verifying series[1]")
+                ok, err = check_series_binding(args.output, chart_path)
+                if not ok:
+                    errors.append(f"[DATA_ERROR] {err}")
+        else:
+            ok, err = check_series_binding(args.output, chart_path)
+            if not ok:
+                errors.append(f"[DATA_ERROR] {err}")
+    elif chart_path:
+        # No proposal — fallback to basic series check
         ok, err = check_series_binding(args.output, chart_path)
         if not ok:
             errors.append(f"[DATA_ERROR] {err}")
 
-    # 4. Workdir completeness (non-fatal info)
+    # 5. Ghost series detection (always run regardless of binding mode)
+    if chart_path:
+        ghosts = _check_ghost_series(args.output, chart_path)
+        if ghosts:
+            for g in ghosts:
+                errors.append(
+                    f"[DATA_ERROR] Ghost series detected: '{g}'. "
+                    "This suggests dataRange auto-inference picked up an unwanted aggregate column. "
+                    "Use explicit binding (seriesN.values) to prevent this."
+                )
+            print(f"[VERIFY] Ghost series check: detected {ghosts}")
+
+    # 6. Workdir completeness (non-fatal info)
     if args.workdir.exists():
         workdir_issues = check_workdir_completeness(args.workdir)
         if workdir_issues:
