@@ -780,6 +780,45 @@ class LookupNormalizeTests(unittest.TestCase):
             self.assertNotIn("LOOKUP_COLUMN_ALL_MISSING",
                              [w["code"] for w in plan["warnings"]])
 
+    # ── Q2: lookup key 归一化 (NBSP + strip) ──
+    def test_lookup_key_normalized_nbsp(self):
+        """源 key 含 NBSP 尾字符 → 归一化后命中索引 (non-empty)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp, src_rows=[
+                ["家用", "12K", "Z001\xa0", "F-1", "C-1", "1", "2", "3"],
+                ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
+                ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
+            ])
+            wd["workdir"] = tmp
+            (tmp / "inheritance.json").write_text(
+                json.dumps({"Z001": {"compressor": "C-1"},
+                            "Z002": {"compressor": "C-2"}}),
+                encoding="utf-8")
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], tmp)
+            f_vals = [w["value"] for w in plan["writes"] if w["col"] == "F"]
+            self.assertEqual(f_vals[0], "C-1")  # Z001\xa0 → hit
+
+    def test_lookup_key_normalized_strip(self):
+        """源 key 含首尾空格 → 归一化后命中索引 (non-empty)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp, src_rows=[
+                ["家用", "12K", " Z001 ", "F-1", "C-1", "1", "2", "3"],
+                ["家用", "18K", "Z002", "F-2", "C-2", "4", "5", "6"],
+                ["商用", "24K", "Z003", "F-3", "C-3", "7", "8", "9"],
+            ])
+            wd["workdir"] = tmp
+            (tmp / "inheritance.json").write_text(
+                json.dumps({"Z001": {"compressor": "C-1"},
+                            "Z002": {"compressor": "C-2"}}),
+                encoding="utf-8")
+            plan = compile_fill.compile_spec(
+                lookup_column_spec(wd), wd["manifest"], tmp)
+            f_vals = [w["value"] for w in plan["writes"] if w["col"] == "F"]
+            self.assertEqual(f_vals[0], "C-1")  # ' Z001 ' → hit
+
 
 class NumericPrecisionTests(unittest.TestCase):
     def test_long_precision_value_auto_rounded_with_warning(self):

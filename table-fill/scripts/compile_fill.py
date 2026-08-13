@@ -785,7 +785,8 @@ def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list,
     field = lookup.get("field")
     kcol = lookup.get("key_column") or tbl.get("key_column")
     key = values[col_letter_to_idx(kcol)] if kcol else None
-    hit = tbl["data"].get(str(key), {}) if key is not None else {}
+    norm_key = str(key).replace("\u00a0", " ").strip() if key is not None else None
+    hit = tbl["data"].get(norm_key, {}) if norm_key is not None else {}
     if not hit:
         # Key miss: a hit-vs-miss is unambiguous here, so count before the
         # missing policy decides the outcome ("" vs LOOKUP_KEY_MISSING defect).
