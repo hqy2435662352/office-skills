@@ -1574,6 +1574,21 @@ class FillSpecContractTests(unittest.TestCase):
     def _fail_codes(self, spec) -> list[str]:
         return compile_fail_codes(self.wd, spec)
 
+    def _fail_payload(self, spec) -> dict:
+        """Compile-fail payload (parsed stderr JSON); asserts exit 3."""
+        from io import StringIO
+        buf = StringIO()
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                compile_fill.compile_spec(spec, self.wd["manifest"],
+                                          self.wd["workdir"])
+            self.assertEqual(ctx.exception.code, 3)
+        finally:
+            sys.stderr = old
+        return json.loads(buf.getvalue())
+
     # ── Q1: group_merges × formulas / aggregates ──
     def test_group_merges_plus_aggregate_different_column(self):
         """聚合在独立列: 一等支持 — 编译通过, 锚点聚合公式写在块首行."""
@@ -1890,6 +1905,106 @@ class FillSpecContractTests(unittest.TestCase):
         self.assertIn("/S/F7", by_kind["nonempty"])  # per_row 公式 → nonempty
         self.assertEqual(len({rb["path"] for rb in plan["readback"]}),
                          len(plan["readback"]), "一格一断言")
+
+    # ── 布局决策树: append 块 remove_rows 越界 → REMOVE_TARGETS_APPEND_ZONE ──
+    def test_remove_rows_beyond_base_append_zone_rejected(self):
+        """埃及等价 (probe 2026-08-13): append 克隆 + remove_rows > base_last_row
+        → 先行的 add 全部插在 base 之下推移行号, remove 用裸模板坐标命中刚插入的
+        新数据行 (自毁 plan, 行数断言恒等抓不住) → 拒绝, 缺陷携带行号、块标签与
+        拦截理由, 且不无条件指向 inplace."""
+        spec = spec_with(self.wd)  # base_last_row=4, 数据行 5-7
+        spec["mapping"]["targets"][0]["remove_rows"] = [5, 6, 7]
+        payload = self._fail_payload(spec)
+        self.assertEqual(payload["code"], "STATIC_VALIDATION_FAILED")
+        defects = [d for d in payload["defects"]
+                   if d["code"] == "REMOVE_TARGETS_APPEND_ZONE"]
+        self.assertEqual([d["row"] for d in defects], [5, 6, 7])
+        for d in defects:
+            self.assertEqual(d["block"], "block[0]")
+            self.assertIn("base_last_row 4", d["message"])
+            self.assertIn("自毁", d["message"])
+            ca = d["corrective_action"]
+            self.assertIn("append-only", ca)
+            self.assertIn("占位行自然下沉", ca)
+            self.assertIn("inplace", ca)
+            self.assertIn("样式", ca)
+            self.assertLess(ca.index("append-only"), ca.index("inplace"),
+                            "append-only 是首选, inplace 只能是条件选项")
+
+    def test_remove_rows_within_base_classic_shrink_compiles(self):
+        """经典场景 (源行数 < 模板行数): remove_rows ≤ base_last_row 在 add 区
+        之外不被推移 → 编译通过, plan 与无 remove_rows 的基线相比仅多该 remove op
+        (既有运行不受影响)."""
+        baseline = compile_spec_with(self.wd, spec_with(self.wd))
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["remove_rows"] = [3]  # ≤ base 4
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        diff = [op for op in plan["operations"] if op not in baseline["operations"]]
+        self.assertEqual(len(diff), 1)
+        self.assertEqual(diff[0]["command"], "remove")
+        self.assertEqual(diff[0]["path"], "/S/row[3]")
+        self.assertEqual(plan["structural_deltas"]["removes"], 1)
+        # 执行顺序: remove 恒在全部 add 之后
+        ops = plan["operations"]
+        last_add = max(i for i, o in enumerate(ops) if o["command"] == "add")
+        remove_idx = next(i for i, o in enumerate(ops) if o["command"] == "remove")
+        self.assertGreater(remove_idx, last_add)
+
+    def test_remove_zone_multi_block_any_out_of_bounds_rejected(self):
+        """blocks[] 多块: 任一非 inplace 块 remove_rows 越界 → 拒绝, 缺陷携带
+        越界块的标签."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli",
+                      "selectors": [{"column": "A", "pattern": "家用*"}]},
+             "remove_rows": [2]},   # ≤ base 4 — 合法
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli",
+                      "selectors": [{"column": "A", "pattern": "商用*"}]},
+             "remove_rows": [7]},   # > base 4 — 自毁
+        ]
+        payload = self._fail_payload(spec)
+        bad = [d for d in payload["defects"]
+               if d["code"] == "REMOVE_TARGETS_APPEND_ZONE"]
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["block"], "block[1]")
+        self.assertEqual(bad[0]["row"], 7)
+
+    def test_remove_zone_multi_block_all_legal_compiles(self):
+        """blocks[] 多块: 全部 ≤ base_last_row → 编译通过, 每块 remove op 依块序
+        自底向上生成."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli",
+                      "selectors": [{"column": "A", "pattern": "家用*"}]},
+             "remove_rows": [2]},
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli",
+                      "selectors": [{"column": "A", "pattern": "商用*"}]},
+             "remove_rows": [3]},
+        ]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        removes = [op["path"] for op in plan["operations"]
+                   if op["command"] == "remove"]
+        self.assertEqual(removes, ["/S/row[2]", "/S/row[3]"])
+
+    def test_remove_zone_skips_inplace_block(self):
+        """inplace 块消费编译器推导的 Trim, 不消费 remove_rows — 不在检查范围
+        (remove_rows 越界值也不触发 REMOVE_TARGETS_APPEND_ZONE)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_inplace_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = copy.deepcopy(INPLACE_BASE_SPEC)
+            spec["fingerprints"] = wd["manifest"]["fingerprints"]
+            spec["mapping"]["targets"][0]["remove_rows"] = [15]  # > base 14
+            codes = compile_fail_codes(wd, spec)
+            self.assertNotIn("REMOVE_TARGETS_APPEND_ZONE", codes)
+            compile_fill.compile_spec(spec, wd["manifest"], tmp)  # 编译通过
 
 class CapabilityMappingContractTests(unittest.TestCase):
     """能力映射表 (FILLSPEC「能力映射表」章节) 的编译用例背书.
@@ -2366,6 +2481,22 @@ class DocCoverageGuardTests(unittest.TestCase):
         """DUPLICATE_TARGET_WRITE 必须在「常见编译错误速查」表内 (防章节误删)."""
         self.assertIn("DUPLICATE_TARGET_WRITE", self._error_code_table())
 
+    def test_fillspec_error_code_table_has_append_remove_zone(self):
+        """REMOVE_TARGETS_APPEND_ZONE 必须在「常见编译错误速查」表内且行内
+        首选语义为 append-only (inplace 仅是带样式时的条件选项, 防无条件
+        指向 inplace 的误导)."""
+        table = self._error_code_table()
+        self.assertIn("REMOVE_TARGETS_APPEND_ZONE", table)
+        m = re.search(r"^\|\s*REMOVE_TARGETS_APPEND_ZONE.*$", table,
+                      re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 REMOVE_TARGETS_APPEND_ZONE 行")
+        row = m.group(0)
+        self.assertIn("append-only", row)
+        self.assertIn("inplace", row)
+        self.assertIn("样式", row)
+        self.assertLess(row.index("append-only"), row.index("inplace"),
+                        "append-only 是首选, inplace 只能是条件选项")
+
     def test_skill_md_authoring_procedure_words(self):
         """SKILL.md 撰写规程: 先写后编译 + scratch 纪律词存在."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -2457,6 +2588,41 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("一次列出全部源 sheet", text)
         self.assertIn("兜底", text)
+
+    def test_fillspec_layout_decision_tree_style_first(self):
+        """FILLSPEC 布局决策树: 以样式为第一判定条件 (带样式分支先于裸行分支),
+        三分支齐全, 各分支与缺陷码对应 (文档与编译器裁决同源)."""
+        section = self._fillspec_section("布局决策树")
+        self.assertIn("以样式为第一判定条件", section)
+        for word in ("带样式", "裸行", "inplace", "clone-append",
+                     "append-only", "remove_rows", "自然下沉", "收缩"):
+            self.assertIn(word, section)
+        self.assertLess(section.index("带样式"), section.index("裸行"),
+                        "样式条件必须作为第一判定条件: 带样式分支先于裸行分支")
+        self.assertLess(section.index("①"), section.index("②"),
+                        "分支 ① (带样式→inplace) 必须先于分支 ② (裸行→clone-append)")
+        self.assertLess(section.index("②"), section.index("③"),
+                        "分支 ② 必须先于分支 ③ (既有块收缩)")
+        for code in ("REMOVE_TARGETS_APPEND_ZONE", "TEMPLATE_ROW_GAP",
+                     "STRUCTURAL_OP_OUT_OF_ZONE"):
+            self.assertIn(code, section)
+        self.assertLess(section.index("≤ base_last_row"),
+                        section.index("TEMPLATE_ROW_GAP"),
+                        "分支 ③ 必须声明 remove_rows ≤ base_last_row 边界")
+
+    def test_skill_md_mod_loading_output_form(self):
+        """SKILL.md MOD 段输出形态优化: 提名阶段只给摘要不含完整规则集,
+        裁决后才加载选中 MOD 完整规则; 「候选规则必须加载后才可写 spec」
+        的硬性要求保留 (改变加载时机与粒度, 不是是否加载)."""
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        m = re.search(r"^### 2\. MOD Resolution.*?(?=^### 3\.)",
+                      text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "SKILL.md 缺 MOD Resolution 段")
+        section = m.group(0)
+        for word in ("摘要", "不含完整规则集", "裁决后", "选中"):
+            self.assertIn(word, section)
+        self.assertIn("必须加载后才可写 spec", section)
+        self.assertIn("不因输出形态优化放宽", section)
 
 
 class ModCatalogIndexTests(unittest.TestCase):

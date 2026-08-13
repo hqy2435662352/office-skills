@@ -161,16 +161,27 @@ python scripts/mod_nominate.py --workdir <dir> --task "<任务文本>" \
 `selected_mod` 只写入 fill_spec.yaml — 没有 mod_state, 没有独立 Gate。
 MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.py`。
 
-**规则注入时机 (硬性)**: 一旦出现候选 MOD (status ∈ `resolved`/`ambiguous`/
-`conflict`), **写 FillSpec 之前**必须加载候选 MOD 规则 — 直接使用
-`mod_resolution.json` 候选的 `rules` 字段 (或读 MOD 文件全文)。映射关系、
-公式链、路由、字段继承、校验规则全部进入 spec 撰写上下文:
+**规则注入时机 (硬性)**: 候选 MOD 的规则**必须加载后才可写 spec** — 此硬性
+要求不变, 改变的是加载时机与粒度, 不是是否加载。为控制 mod_resolution 相位
+信息过载 (真实构成: 读 3 digest + 3 展平 CSV + 用户裁决墙钟 — 提名输出曾含
+625 行两候选全量规则), 加载分两段:
+
+- **提名阶段 (mod_nominate.py 输出)**: 每个候选只给「候选名 + 命中/待复验
+  信号 + 业务逻辑摘要 + 裁决选项」— **不含完整规则集**;
+- **用户裁决后**: 才加载**选中** MOD 的完整规则 (`mod_resolution.json` 候选的
+  `rules` 字段或 MOD 文件全文) 注入 FillSpec 撰写上下文;
+- **多候选 (ambiguous)**: 裁决选项仍附带各候选的**规则证据摘要** (关键映射/
+  公式链差异, 足够裁决判断), 完整规则在选定后加载 — 不加载全量规则直接呈现
+  裁决。
+
+选中 MOD 完整规则注入后, 映射关系、公式链、路由、字段继承、校验规则全部
+进入 spec 撰写上下文:
+
 - spec 的 `columns`/`formulas`/`lookups`/`rows`/`decisions` 必须与 MOD 规则
   一致 (如 FLD-006 原型机成本 = 源面价 − 铜管成本, FRM-001..008 公式链);
 - 任何偏离必须记入 `decisions` 并写明理由;
-- **禁止在未加载 MOD 规则的情况下猜测映射关系与数据关系**;
-- 多候选 (ambiguous) 时, 加载**所有**候选的规则后再呈现给用户裁决 —
-  裁决选项附带规则证据, 不用用户现场想;
+- **禁止在未加载 MOD 规则的情况下猜测映射关系与数据关系** — 候选规则进入
+  spec 撰写上下文前必须已加载 (硬性, 不因输出形态优化放宽);
 - `MOD NONE` 或 status=`none` (无候选) 时无规则注入, 按无 MOD 流程撰写。
 
 **MOD 规则变更必须经用户审核 (硬性)**: 任何向 MOD 添加、修改、删除规则
@@ -200,6 +211,9 @@ Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_templa
   singleton 不合并); `columns[].props`/`sets[].props` 白名单 V1=numberformat。
   schema_version 2→2.5 (mode 缺省 = append, 向后兼容)。全量 schema 见
   references/FILLSPEC.md「v2.5: Row Layout Mode」。
+- **布局决策先查决策树**: inplace vs clone-append vs 收缩 三选一以 digest
+  样式粒度事实为第一判定条件 (带样式→inplace, 裸行→clone-append, 占位行
+  自然下沉), 不凭占位块存在性猜 — 见 FILLSPEC「布局决策树」。
 - `decisions` / `gaps` / `lineage` 必填 — 追溯事实
 - `validation`: `required_coverage` (源行必须被消费) + `key_outputs`
   (readback 采样格, 必须是被写入的格) + `required_empty`

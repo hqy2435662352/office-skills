@@ -85,7 +85,8 @@ mapping:
           rows: all
         - col: M
           rows: [1, 3]                # 或 "2:4" 相对行范围
-      remove_rows: []                 # 绝对行号, 自底向上 (源行数 < 模板行数时)
+      remove_rows: []                 # 绝对模板坐标, 自底向上; 只允许 ≤ base_last_row (add 区之外)
+                                      # 越界 (> base_last_row) → REMOVE_TARGETS_APPEND_ZONE
       # styles:                       # 可选覆盖锚点/标签样式
       #   anchor: {font.size: 11}
 
@@ -463,11 +464,17 @@ mapping:
 语义要点 (锁定语义, Compiler 强制执行):
 
 - **坐标约定**: `start_row` / `sets.path` 一律是**模板坐标**, spec 永远不计算
-  移位后的行号。坐标稳定由两条结构性约束联合保证: append 块的行的结构操作
-  只能在 append 区 (base_last_row 以下) 合法; 任何前置操作不得触碰占位区。
+  移位后的行号。坐标稳定由两条结构性约束联合保证: append 块的 add 全部插在
+  base_last_row 之下 (append 区); `remove_rows` 只能声明 ≤ base_last_row 的
+  模板既有行 (add 区之外, 不被 add 推移) — 越界 (> base_last_row) 的 remove
+  会被先行的 add 推移行号, 命中刚插入的新数据行 (自毁 plan), 编译器以
+  REMOVE_TARGETS_APPEND_ZONE 拒绝; 任何前置操作不得触碰占位区。
 - **N > capacity → hybrid overflow**: 占位区填满, 从 `template_row` 克隆
   N−capacity 行接在占位区之后 (Total 行自然下移)。
 - **N < capacity → Trim**: 恒为**尾部**裁剪 (编译器推导, 不写 `remove_rows`)。
+- **append-only 合法终态**: 源行数 < 模板行数时, 首选让占位行**自然下沉保留**
+  (append-only), 不需要 remove_rows; inplace (占位区消费) 仅在占位行携带单元格
+  样式时成立 — 裸行占位 inplace 填入即无边框块, 违反 VAL-007 格式沿用。
 - **执行阶段不变量**: append 块全部操作 → sets → 终末 inplace 块的结构操作
   (overflow 克隆 add → trim remove) → inplace 值操作。sets 的 readback 路径由
   Compiler 翻译为最终坐标 (如 A36 → 最终 A31)。
@@ -490,6 +497,25 @@ mapping:
   应用; 单值 `transform` 仍是单变换简写。正则替换的 replacement 含反斜杠转义
   (如 `'\1\n(220-240V,1N,50Hz)'`) 时 YAML 用**单引号**包裹。
 
+## 布局决策树 (以样式为第一判定条件)
+
+> **布局决策必须以 digest 的样式粒度事实为第一判定条件** (`占位行样式: 带样式
+> (样例: A23)` / `占位行样式: 裸行 (23-52)` + 各 clone_roles 克隆源行样式
+> 结论 — prepare 阶段 B 自动检测), 而不是"占位块存在与否"。按占位块存在性
+> 推荐 inplace 会把 Agent 引入错误路径 (埃及案例实证: 23-52 占位行是裸行,
+> inplace 填入即无边框块, 违反 VAL-007 格式沿用)。三分支的违规形态由编译器
+> 缺陷码裁决 — 决策树与编译裁决同源, 不许凭猜。
+
+| 分支 | 判定条件 (样式优先) | 决策 | 违规形态 → 缺陷码 |
+|---|---|---|---|
+| ① 占位区消费 | digest 报**占位行带样式** | `mode: inplace` 成立 — start_row/capacity 消费占位区; N>capacity → overflow 克隆; N<capacity → 尾部 Trim (编译器推导, **不写 remove_rows**) | 区域声明矛盾 → INPLACE_REGION_OUT_OF_BOUNDS; 前置块结构行操作触碰占位区 → INPLACE_REGION_OVERLAP / STRUCTURAL_OP_OUT_OF_ZONE |
+| ② 裸行占位 | digest 报**占位行裸行** | **clone-append** — 克隆携带格式 (满足 VAL-007 格式沿用), 占位行**自然下沉保留** (append-only 是合法终态, **不写 remove_rows**) | 误用 inplace → 无边框块 (VAL-007 违反, 编译不拦, 靠本决策树拦截); 误写越界 remove_rows → REMOVE_TARGETS_APPEND_ZONE |
+| ③ 既有块收缩 | 模板既有块行数 > 源行数 (源行数 < 模板行数) | append + `remove_rows` (**≤ base_last_row**, 自底向上) — 经典收缩场景 | remove_rows > base_last_row → REMOVE_TARGETS_APPEND_ZONE (先行的 add 推移行号, remove 命中刚插入的新数据行 — 自毁 plan); 模板行号空洞 → TEMPLATE_ROW_GAP / digest 行洞行 (既有两层防护, 不新增机制) |
+
+判定次序: **先看样式** (分支 ①/② 二选一), 再看行数差 (分支 ③ 只作用于
+append 形态 — inplace 的收缩由尾部 Trim 消费, 不写 remove_rows); 样式事实读
+digest, 不要 unzip sheet XML 考古。
+
 ## 常见编译错误速查
 
 | 错误码 | 含义 | 修复 |
@@ -511,7 +537,8 @@ mapping:
 | INPLACE_REGION_OUT_OF_BOUNDS | start_row+capacity−1 超出 digest 行数 (模型事实矛盾) | 重读 digest 修正声明 |
 | INPLACE_NO_CLONE_SOURCE | inplace data role 缺 template_row | 声明非锚点占位行 |
 | INPLACE_REGION_OVERLAP | 前置 add/remove 或 sets 触碰占位区 | base_last_row ≥ 占位区末端; 移除/写入移到区外 |
-| STRUCTURAL_OP_OUT_OF_ZONE | 非终末 inplace 块的结构行操作 ≤ base_last_row | remove_rows 只声明在 append 区 |
+| STRUCTURAL_OP_OUT_OF_ZONE | 非终末 inplace 块声明 remove_rows (结构行操作只属于终末 inplace 块的 Trim) | 前置 append 块不声明 remove_rows; 收缩由终末 inplace 块 Trim (编译器推导) |
+| REMOVE_TARGETS_APPEND_ZONE | append 块 remove_rows > base_last_row — add 推移行号后 remove 命中新数据行 (自毁 plan) | 首选 **append-only 合法终态**: 占位行自然下沉保留, 无需删除; remove_rows 只能声明 ≤ base_last_row 的模板既有行; 仅当占位行带样式时 inplace 才是条件选项 |
 | PLACEHOLDER_RESIDUE_UNHANDLED | 保留占位行携带未覆盖值 | 加 columns/null/group label |
 | PLACEHOLDER_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分保留行 | rows: all 或列映射 |
 | GROUP_MERGE_ANCHOR_UNCOVERED | 无映射 group 列缺 label | 声明 label ("" = 清空) |

@@ -427,9 +427,49 @@ def validate_inplace_geometry(blocks_cfg: list, ip_ctx: dict, roles: list,
                                 "message": f"preceding block remove_rows targets row {rn} "
                                            f"<= base_last_row {base_last_row} — structural "
                                            "row ops outside the terminal inplace block are "
-                                           "legal only in the append zone",
-                                "corrective_action": "Declare remove_rows above "
-                                                     "base_last_row"})
+                                           "illegal (the terminal inplace block owns the "
+                                           "Trim the Compiler derives); remove_rows declared "
+                                           "above base_last_row would hit rows shifted by "
+                                           "the block's own adds",
+                                "corrective_action": "前置 append 块不声明 remove_rows; "
+                                                     "收缩由终末 inplace 块 Trim (编译器"
+                                                     "推导). 首选 append-only 合法终态: "
+                                                     "占位行自然下沉保留"})
+
+
+def validate_append_remove_zone(blocks_cfg: list, base_last_row: int,
+                                defects: list) -> None:
+    """REMOVE_TARGETS_APPEND_ZONE: append 块的 remove_rows 必须 ≤ base_last_row.
+
+    append 块的 add 全部插在 base_last_row 之下, remove_rows 声明的是模板坐标;
+    若 remove > base_last_row, 其执行时身份被先行的 add 推移, remove 用裸模板
+    坐标命中刚插入的新数据行 — 自毁 plan (probe 2026-08-13: base=10 +
+    remove_rows [12,13,14] + 3 数据行克隆 → ops = add×4 → remove 14/13/12
+    正是新数据行; 最终行数断言 rows + adds − removes 恒等, 抓不住)。
+    remove_rows ≤ base_last_row 的经典场景 (源行数 < 模板行数) 在 add 区之外,
+    不被推移, 保持合法。inplace 块消费编译器推导的 Trim, 不在本检查范围。"""
+    for bi, b in enumerate(blocks_cfg):
+        if inplace_roles(b):
+            continue
+        for rn in b.get("remove_rows", []):
+            if rn > base_last_row:
+                defects.append({
+                    "code": "REMOVE_TARGETS_APPEND_ZONE",
+                    "row": rn, "block": f"block[{bi}]",
+                    "message": f"block[{bi}]: remove_rows targets row {rn} > "
+                               f"base_last_row {base_last_row} — the block's own "
+                               "adds insert below base_last_row and shift every "
+                               "row below it, so this remove executes against a "
+                               "newly inserted row (自毁 plan, 行数断言恒等抓不住); "
+                               "rows ≤ base_last_row never shift",
+                    "corrective_action": "首选 append-only 合法终态: 占位行自然"
+                                         "下沉保留, 无需删除; remove_rows 只能声明"
+                                         "≤ base_last_row 的模板既有行 (add 区之外). "
+                                         "仅当占位行携带单元格样式 (digest 样式粒度"
+                                         "结论) 时, mode: inplace 才是条件选项 — "
+                                         "裸行占位 inplace 填入会产出无边框块, "
+                                         "违反 VAL-007 格式沿用",
+                })
 
 
 def compute_layout_block(clone_roles: list, n_rows: int, cursor: int,
@@ -1846,6 +1886,32 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             defects.append({"code": "BASE_ROW_OUT_OF_BOUNDS",
                             "message": f"base_last_row {target_cfg['base_last_row']} > digest rows {dims.get('rows')}",
                             "corrective_action": "Use the digest's row count"})
+        validate_append_remove_zone(blocks_cfg,
+                                    target_cfg.get("base_last_row", 0), defects)
+        row_gaps = sorted(set(target_meta.get("row_gaps") or []))
+        if row_gaps:
+            for role in roles:
+                if role.get("mode") in ("inplace", "overflow_clone"):
+                    continue
+                r = role.get("row")
+                trow = role.get("template_row")
+                # 锚点链: data/title/header 克隆 add after /row[r-1]; spacer 无 after.
+                anchor = (r - 1) if (isinstance(r, int) and role.get("kind") != "spacer") else None
+                for a, kind in ((anchor, "add anchor (after)"), (trow, "clone source (from)")):
+                    if a in row_gaps:
+                        defects.append({
+                            "code": "TEMPLATE_ROW_GAP",
+                            "row": a,
+                            "kind": kind,
+                            "message": f"role {role.get('kind','?')} at row {r}: "
+                                       f"{kind} row {a} is a row-number gap in the target "
+                                       f"sheet (row elements: missing {row_gaps}) — officecli "
+                                       f"`add after/from /row[{a}]` would fail at runtime",
+                            "corrective_action": "Materialize the missing row elements "
+                                                 "(scripts/repair_row_gaps.py --workdir <dir>) "
+                                                 "then re-run prepare_run.py --flatten, update "
+                                                 "the spec fingerprints, and recompile",
+                        })
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)

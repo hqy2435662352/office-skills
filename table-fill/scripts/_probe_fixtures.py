@@ -454,6 +454,20 @@ def _per_group_total_explicit_ranges(spec, wd):
     return spec
 
 
+def _append_remove_out_of_zone(spec, wd):
+    """append 块 remove_rows > base_last_row (4): add 全部插在 base 之下推移
+    行号, remove 用裸模板坐标命中刚插入的新数据行 → 自毁 plan → 拒绝."""
+    _set(spec, "mapping.targets.0.remove_rows", [5, 6, 7])
+    return spec
+
+
+def _append_remove_within_base(spec, wd):
+    """remove_rows ≤ base_last_row (4): add 区之外不被推移 — 经典收缩场景
+    (源行数 < 模板行数) 保持合法."""
+    _set(spec, "mapping.targets.0.remove_rows", [3])
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -500,4 +514,9 @@ PROBE_CASES = [
      "build": _pptx_group_merges},
     {"id": "pptx_inplace", "expect": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
      "build": _pptx_inplace},
+    # ── 布局决策树: append 块 remove_rows 边界 (REMOVE_TARGETS_APPEND_ZONE) ──
+    {"id": "append_remove_rows_out_of_zone", "expect": "REMOVE_TARGETS_APPEND_ZONE",
+     "build": _append_remove_out_of_zone},
+    {"id": "append_remove_rows_within_base", "expect": "accept",
+     "build": _append_remove_within_base},
 ]

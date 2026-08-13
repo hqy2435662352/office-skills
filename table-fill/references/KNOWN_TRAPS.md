@@ -71,6 +71,7 @@
 | 陷阱 | 症状 | 正确路径 |
 |------|------|------|
 | **nulls × aggregates 同列** | 锚点格 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空, 聚合再写公式) | 聚合列不进 nulls; 值所有者五选一 (mapping/per_row/aggregate/nulls/group) |
+| **append 块 remove_rows 越界 (2026-08-13)** | remove_rows > base_last_row 编译通过, 执行删掉刚插入的新数据行 (adds 推移行号; 行数断言 rows+adds−removes 恒等抓不住; 埃及 11_FRESH本土 为此手工模拟 30+ 次行位移) | 编译器现以 REMOVE_TARGETS_APPEND_ZONE 静态拒绝; remove_rows 只声明 ≤ base_last_row 的模板既有行。首选 **append-only 合法终态** (占位行自然下沉保留, 无需删除); inplace 只在占位行带样式时成立 (裸行占位 inplace → 无边框块, 违反 VAL-007) |
 | **聚合列进 nulls 表达"每组合计"** | 聚合锚点 `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 先清空锚点格, 聚合再写公式); 曾误判为「硬编码范围必然漂移 → 只有拆块」(2026-08-13 契约修正: 最小 spec 实证触发因素就是聚合列进 nulls) | 聚合列不进 nulls — 同形 spec (单块 + 显式范围聚合) 编译通过 (埃及最终方案); 复制即用见 combination_patterns.yaml `per_group_total_explicit_ranges` |
 | **`nulls rows` 用 `["1:2","3:4"]` 混合列表** | probe 抛 Python traceback 而非缺陷清单 (int("1:2") 崩溃) | 用 `rows: all` / int 列表 / `"a:b"` 字符串; 编译器现以 NULLS_ROWS_INVALID 结构化拒绝 |
 | **`officecli get --depth 0` 查不到 mergeCell** | 合并验证漏报 | 用 `officecli query merge` (或 execute readback 的组边界断言), 别靠 get 的单元格属性 |
