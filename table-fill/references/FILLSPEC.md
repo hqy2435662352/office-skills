@@ -561,7 +561,11 @@ formulas:
 ## v2.5: Row Layout Mode — inplace 占位区
 
 预设格式的占位行 (无公式、客户模板场景, 如报价单 18 行产品占位) 用 `mode: inplace`
-直接消费, 不再克隆追加:
+直接消费, 不再克隆追加。**完整可实例化骨架 (含分组合并 + 绝对写 + numberformat) 见
+`combination_patterns.yaml` → `preformatted_quotation_inplace`** — 真实
+Validated Draft E2E 同形、数据中立, 按 fragment 内参数替换表一次实例化即编译
+(机械契约测试: `tests/test_optimization.py` → PreformattedQuotationPatternContractTests;
+完整 Canonical Pattern 准入边界见 catalog 头部说明):
 
 ```yaml
 mapping:

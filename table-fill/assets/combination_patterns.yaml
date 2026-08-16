@@ -8,6 +8,16 @@
 # 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书
 # (tests/test_optimization.py: FillSpecContractTests / CapabilityMappingContractTests);
 # 运行时可用 compile_fill.py --capabilities 直接向编译器查询整个契约矩阵。
+#
+# 完整 Canonical Pattern 准入说明 (issue 02):
+#   - 完整 Canonical Pattern (如 preformatted_quotation_inplace) 入库必须同时满足:
+#     ① 来自真实任务; ② 有通过的 Validated Draft (E2E) 支撑; ③ skeleton 显著减少
+#     未来布局/业务表达决策。仅可编译、假想组合、单特性示例、语法展示不入库。
+#   - 局部片段 (feature snippets, 如 group_aggregates / per_group_total_explicit_ranges)
+#     与完整 Canonical Pattern 并存; 未经验证的组合 (如 append + group_aggregates
+#     完整骨架) 不拼接成完整 Pattern。
+#   - 无 Candidate / Provisional / 评分 / 复用阈值层级; Pattern 是推荐构造路径,
+#     不是能力白名单, 不声明 cross-Run support/rejection。
 
 patterns:
   # ── Q1: group_merges 列 × 公式/聚合 ──
@@ -188,3 +198,80 @@ patterns:
                 rows: "1:{n}"
                 formula: "SUM(T{r1}:T{r2})"
                 style: anchor
+
+  # ── 完整 Canonical Pattern: 预格式报价模板 (issue 02, MXP 同形) ──
+  - id: preformatted_quotation_inplace
+    question: 预格式报价模板 (带样式占位区 + 分组合并 + 绝对写 + 数字格式) 怎么写?
+    answer: 完整 skeleton 一次实例化 — 按下方替换表把占位标记换成 digest/业务映射
+      事实即得合法 FillSpec; inplace 占位区消费, 编译器推导尾部 Trim (N<capacity)
+      与 overflow 克隆 (N>capacity), 不手算行数
+    fragment: |
+      # ── 参数替换表 (一次实例化: 把下面的占位标记换成 digest/业务映射事实) ──
+      # <TARGET_SHEET>    目标 sheet 名 (来自 outline/digest)
+      # <BASE_LAST_ROW>   模板最后一行 (digest 行数, ≥ 占位区末端)
+      # <REGION_START>    占位区首行 (模板坐标)
+      # <REGION_CAPACITY> 占位区行数
+      # <TEMPLATE_ROW>    克隆格式源行 (占位区内非合并锚点行)
+      # <SOURCE_NAME>     展平源名 (manifest flattened name; 需过滤时加 selectors)
+      # 源列 → 目标列: <GROUP_SRC>→<GROUP_COL> 组键 | <MODEL_SRC>→<MODEL_COL> 型号
+      #   <CAP_SRC>→<CAP_COL> 规格/能力 | <DESC_SRC>→<DESC_COL> 描述
+      #   <PRICE_SRC>→<PRICE_COL> 金额 (numberformat 列)
+      # <LABEL_COL>       label-only 分组合并列 (无列映射, label 必填)
+      # <NUMFMT>          numberformat 格式串 (如 "$#,##0.00", 按业务实际改)
+      # <HDR_ADDR>/<HDR_VALUE>   表头绝对写 1 (模板坐标, 占位区之上)
+      # <HDR2_ADDR>/<HDR2_VALUE> 表头绝对写 2 (模板坐标, 占位区之上)
+      # <FOOT_ADDR>/<FOOT_VALUE> 占位区之下绝对写 — Trim 后由 Excel 行移位搬移,
+      #                           编译器把 readback/记录翻译为最终坐标, 不手算
+      # <KO1..KO6>        key_outputs (模板坐标): 表头写 / 组锚点 / 末行值格 / 区下写
+      mapping:
+        targets:
+          - sheet: <TARGET_SHEET>
+            base_last_row: <BASE_LAST_ROW>
+            clone_roles:
+              - role: data
+                mode: inplace
+                start_row: <REGION_START>
+                capacity: <REGION_CAPACITY>
+                template_row: <TEMPLATE_ROW>
+            rows:
+              source: <SOURCE_NAME>
+            columns:
+              - source: <GROUP_SRC>
+                target: <GROUP_COL>
+              - source: <MODEL_SRC>
+                target: <MODEL_COL>
+              - source: <CAP_SRC>
+                target: <CAP_COL>
+              - source: <DESC_SRC>
+                target: <DESC_COL>
+              - source: <PRICE_SRC>
+                target: <PRICE_COL>
+                props:
+                  numberformat: "<NUMFMT>"
+            group_merges:
+              - col: <GROUP_COL>
+                group_by: <GROUP_COL>
+                style: label
+              - col: <LABEL_COL>
+                group_by: <GROUP_COL>
+                label: ""
+            sets:
+              - path: <HDR_ADDR>
+                value: "<HDR_VALUE>"
+              - path: <HDR2_ADDR>
+                value: "<HDR2_VALUE>"
+              - path: <FOOT_ADDR>
+                value: "<FOOT_VALUE>"
+      validation:
+        required_coverage: []
+        required_empty: []
+        key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>, <KO5>, <KO6>]
+    note: |
+      完整 Canonical Pattern (准入见本文件头部说明): 真实预格式报价 Validated Draft
+      E2E 同形骨架 (tests/test_mxp_e2e.py, 2026-08-16 入库), 数据中立, 不携带客户/
+      sheet/行号/价格/lookup/文案事实。结构关系全部在同一 fragment: terminal inplace
+      消费 → 编译器 Trim (N<capacity, 尾部) / overflow 克隆 (N>capacity) → mapped +
+      label-only 两类 group_merges → block-external sets (模板坐标, 区下位移由 Excel
+      行移位搬移) → 代表列 numberformat → key_outputs/readback 指针。替换后编译失败
+      = 结构事实与 digest 不符, 以 compile 缺陷码为准修正。Pattern 是推荐构造路径,
+      不是能力白名单, 不声明 cross-Run support; 同类组合未逐一验证, 不做支持承诺。

@@ -22,6 +22,7 @@ from _probe_fixtures import (  # noqa: E402
     make_all_missing_lookup_workdir,
     make_empty_lookup_workdir,
     make_egypt_workdir,
+    make_preformatted_quotation_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
 )
@@ -2915,6 +2916,171 @@ class CapabilityMappingContractTests(unittest.TestCase):
         self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", self._fail_codes(spec))
 
 
+class PreformattedQuotationPatternContractTests(unittest.TestCase):
+    """issue 02 — 完整 Canonical Pattern `preformatted_quotation_inplace` 的
+    机械契约测试: 从 catalog entry 本身 (文本参数替换, 而非测试里手写一份等价
+    skeleton) 实例化 spec, 并走 PUBLIC Compiler CLI (MxpEndToEndTests 同款 seam)
+    编译出 MXP 同形 plan:
+
+    target extent 40 → 占位区 18 (rows 7-24) → 匹配 13 → Trim 5 → 最终 35;
+    group boundaries 数据驱动 (三连续组 + 一个永不合并的 singleton);
+    block-external sets 中区下写随 Trim 位移; numberformat 落在 mapped value
+    column 的 value-owner operations; key outputs/readback 覆盖组锚点、格式化值
+    与绝对写; 零 static defects。"""
+
+    PATTERN_ID = "preformatted_quotation_inplace"
+
+    # One explicit instantiation: catalog fragment placeholders → concrete
+    # neutral values (the roles are documented inside the fragment itself).
+    SUBSTITUTIONS = {
+        "<TARGET_SHEET>": "S", "<BASE_LAST_ROW>": "40",
+        "<REGION_START>": "7", "<REGION_CAPACITY>": "18", "<TEMPLATE_ROW>": "8",
+        "<SOURCE_NAME>": "source_quotation",
+        "<GROUP_SRC>": "A", "<MODEL_SRC>": "B", "<CAP_SRC>": "C",
+        "<DESC_SRC>": "D", "<PRICE_SRC>": "E",
+        "<GROUP_COL>": "A", "<MODEL_COL>": "B", "<CAP_COL>": "C",
+        "<DESC_COL>": "D", "<PRICE_COL>": "E", "<LABEL_COL>": "F",
+        "<NUMFMT>": "$#,##0.00",
+        "<HDR_ADDR>": "A4", "<HDR_VALUE>": "To Messrs: Example Co.",
+        "<HDR2_ADDR>": "F4", "<HDR2_VALUE>": "Date of issue: 2026-01-01",
+        "<FOOT_ADDR>": "A36", "<FOOT_VALUE>": "* Valid for 30 days from issue",
+        "<KO1>": "A4", "<KO2>": "A7", "<KO3>": "A19",
+        "<KO4>": "A36", "<KO5>": "E7", "<KO6>": "E19",
+    }
+
+    def _pattern_entry(self) -> dict:
+        import yaml
+        text = (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(
+            encoding="utf-8")
+        entry = next(p for p in yaml.safe_load(text)["patterns"]
+                     if p["id"] == self.PATTERN_ID)
+        for key in ("question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"catalog entry 缺字段 {key!r}")
+        return entry
+
+    def _instantiate(self, entry: dict) -> dict:
+        """Textual substitution on the catalog fragment (comments included);
+        leftover placeholders fail loudly instead of silently passing."""
+        import yaml
+        frag = entry["fragment"]
+        for token, value in self.SUBSTITUTIONS.items():
+            self.assertIn(token, frag, f"fragment 缺占位符 {token}")
+            frag = frag.replace(token, value)
+        leftovers = re.findall(r"<[A-Z0-9_]+>", frag)
+        self.assertEqual(leftovers, [],
+                         f"fragment 存在未替换占位符: {leftovers}")
+        return yaml.safe_load(frag)
+
+    def _spec(self, wd: dict, instantiated: dict) -> dict:
+        return {
+            "task": {"intent": "预格式报价模板 inplace 填充 (pattern contract)",
+                     "selected_mod": "NONE", "selected_mod_revision": None},
+            "inputs": {"sources": ["source_quotation.xlsx"], "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_quotation.xlsx",
+                                          "sheets": ["报价"]}],
+                       "target_sheet": "S"},
+            "fingerprints": {
+                "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+                "target_structure": wd["manifest"]["fingerprints"]["target_structure"],
+            },
+            **instantiated,
+            "decisions": ["占位区消费: 13 行物化, 尾部 Trim 5 行由编译器推导 (不写 remove_rows)"],
+            "gaps": [],
+            "lineage": [{"source": "source_quotation_flat.csv", "role": "primary",
+                         "note": "每个匹配源行恰好写入一个占位行"}],
+        }
+
+    def _compile_cli(self, tmp: Path) -> dict:
+        """The public Compiler CLI seam (the same one MxpEndToEndTests uses)."""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8",
+             str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+             "--spec", "fill_spec.yaml", "--workdir", "."],
+            cwd=str(tmp), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        return json.loads((tmp / "execution_plan.json").read_text(encoding="utf-8"))
+
+    def test_pattern_instantiation_compiles_to_mxp_homomorphic_plan(self):
+        """catalog entry 本身 → 参数替换 → 合法 FillSpec YAML → 公开 CLI 编译:
+        plan 断言 inplace 物化 / Trim 5 / 最终 35 / 组边界数据驱动 (singleton
+        不合并) / sets 模板坐标执行与最终位移记录 / numberformat 落 ops /
+        key outputs 与 readback 覆盖组锚点、格式化值、绝对写; 零 defects."""
+        import yaml
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            wd = make_preformatted_quotation_workdir(tmp)
+            entry = self._pattern_entry()
+            instantiated = self._instantiate(entry)
+            spec = self._spec(wd, instantiated)
+            (tmp / "fill_spec.yaml").write_text(
+                yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
+                encoding="utf-8")
+            plan = self._compile_cli(tmp)
+
+            # ── 确定性形状 (MXP 同形关键计数): 40 → 18 占位区 → 13 匹配 →
+            #    Trim 5 → 最终 35 ──
+            self.assertEqual(plan["schema_version"], "2.5")
+            self.assertEqual(plan["expected_final_row_count"], 35)
+            self.assertEqual(plan["structural_deltas"],
+                             {"adds": 0, "removes": 5, "inplace_trim": 5,
+                              "inplace_overflow": 0})
+            # terminal inplace data role 被物化
+            self.assertEqual(plan["blocks"][-1]["mode"], "inplace")
+            self.assertEqual((plan["blocks"][-1]["data_start"],
+                              plan["blocks"][-1]["data_end"]), (7, 19))
+
+            # ── group boundaries 数据驱动: 三连续组 + singleton 永不合并 ──
+            gb = {g["col"]: g for g in plan["group_boundaries"]}
+            self.assertEqual(sorted(gb), ["A", "F"])
+            for col in ("A", "F"):
+                self.assertEqual((gb[col]["region_start"], gb[col]["region_end"]),
+                                 (7, 19), col)
+                self.assertEqual(gb[col]["expected_merges"],
+                                 [f"{col}7:{col}10", f"{col}11:{col}15",
+                                  f"{col}16:{col}18"], col)
+            merge_props = [op["props"]["merge"] for op in plan["operations"]
+                           if isinstance(op.get("props", {}).get("merge"), str)]
+            self.assertNotIn("A19:A19", merge_props)  # Delta singleton 不产生 merge
+
+            # ── sets: op 保持模板坐标执行, 记录翻译为最终坐标 (A36 → A31) ──
+            set_ops = {op["path"]: op for op in plan["operations"]
+                       if op["command"] == "set"
+                       and op["path"] in ("/S/A4", "/S/F4", "/S/A36")}
+            self.assertEqual(set(set_ops), {"/S/A4", "/S/F4", "/S/A36"})
+            self.assertEqual(set_ops["/S/A36"]["props"]["value"],
+                             "* Valid for 30 days from issue")
+            self.assertEqual([s["path"] for s in plan["sets"]],
+                             ["/S/A4", "/S/F4", "/S/A31"])
+
+            # ── numberformat 进入对应 value-owner operations ──
+            e_ops = [op for op in plan["operations"]
+                     if op["command"] == "set"
+                     and re.fullmatch(r"/S/E\d+", op["path"])]
+            self.assertEqual(len(e_ops), 13)
+            self.assertTrue(all(op["props"].get("numberformat") == "$#,##0.00"
+                                for op in e_ops))
+
+            # ── key outputs / readback 覆盖组锚点、格式化值、绝对写 ──
+            self.assertEqual(plan["key_outputs"], [
+                {"path": "/S/A4", "kind": "value"},
+                {"path": "/S/A7", "kind": "value"},
+                {"path": "/S/A19", "kind": "value"},
+                {"path": "/S/A31", "kind": "value"},
+                {"path": "/S/E7", "kind": "value"},
+                {"path": "/S/E19", "kind": "value"},
+            ])
+            rb = {rb["path"]: rb for rb in plan["readback"]}
+            self.assertEqual(rb["/S/A7"]["expect"], "Alpha")     # 组锚点 (映射值)
+            self.assertEqual(rb["/S/A19"]["expect"], "Delta")    # singleton 锚点
+            self.assertEqual(rb["/S/E7"]["expect"], "100")       # numberformat 值格
+            self.assertEqual(rb["/S/A31"]["expect"],
+                             "* Valid for 30 days from issue")   # 区下绝对写最终坐标
+            self.assertEqual(rb["/S/F7"]["kind"], "empty")       # label-only 锚点清空
+            self.assertEqual(plan["warnings"], [])               # 无 static defects
+
+
 class ProbeTests(unittest.TestCase):
     """compile_fill.py --probe: compile-only verification, zero side effects.
 
@@ -3404,6 +3570,77 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = p.read_text(encoding="utf-8")
         self.assertIn("group_aggregates", text)
         self.assertIn("group_by", text)
+
+    # ── issue 02: 完整 Canonical Pattern (preformatted_quotation_inplace) ──
+
+    def test_combination_patterns_preformatted_quotation_inplace_entry(self):
+        """Catalog 含唯一 preformatted_quotation_inplace entry, 命名与问题描述
+        让 Agent 在预格式报价模板场景可定位; 同一条目 (fragment) 同时携带全部
+        结构职责词 — 不退化为独立 feature snippets 的链接列表 (只守词, 不复制
+        整份 skeleton)."""
+        import yaml
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        entries = yaml.safe_load(p.read_text(encoding="utf-8"))["patterns"]
+        hits = [e for e in entries if e["id"] == "preformatted_quotation_inplace"]
+        self.assertEqual(len(hits), 1, "pattern id 必须唯一")
+        entry = hits[0]
+        for key in ("id", "question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"entry 缺字段 {key!r}")
+        self.assertIn("报价", entry["question"], "问题描述应可定位预格式报价场景")
+        for word in ("mode: inplace", "start_row", "capacity", "template_row",
+                     "group_merges", "label", "sets", "numberformat",
+                     "key_outputs"):
+            self.assertIn(word, entry["fragment"],
+                          f"fragment 缺结构职责词 {word!r}")
+        # Trim/overflow 是编译器从 inplace 几何推导的后果, 由 answer/note 表达
+        # (fragment 只声明几何); 文档守卫同时守住这段职责说明
+        for word in ("Trim", "overflow"):
+            self.assertIn(word, entry["answer"] + entry["note"],
+                          f"entry 缺 {word} 职责说明")
+        # 结构决策完整保留在同一 fragment (含几何与两类 merge 与绝对写),
+        # 而不是只给链接列表
+        self.assertIn("base_last_row", entry["fragment"])
+        self.assertIn("group_by", entry["fragment"])
+        self.assertIn("path:", entry["fragment"])
+
+    def test_combination_patterns_preformatted_quotation_data_neutral(self):
+        """MXP 单次业务事实不泄漏进 fragment: 客户/sheet/行号/价格/lookup/文案
+        一律参数化为占位标记 (含行号: region/trim 数字全部在替换表里)."""
+        import yaml
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        entry = next(e for e in yaml.safe_load(p.read_text(encoding="utf-8"))["patterns"]
+                     if e["id"] == "preformatted_quotation_inplace")
+        frag = entry["fragment"]
+        for leaked in ("MXP", "ATLAS", "Algeria", "To Messrs", "2026",
+                       "source_17", "158", "5035"):
+            self.assertNotIn(leaked, frag, f"fragment 泄漏 MXP 单次事实 {leaked!r}")
+        for token in ("<TARGET_SHEET>", "<BASE_LAST_ROW>", "<REGION_START>",
+                      "<REGION_CAPACITY>", "<TEMPLATE_ROW>", "<SOURCE_NAME>",
+                      "<NUMFMT>", "<HDR_ADDR>", "<FOOT_ADDR>", "<KO1>"):
+            self.assertIn(token, frag, f"fragment 缺参数占位符 {token}")
+        # 明确是推荐构造路径, 不是 whitelist / cross-Run support claim
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("构造路径", text)
+        self.assertIn("白名单", text)
+
+    def test_combination_patterns_canonical_admission_boundary(self):
+        """完整 Canonical Pattern 准入边界: 真实任务 + 通过的 Validated Draft +
+        显著减少决策; 局部 group_aggregates Pattern 保留; 不拼接未验证的
+        append+group_aggregates 完整骨架; 无 Candidate/Provisional 层级."""
+        import yaml
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        text = p.read_text(encoding="utf-8")
+        for word in ("真实任务", "Validated Draft", "显著减少"):
+            self.assertIn(word, text, f"catalog 头部缺准入词 {word!r}")
+        ids = [e["id"] for e in yaml.safe_load(text)["patterns"]]
+        self.assertIn("per_group_total_group_aggregates", ids,
+                      "局部 group_aggregates Pattern 必须保留")
+        self.assertIn("preformatted_quotation_inplace", ids)
+        self.assertNotIn("append_group_aggregates", ids,
+                         "未验证的 append+group_aggregates 完整骨架不得入库")
+        self.assertFalse(any("candidate" in i.lower() or "provisional" in i.lower()
+                             for i in ids),
+                         "不得新增 Candidate/Provisional Pattern 层级")
 
     def test_known_traps_spike_facts(self):
         """KNOWN_TRAPS 沉淀已 spike 机械事实 (克隆携带合并 / merges×aggregates)."""

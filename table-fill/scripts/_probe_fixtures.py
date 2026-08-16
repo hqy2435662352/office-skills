@@ -182,6 +182,94 @@ def make_egypt_workdir(tmp) -> dict:
                               n_source_rows=len(EGYPT_SRC_ROWS))
 
 
+def make_preformatted_quotation_workdir(tmp) -> dict:
+    """Preformatted-quotation target in the MXP-homomorphic shape (issue 02
+    canonical-pattern fixture): 40-row target with an 18-row styled
+    Placeholder Region (rows 7-24), Total row 25, footnotes 26-40, and a
+    13-row source with three consecutive groups (Alpha×4 / Beta×5 / Gamma×3)
+    plus one singleton group (Delta×1).
+
+    Deterministic contract-test shape: target extent 40, region 18,
+    matched 13, trim 5, final extent 35. Region rows carry values in
+    A/B/C/D/F (residue baseline per retained row); E is the number-format
+    column and stays empty in the template."""
+    src_rows = [
+        ["Alpha", "M-01", "9000Btu", "/", "100", "P-1"],
+        ["Alpha", "M-02", "12000Btu", "/", "200", "P-1"],
+        ["Alpha", "M-03", "18000Btu", "/", "300", "P-1"],
+        ["Alpha", "M-04", "24000Btu", "/", "400", "P-1"],
+        ["Beta", "M-05", "48000Btu", "/", "500", "P-2"],
+        ["Beta", "M-06", "18000Btu", "/", "600", "P-2"],
+        ["Beta", "M-07", "27000Btu", "/", "700", "P-2"],
+        ["Beta", "M-08", "32000Btu", "/", "800", "P-2"],
+        ["Beta", "M-09", "42000Btu", "/", "900", "P-2"],
+        ["Gamma", "M-10", "9000Btu", "/", "1000", "P-3"],
+        ["Gamma", "M-11", "12000Btu", "/", "1100", "P-3"],
+        ["Gamma", "M-12", "18000Btu", "/", "1200", "P-3"],
+        ["Delta", "M-13", "24000Btu", "/", "1300", "P-4"],
+    ]
+    with open(tmp / "source_quotation_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(src_rows):
+            csv.writer(f).writerow(row + [101 + i])
+
+    target_meta = {
+        "sheet": "S",
+        "dimensions": {"rows": 40, "cols": 6, "data_rows": 18},
+        "header_band": {"header_rows": [2], "data_start_row": 7},
+        "merged_ranges": ["A7:A24"],
+        "merge_anchors": [{"range": "A7:A24", "anchor": "A7", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 18}, {"col": "B", "nonempty": 18}],
+        "formulas": {},
+        "column_numfmt": {},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+
+    with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["报价单标题", "", "", "", "", "", "1"])
+        w.writerow(["Type", "Model", "C&H capacity", "Pipe", "Price", "Panel", "2"])
+        w.writerow(["", "", "", "", "", "", "3"])
+        w.writerow(["To Messrs: <CUSTOMER>", "", "", "", "", "", "4"])
+        w.writerow(["", "", "", "", "", "", "5"])
+        w.writerow(["", "", "", "", "", "", "6"])
+        for i, r in enumerate(range(7, 25), start=1):
+            w.writerow(["Xpro placeholder", f"M{i}", f"{i}000Btu", "/", "",
+                        "Panel looking", str(r)])
+        w.writerow(["Total", "", "", "", "", "", "25"])
+        for r in range(26, 41):
+            text = "* footer note" if r == 36 else f"* note-{r}"
+            w.writerow([text, "", "", "", "", "", str(r)])
+
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [
+            {"staged": "source_quotation.xlsx", "source": "x", "sha256": "a"},
+            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
+        ],
+        "flattened": [
+            {"file": "source_quotation.xlsx", "sheet": "报价", "name": "source_quotation",
+             "csv": "source_quotation_flat.csv", "meta": "m.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "target.xlsx", "sheet": "S", "name": "target",
+             "csv": "target_flat.csv", "meta": "target_meta.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+        ],
+        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
+                   "csv": "target_flat.csv", "meta": "target_meta.json",
+                   "digest": "d.md", "candidates": "c.yaml"},
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    return {"manifest": manifest}
+
+
 def make_empty_lookup_workdir(tmp) -> dict:
     """Broken index: entries present but field_consensus dropped (hand-rewritten
     JSON) → normalization produces an EMPTY table → LOOKUP_TABLE_EMPTY."""
