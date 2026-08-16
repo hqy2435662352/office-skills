@@ -275,9 +275,13 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
   FillSpec 骨架构成架构分叉、选错会明显重写的场景; 输出只有 ACCEPTED/REJECTED,
   具 Evidence Fit 即终结该 Capability Question, 不得转 Rescue; 环境故障允许
   原样重试。Bounded Rescue 一个问题、一个黑盒方案、一个判据、一个结论,
-  获得 Sufficient Evidence 即止。同一 Capability Question 只能消费其中一种
-  路径; Probe 与 Rescue 预算独立。普通 compile defect 走 REPAIR (见失败处置
-  表), 不升级为 Capability Unknown。
+  获得 Sufficient Evidence 即止。**Rescue 使用前按
+  `references/CAPABILITY_EVIDENCE.md` §4 合同执行: 预声明 question/plan/verdict
+  → scratch 黑盒实验 → workdir 留 Run-local 记录 → Gate 披露一句 (回答了什么问题
+  / PASS-FAIL 结论 / 证据 Run-local 且未制度化); 实验无结论时按 §5 边界: 仅多个
+  安全 Known Supported 路径间的纯业务取舍才 ASK, 否则 STOP**。同一 Capability
+  Question 只能消费其中一种路径; Probe 与 Rescue 预算独立。普通 compile defect
+  走 REPAIR (见失败处置表), 不升级为 Capability Unknown。
 - **TASK MODE 禁区 (硬性)**: 不读实现源码、不运行 Skill 测试套件、不修改 Skill、
   不连续设计实验; 任何实验 (含 Bounded Rescue) 一律使用独立 scratch
   文件, staged 文件只读 — 在 staged 副本上做实验会污染暂存文件, 触发重复

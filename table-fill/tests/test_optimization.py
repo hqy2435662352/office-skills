@@ -3413,6 +3413,16 @@ class DocCoverageGuardTests(unittest.TestCase):
             self.assertIn(word, text, f"SKILL.md 缺 TASK MODE 禁区词 {word!r}")
         self.assertIn("Run Verification", text)
 
+    def test_skill_md_rescue_formalities_pointer(self):
+        """SKILL.md 预算行 (issue 03 rehearsal S6 发现): Rescue 使用前按
+        CAPABILITY_EVIDENCE.md §4 合同执行 — 预声明 question/plan/verdict、
+        workdir Run-local 记录、Gate 披露一句、无结论时 ASK/STOP 边界 —
+        主 Skill 至少给出形式要求指针 (详细合同仍在按需参考, 不复制政策)."""
+        text = self._skill_md_text()
+        for word in ("预声明", "Run-local 记录", "Gate 披露", "未制度化",
+                     "CAPABILITY_EVIDENCE.md", "ASK", "STOP"):
+            self.assertIn(word, text, f"SKILL.md 缺 Rescue 形式指针词 {word!r}")
+
     def test_capability_evidence_reference_owns_policy(self):
         """CAPABILITY_EVIDENCE.md 是唯一详细 policy 源: 三态、Evidence Fit 与
         scope、封闭 Standard Evidence Paths 表、Probe 与 Rescue 合同、ASKS/STOP
