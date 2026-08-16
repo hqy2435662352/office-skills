@@ -245,7 +245,10 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 >
 > 运行时直接问编译器: `compile_fill.py --capabilities` 输出与本章节同源的契约
 > 矩阵 (同一探针集驱动文档、测试与运行时报告, 三者不会漂移); 对某个具体写法
-> 不确定 → `compile_fill.py --probe` (与完整编译同管线, 零副作用)。
+> 不确定 → 写正式 spec 走 formal compile (同管线, 编译即权威反馈)。机制能力
+> 疑问 (三态 / Evidence Fit / Standard Evidence Paths / Probe / Bounded Rescue
+> / ASK·STOP) 按 `references/CAPABILITY_EVIDENCE.md` 处理 — 按需加载, 正常
+> Run 不预读; `--probe` 只用于该参考定义的架构分叉场景。
 
 ### Q1: group_merges 列能与公式/聚合共存吗？
 

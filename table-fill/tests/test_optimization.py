@@ -3227,12 +3227,94 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("precision: keep", text)
         self.assertIn("scratch", text)
 
-    def test_skill_md_probe_rules(self):
-        """SKILL.md 撰写规程: probe 是唯一允许的确认手段 (防规程被误删)."""
-        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("--probe", text)
-        self.assertIn("--capabilities", text)
-        self.assertIn("make_probe_spec.py", text)
+    def _skill_md_text(self) -> str:
+        return (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    def _capability_evidence_text(self) -> str:
+        p = SKILL_ROOT / "references" / "CAPABILITY_EVIDENCE.md"
+        self.assertTrue(p.is_file(), "缺 references/CAPABILITY_EVIDENCE.md")
+        return p.read_text(encoding="utf-8")
+
+    def test_skill_md_capability_resolution_trigger(self):
+        """SKILL.md 撰写规程: Capability Question 按需触发指针 + 三态 + 两项
+        预算 + TASK MODE 禁区 + Run Verification 不可跳过 (防新停止规则被误删)."""
+        text = self._skill_md_text()
+        for word in ("Capability Question", "Known Supported", "Known Rejected",
+                     "Capability Unknown", "Extra Capability Probe",
+                     "Bounded Rescue", "CAPABILITY_EVIDENCE.md"):
+            self.assertIn(word, text, f"SKILL.md 缺能力求证词 {word!r}")
+        for word in ("不读实现源码", "测试套件", "不修改 Skill", "scratch"):
+            self.assertIn(word, text, f"SKILL.md 缺 TASK MODE 禁区词 {word!r}")
+        self.assertIn("Run Verification", text)
+
+    def test_capability_evidence_reference_owns_policy(self):
+        """CAPABILITY_EVIDENCE.md 是唯一详细 policy 源: 三态、Evidence Fit 与
+        scope、封闭 Standard Evidence Paths 表、Probe 与 Rescue 合同、ASKS/STOP
+        与 Run-local 证据 (防详细政策被拆散或章节被误删)."""
+        text = self._capability_evidence_text()
+        for word in ("Known Supported", "Known Rejected", "Capability Unknown",
+                     "Evidence Fit", "Standard Evidence Path", "scope"):
+            self.assertIn(word, text, f"CAPABILITY_EVIDENCE.md 缺词 {word!r}")
+        for path_word in ("--capabilities", "formal compile", "officecli help",
+                          "KNOWN_TRAPS", "readback", "结构验证", "Render QA"):
+            self.assertIn(path_word, text, f"Standard Evidence Paths 缺 {path_word!r}")
+        for probe_word in ("ACCEPTED", "REJECTED", "架构分叉"):
+            self.assertIn(probe_word, text, f"Probe 合同缺 {probe_word!r}")
+        for rescue_word in ("scratch", "Sufficient Evidence", "ASK", "STOP",
+                            "Run-Local"):
+            self.assertIn(rescue_word, text, f"Rescue 合同缺 {rescue_word!r}")
+
+    def test_capability_evidence_reference_is_on_demand_pointer_target(self):
+        """主 Skill 只放短算法与预算, 详细政策唯一住在 CAPABILITY_EVIDENCE.md:
+        主 Skill 含按需加载声明 (正常 Run 不预读), 参考文件含五部分骨架."""
+        skill = self._skill_md_text()
+        self.assertIn("按需", skill)
+        self.assertIn("不预读", skill)
+        evidence = self._capability_evidence_text()
+        self.assertIn("Capability Question", evidence)
+        self.assertIn("Standard Evidence Paths", evidence)
+        self.assertIn("Extra Capability Probe", evidence)
+        self.assertIn("Bounded Rescue", evidence)
+
+    def test_old_universal_probe_and_escape_hatch_removed(self):
+        """旧流程被原子替换 (migrate facts, replace process): 普遍 probe、
+        TASK MODE 源码/spike escape hatch 与任务内强制制度化措辞不再存在,
+        不以优先级说明保留并行旧流程. 三件套完整性标准 (缺一视为未完成)
+        属于 Skill Development 制度化标准, 不在此禁止之列."""
+        skill = self._skill_md_text()
+        for phrase in ("probe = 唯一允许的确认手段", "源码/spike 边界",
+                       "才读源码或做", "必须强制转换"):
+            self.assertNotIn(phrase, skill, f"SKILL.md 仍含旧流程措辞 {phrase!r}")
+        fillspec = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        for phrase in ("不确定 → `compile_fill.py --probe`",
+                       "probe/编译报错无法解释"):
+            self.assertNotIn(phrase, fillspec, f"FILLSPEC.md 仍含旧流程措辞 {phrase!r}")
+        traps = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8")
+        for phrase in ("仅「文档未覆盖 且 报错无法解释」才读源码",):
+            self.assertNotIn(phrase, traps, f"KNOWN_TRAPS.md 仍含旧流程措辞 {phrase!r}")
+
+    def test_skill_md_distrust_recorded_not_institutionalized(self):
+        """不信任事件纪律: TASK MODE 只记录 (Capability Gap Discovery /
+        Contract Drift), 三件套制度化只属于用户发起的 Skill Development
+        (旧'当前任务内必须强制转换'被替换, 触发条件与契约漂移保留)."""
+        text = self._skill_md_text()
+        for word in ("不信任事件", "契约漂移", "触发条件", "三件套", "Skill Development"):
+            self.assertIn(word, text, f"SKILL.md 缺不信任事件纪律词 {word!r}")
+        m = re.search(r"最高优先[^\n]*", text)
+        self.assertIsNotNone(m, "缺最高优先触发条件声明")
+        self.assertIn("契约漂移", m.group(0))
+        self.assertIn("needs-triage", text)
+        self.assertNotIn("必须强制转换", text)
+
+    def test_skill_md_probe_and_capabilities_tools_mentioned(self):
+        """SKILL.md 能力求证段保留工具名 (事实): --probe / --capabilities /
+        make_probe_spec.py 仍在, 但角色是预算内的架构分叉工具, 不是普遍
+        确认手段."""
+        text = self._skill_md_text()
+        for word in ("--probe", "--capabilities", "make_probe_spec.py"):
+            self.assertIn(word, text, f"SKILL.md 缺工具名 {word!r}")
 
     def test_combination_patterns_exist(self):
         """assets/combination_patterns.yaml 存在且含关键模式 (防模板被误删)."""
@@ -3446,19 +3528,6 @@ class DocCoverageGuardTests(unittest.TestCase):
             self.assertIn(word, section)
         self.assertIn("必须加载后才可写 spec", section)
         self.assertIn("不因输出形态优化放宽", section)
-
-    def test_skill_md_distrust_conversion_section(self):
-        """SKILL.md「不信任事件转换纪律」: 四类触发条件 + 契约漂移为最高优先
-        触发条件 + 三件套 + 产出物 (防制度小节被误删或触发条件被降级)."""
-        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("不信任事件转换", text)
-        for word in ("三件套", "契约漂移", "最高优先", "contract test",
-                     "缺陷码", "契约 Q&A", "回归测试", "KNOWN_TRAPS"):
-            self.assertIn(word, text)
-        # 契约漂移必须单独列为最高优先触发条件 (issue 05 类)
-        m = re.search(r"最高优先触发条件[^\n]*", text)
-        self.assertIsNotNone(m, "缺最高优先触发条件声明")
-        self.assertIn("契约漂移", m.group(0))
 
     def test_known_traps_three_workflows_oracles(self):
         """KNOWN_TRAPS 与三个工作流产物对应 (07 验收 #2): remove/add 交互

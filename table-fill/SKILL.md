@@ -249,20 +249,39 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
   (code + corrective_action) 即**权威反馈** → 定向修 → 重编译。**禁止以源码
   阅读替代编译验证** — 读源码的成本是编译的数百倍, 结论还不一定对
   (precision: keep 反例: 读了源码反而选错, 见 references/KNOWN_TRAPS.md)。
-- **probe = 唯一允许的确认手段 (硬性)**: 任何"编译器会怎样处理 X"的不确定,
-  **禁止读源码、禁止通读编译器代码确认**。四条路, 按此顺序:
-  1. `assets/combination_patterns.yaml` — 组合模式**先复制后理解** (改列名即可);
-  2. `compile_fill.py --capabilities` — 一条命令向编译器查询整个契约矩阵
-     (输出与 FILLSPEC 契约章节一致, 由测试强制);
-  3. `scripts/make_probe_spec.py --workdir <dir>` — 一键生成 probe 骨架
-     (指纹/inputs 自动从 manifest 填), 填入不确定片段;
-  4. `compile_fill.py --probe --spec <spec> --workdir <dir>` — 对 spec 做编译验证:
-     与完整编译**同管线**所以结论必然一致, 且零副作用 (不写 plan/mapping/
-     timing)。probe 失败 (exit 3) 时 stdout 直接给内部缺陷码 +
-     corrective_action。
-- **源码/spike 边界**: 仅当「文档未覆盖 且 probe/编译报错无法解释」才读源码或做
-  spike; spike 实验**一律使用独立 scratch 文件, staged 文件只读** — 在 staged
-  副本上做实验会污染暂存文件, 触发重复 flatten。
+- **能力求证 (Capability Resolution) — 按需加载, 正常 Run 不预读**: happy
+  path 直接撰写正式 spec → formal compile; 不先 probe, 不预读 capability
+  材料。只有产生**单一、可证伪的 Capability Question** (机制能力疑问: 关于
+  Table Fill / Prepare / Compiler / Executor / OfficeCLI 机制行为) 时, 才按需
+  读取 `references/CAPABILITY_EVIDENCE.md` (唯一详细 policy 源) 并沿其终局
+  算法执行:
+  1. 找与问题有直接 **Evidence Fit** 的 Standard Evidence Path (支持/拒绝/
+     rollout 状态 → capability contract / `compile_fill.py --capabilities`;
+     OfficeCLI 接口 → `officecli help`; 同形机械陷阱 → KNOWN_TRAPS;
+     Draft 值/结构/渲染 → readback / 结构验证 / Render QA);
+  2. **Known Supported** → 直接使用 — 正常 Run Verification (formal compile、
+     Validated Draft、readback、结构验证、Render QA、Execution Gate) 全部执行;
+  3. **Known Rejected** → 不尝试; 找满足同一业务意图与约束的 Known Equivalent
+     Adaptation;
+  4. **Capability Unknown** → 非 task-blocking 忽略继续; 标准流水线可回答则走
+     流水线; 有等价适配则 ADAPT; 昂贵的 Compiler acceptance 架构分叉才可消耗
+     本 Run 唯一 **Extra Capability Probe**; 四项资格 (unresolved +
+     task-blocking + 无 Standard Evidence Path + 无 Known Equivalent
+     Adaptation) 全满足的未知才可消耗本 Run 唯一 **Bounded Rescue**; Rescue 无
+     Sufficient Evidence → 只有多个安全 Known Supported 路径之间的业务取舍才
+     ASK, 否则 STOP (用户确认不能授权 Capability Unknown)。
+- **预算 (每 Run 各一次, 不按问题重置)**: Extra Capability Probe (`--probe`,
+  骨架用 `make_probe_spec.py`) 只用于未被能力权威回答、两个互斥且实质不同的
+  FillSpec 骨架构成架构分叉、选错会明显重写的场景; 输出只有 ACCEPTED/REJECTED,
+  具 Evidence Fit 即终结该 Capability Question, 不得转 Rescue; 环境故障允许
+  原样重试。Bounded Rescue 一个问题、一个黑盒方案、一个判据、一个结论,
+  获得 Sufficient Evidence 即止。同一 Capability Question 只能消费其中一种
+  路径; Probe 与 Rescue 预算独立。普通 compile defect 走 REPAIR (见失败处置
+  表), 不升级为 Capability Unknown。
+- **TASK MODE 禁区 (硬性)**: 不读实现源码、不运行 Skill 测试套件、不修改 Skill、
+  不连续设计实验; 任何实验 (含 Bounded Rescue) 一律使用独立 scratch
+  文件, staged 文件只读 — 在 staged 副本上做实验会污染暂存文件, 触发重复
+  flatten。
 - **YAML 纪律**: 含 `: ` / 引号 / 特殊字符的字符串**统一加引号** —
   `decisions`/`gaps` 条目含 `: ` 时给**整行** (含冒号) 加双引号:
   `- "追加新历史块: 源文件 ..."`。漏写 → 裸标量被解析成 mapping 静默丢内容
@@ -271,8 +290,9 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
 - **note_phase 合规**: 关键相位至少各记录一次 — `mod_resolution` /
   `spec_authoring` / `compile_review` / `execute_review` / `gate_wait`;
   缺 Agent 相位 → run_timing 不完整, Gate 报告缺 Agent 时间栏。
-- **效率提示**: 把每轮验证成本从数分钟降到秒级 — compile/probe 一轮 0.1s,
-  读源码是它的数百倍。不确定"编译器会怎样处理 X"时, 写一版让编译器回答。
+- **效率提示**: 把每轮验证成本从数分钟降到秒级 — compile 一轮 0.1s,
+  读源码是它的数百倍。不确定"编译器会怎样处理 X"时, 写正式 spec 走
+  formal compile 让编译器回答 (probe 只留给架构分叉)。
 - **失败成本量化 (为什么不怕第 1 轮失败)**: 第 1 轮执行失败是**预期路径** —
   修复成本 ≈ 编译 0.1s + 重跑 ~20s + 一次 spec 改动, 合计 <2 分钟; 为防失败
   而读源码是负收益 (一次源码阅读 ≈ 数分钟到十几分钟)。repair 预算 1 轮
@@ -394,10 +414,10 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 ## Help-first
 
 当 officecli 属性名、参数语义、元素能力或 merge/remove 行为不确定时, 先跑
-`officecli help <format> <element>` 再生成相关 ops; **绝不猜测未经确认的命令
-语义**。spike 已确认的行为直接进 lowering/KNOWN_TRAPS/MOD 文档, 运行时不再
-重新发现 — spike 四坑 (行删除残留 vMerge、unmerge 多步、`merge.down=N` 总跨度
-N+1、validate 对合并残留视而不见) 见 references/KNOWN_TRAPS.md。
+`officecli help <format> <element>` 再生成相关 ops (Standard Evidence Path);
+**绝不猜测未经确认的命令语义**。已实测机械事实 (spike 四坑: 行删除残留
+vMerge、unmerge 多步、`merge.down=N` 总跨度 N+1、validate 对合并残留视而不见)
+见 references/KNOWN_TRAPS.md — 运行时不再重新发现。
 
 ## Exit Code Protocol
 
@@ -427,29 +447,38 @@ N+1、validate 对合并残留视而不见) 见 references/KNOWN_TRAPS.md。
 **禁止**: 把 REPAIR 类问题与 ASK 类问题捆绑呈报; 提供"简化任务/手动 officecli
 处理/暂停任务"等放弃选项; 以"时间/复杂度"为由绕过或忽略失败门禁。
 
-## 不信任事件转换纪律 (事后制度化: 把"修复 Agent"变成"修复 skill")
+## 不信任事件与契约漂移 (记录在案, 制度化交给 Skill Development)
 
-任何对执行机制或契约的怀疑, 只要满足任一触发条件, **事后必须强制转换** —
-产出物让下一位 Agent 不必重新考古。怀疑本身是正常信号, 不转换才是损失
-(埃及案例基线: 机器 63s + Agent ~650s, 其中 mod_resolution 370s / spec_authoring
-166s / execute_review 55s / gate_wait 59s — 详见 .scratch/table-fill-compiler-trust
-spec Comments 复盘基线归档; XML 勘察发生在 spec_authoring, 不在 mod_resolution)。
+对执行机制或契约产生怀疑是正常信号; 但 **TASK MODE 只在当前 Run 记录, 不在
+业务热路径上做制度化改造** (补缺陷码、契约、测试、KNOWN_TRAPS)。三件套制度化
+只允许在用户明确把主要目标改为诊断/修改/扩展/评测 table-fill 的 **Skill
+Development** 中进行 (详见 references/CAPABILITY_EVIDENCE.md「Capability Gap
+Discovery 与模式切换」)。
 
-**触发条件 (任一)**:
+**触发条件 (任一, 触发即记录一条 Capability Gap Discovery)**:
 
 | 触发条件 | 示例 |
 |---|---|
 | 对执行机制怀疑 > ~1 分钟 | "编译器会怎样处理 X"悬而未决 |
 | 手工模拟行位移/坐标推算 | add/remove 交互、trim 后行号手算 (一次以上) |
-| 读源码确认执行行为 | 无论结论对错, 都是一次未转换的不信任事件 |
+| 读源码确认执行行为 | 无论结论对错, 都是一次未记录的不信任事件 |
 | 契约结论与实测不符 | 能力矩阵/FILLSPEC 声明 vs 编译/执行结果矛盾 |
 
 **最高优先触发条件 — 契约漂移 (issue 05 类)**: 文档/能力矩阵声称的接受性或
-缺陷行为与实际编译行为不一致。契约是 Agent 决策的地图, 漂移即地图错位 —
-必须最先修复, 并以一致性回归断言闭环 (capabilities 矩阵输出 == 实际编译
-结果), 使下次运行不可能再次踩进漂移区。
+缺陷行为与实际编译行为不一致。契约是 Agent 决策的地图, 漂移即地图错位。
+TASK MODE 下把它记录为 Contract Drift (一条 Capability Gap Discovery), 用
+证据链最直接的通道继续当前 Run; 若两个权威通道冲突且无法判定哪个更直接 →
+ASK/STOP (见 references/CAPABILITY_EVIDENCE.md「冲突仲裁」), 不以自造实验
+仲裁。修复与一致性回归闭环 (capabilities 矩阵输出 == 实际编译结果) 属于
+Skill Development。
 
-**转换动作三件套 (缺一不可)**:
+**TASK MODE 处理 (记录, 不改造)**: 每次怀疑记录一条 Capability Gap Discovery
+(问题 + 证据 + 结论/未解决), 需要跟进时在任务后形成轻量 **needs-triage** 项,
+不阻塞交付。普通 defect 走 REPAIR, 机制未知按 CAPABILITY_EVIDENCE.md 的
+Standard Evidence Path / Probe / Bounded Rescue 路径解决 — 二者都不构成
+TASK MODE 内的 Skill 修改。
+
+**制度化标准 (Skill Development, 用户发起)**: 三件套缺一不可 —
 
 1. **编译器检查**: 把怀疑点变成静态缺陷码 (compile_fill 静态验证段,
    exit 3 + corrective_action); 需要时以最小变异实验 (probe 面) 查明确切
@@ -466,7 +495,7 @@ KNOWN_TRAPS 同步沉淀机械事实 (重放 oracle), 不落 KNOWN_TRAPS 的转�
 **反例 (不转换的成本)**: 埃及 11_FRESH本土 — Agent 对 remove_rows 越界手工
 模拟 30+ 次行位移才确认执行身份。事后转换产物: `REMOVE_TARGETS_APPEND_ZONE`
 (编译器检查) + FILLSPEC「执行顺序保证」E1-E4 (契约 Q&A) + contract tests
-(回归测试), 同域任务再运行零烧脑。
+(回归测试), 同域任务再运行零烧脑 — 此类转换同样在 Skill Development 中落地。
 
 ## Observability
 
