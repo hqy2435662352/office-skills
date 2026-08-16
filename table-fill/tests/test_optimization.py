@@ -3294,6 +3294,12 @@ class DocCoverageGuardTests(unittest.TestCase):
             encoding="utf-8")
         for phrase in ("仅「文档未覆盖 且 报错无法解释」才读源码",):
             self.assertNotIn(phrase, traps, f"KNOWN_TRAPS.md 仍含旧流程措辞 {phrase!r}")
+        catalog = (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(
+            encoding="utf-8")
+        self.assertNotIn("仍不确定 → compile_fill.py --probe", catalog,
+                         "combination_patterns.yaml 仍含普遍 probe 指令")
+        self.assertIn("CAPABILITY_EVIDENCE.md", catalog,
+                      "combination_patterns.yaml 缺能力政策按需指针")
 
     def test_skill_md_distrust_recorded_not_institutionalized(self):
         """不信任事件纪律: TASK MODE 只记录 (Capability Gap Discovery /

@@ -1,7 +1,9 @@
 # combination_patterns.yaml — FillSpec 组合模式速查与复制源
 #
-# 用法: 不确定"某个组合怎么写"时, 先在此文件找模式复制 (改列名即可),
-# 不需要理解交互规则; 模式复制后仍不确定 → compile_fill.py --probe 验证。
+# 用法: 不确定"某个组合怎么写"时, 先在此文件找模式复制 (改列名即可)。
+# 本文件只承载构造骨架 (data-neutral 片段), 不承载 capability status;
+# 机制能力疑问 (支持/拒绝/接受性/Probe/Rescue) 按 references/CAPABILITY_EVIDENCE.md
+# 处理 — 该参考是唯一能力政策源, 按需加载。
 #
 # 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书
 # (tests/test_optimization.py: FillSpecContractTests / CapabilityMappingContractTests);
