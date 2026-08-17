@@ -107,7 +107,8 @@ logic as a private MOD.
    业务逻辑摘要 + 六列规则表), **执行去污染检查**, 呈现给用户审查。
 3. **One private capture command** — after confirmation, invoke:
    `python scripts/mod_capture.py --source <MOD.md> --mod-name <NAME> --action create`
-   (or `--action update`). Visibility is always `private`.
+   (or `--action update`). Visibility defaults to `private`; `--visibility
+   public` 只作机械去污染门禁（见上「捕获去污染原则」），仍需外部脱敏审查通过。
 
 **State boundaries:**
 - `mod_capture.py` never writes `mod_state.yaml` (V2 已彻底废弃该文件).

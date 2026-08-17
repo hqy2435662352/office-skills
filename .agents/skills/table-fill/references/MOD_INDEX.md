@@ -43,6 +43,7 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
 ## Registered MODs
 
 | MOD Name | Aliases | Scope Signals (+) | Exclusion Signals (-) | Path | Revision | Visibility |
+|---|---|---|---|---|---|---|
 | _(no MOD registered — 暂无注册 MOD: 私有客户 MOD 不随发布推送, 见「Adding a MOD」捕获流程)_ | | | | | | |
 
 
@@ -97,6 +98,7 @@ business logic as a private MOD through a single-confirmation post-delivery life
   the live revision is incremented by one, and temp-file replacement is used.
 - Concurrent capture is not supported; revision is a best-effort single-user counter.
 - `mod_capture.py` defaults to `visibility=private`; `--visibility public` is
-  checked for decontamination violations. A governed transition
-  to `public` for de-identified MODs is outside the Phase 3.5 capture lifecycle
-  and requires external review before any manual catalog edit.
+  mechanically gated by the decontamination check, but capture alone does not
+  constitute external review. A governed transition to `public` for
+  de-identified MODs stays outside the Phase 3.5 capture lifecycle and
+  requires external review before any manual catalog edit.

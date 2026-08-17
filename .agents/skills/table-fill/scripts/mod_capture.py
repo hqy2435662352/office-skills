@@ -220,21 +220,31 @@ def _atomic_write(path: str, content: str) -> None:
 # ── Action ────────────────────────────────────────────────────────────────
 
 
+def _enforce_decontamination(req: CaptureRequest) -> None:
+    """Reject public MOD sources carrying single-run facts (fail-closed).
+
+    Runs before any file mutation. Private sources are exempt (private MODs
+    may carry customer domain facts); only an explicit ``--visibility public``
+    triggers the check.
+    """
+    if req.visibility != "public":
+        return
+    source_text = req.source.read_text(encoding="utf-8")
+    has_violations, violations = _check_decontamination(source_text)
+    if has_violations:
+        violation_msgs = [f"  - [{v['pattern_type']}] {v['description']}: '{v['match']}'"
+                          for v in violations]
+        raise CaptureError(
+            f"Decontamination violations in public MOD source:\n" +
+            "\n".join(violation_msgs),
+            _EXIT_BUSINESS,
+        )
+
+
 def _do_create(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission contract
     _validate_request(req)
     rules = _validate_source(req.source)
-    # Decontamination check for public MODs
-    if req.visibility == "public":
-        source_text = req.source.read_text(encoding="utf-8")
-        has_violations, violations = _check_decontamination(source_text)
-        if has_violations:
-            violation_msgs = [f"  - [{v['pattern_type']}] {v['description']}: '{v['match']}'"
-                              for v in violations]
-            raise CaptureError(
-                f"Decontamination violations in public MOD source:\n" +
-                "\n".join(violation_msgs),
-                _EXIT_BUSINESS,
-            )
+    _enforce_decontamination(req)
     body = req.source.read_text(encoding="utf-8")
     index_path = _mod_index_path()
     index_text = Path(index_path).read_text(encoding="utf-8")
@@ -253,18 +263,7 @@ def _do_update(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
     """Update an existing MOD — single-user best effort, not atomic concurrency."""
     _validate_request(req)
     rules = _validate_source(req.source)
-    # Decontamination check for public MODs
-    if req.visibility == "public":
-        source_text = req.source.read_text(encoding="utf-8")
-        has_violations, violations = _check_decontamination(source_text)
-        if has_violations:
-            violation_msgs = [f"  - [{v['pattern_type']}] {v['description']}: '{v['match']}'"
-                              for v in violations]
-            raise CaptureError(
-                f"Decontamination violations in public MOD source:\n" +
-                "\n".join(violation_msgs),
-                _EXIT_BUSINESS,
-            )
+    _enforce_decontamination(req)
     body = req.source.read_text(encoding="utf-8")
     index_path = _mod_index_path()
     index_text = Path(index_path).read_text(encoding="utf-8")

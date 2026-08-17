@@ -36,6 +36,7 @@
 | **readback 字母数字标识误判数值 (2026-08-17)** | SKU/型号/Z 码写错未被 readback 拦截: `Z001` vs `X001` 都归一成 1.0 通过, `SN-001` 归一成 −1.0 | 旧归一化先 `re.sub` 删一切非 `[0-9+-.]` 字符再 `float()` — 字母数字标识被剥成纯数字 | 归一化只认真数值字面量: 剥离 `,`/`%`/货币符号后**整体**必须是合法十进制数, 含字母 → `number_normalized()` 返回 None → 文本精确比较 (见 FILLSPEC Q10) |
 | **跨块重复消费源行 (2026-08-17)** | 两个 block 的 selectors 命中同一源行 → 数据行翻倍 (数量/金额/聚合翻倍), coverage 仍显示通过 | 编译器只做逐块/逐源覆盖**存在性**检查 (覆盖下限, 非唯一性上限): 同一 `(source, original_row)` 可在多个块/多源条目中被重复消费 | 编译器现以 `SOURCE_ROW_CONSUMED_TWICE` (exit 3) 编译拒绝 — 每条被消费的源记录**恰好一次**, 无显式复用语法 (默认 fail-closed); 收窄 selectors (pattern/not_pattern/not_value) 或拆源消除重叠 (见 FILLSPEC Q17) |
 | **PPTX 未支持声明静默丢失 (2026-08-17)** | pptx spec 声明 formulas (per_row/aggregates)/merges/nulls/remove_rows/columns[].props → 编译通过但 plan 无对应操作 (静默丢弃); 行越界要到执行期才失败 | build_ops_pptx 只消费列值 + DOM sets, 其余声明无 lowering 也不报错; compute_layout 不比对表格实际行数 | Compiler 现以 `PPTX_CAPABILITY_NOT_ROLLED_OUT` 编译期拒绝 (fail-closed, 消息点名声明) — 值类需求预计算进 columns; `first_data_row` + 匹配行数越界 → `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` (pptx 行不能克隆, 加行用 python-pptx 一次性, 禁在 officecli 之后重新 import) |
+| **MOD_INDEX 缺 `## Registered MODs` 标题 → 解析静默为空 (2026-08-17)** | 提名/守卫测试用无标题的注册表 → `parse_mod_index` 恒返回 [] → 候选为空或 IndexError, 或误判 "no MOD registered" | 解析器统一到 `_mod_catalog.parse_mod_index` 后要求该小节标题 (`_SECTION_HEADING_RE`); 统一前的手写 fixture 无标题 | 注册表一律带 `## Registered MODs` 小节标题再写表; 手写 fixture/文档示例勿漏 (ModNominateTests 内联 fixture 已补齐) |
 
 ## spike 四坑 (pptx 合并 lowering)
 
