@@ -38,6 +38,10 @@ python scripts/extract_ole.py --input file.pptx --slide 14 --output-dir 展平�
 6. 提取首个包含有效 sheet 数据的 ZIP 段为 xlsx，输出到
    `展平元数据输出/oleObject{M}_slide_extracted.xlsx`。
 
+失败时（`OLE_NO_EXCEL_EMBEDDING` / `OLE_EXTRACT_FAILED` / `INPUT_NOT_FOUND`）：
+向 stderr 输出结构化 JSON（`status` / `code` / `message` / `corrective_action`），
+退出码为 3。
+
 ## 填充
 
 提取后的 xlsx 视为普通源文件：

@@ -95,14 +95,16 @@ def probe_ole(pptx_path, slide, index):
     return {"prog_id": prog_id, "rel_id": str(fmt.get("relId") or "")}
 
 
-def select_excel_ole(pptx_path, slide):
+def select_excel_ole(pptx_path, slide, mappings=None):
     """Choose the OLE embedding whose progId contains ``Excel.Sheet``.
 
     officecli 的 ``/ole[K]`` 是位置序号（1 起，按 slide 内 OLE 对象顺序），与
     rels 文档顺序一致；探测槽位用返回的 relId 回映射到 rels（relId 缺失时按
     位置对应）。返回映射 dict（含 number），无匹配返回 None。
+    ``mappings`` 可传入预解析结果（避免重复读 rels）。
     """
-    mappings = find_ole_mappings(pptx_path, slide)
+    if mappings is None:
+        mappings = find_ole_mappings(pptx_path, slide)
     by_rel_id = {m["rel_id"]: m for m in mappings if m["rel_id"]}
     for index, mapping in enumerate(mappings, start=1):
         probe = probe_ole(pptx_path, slide, index)
@@ -195,7 +197,7 @@ def main():
     # Step 1+2: rels 定位 OLE 对象 → officecli 探测 progId → 选择 Excel.Sheet
     # embedding（探测编号与 rels 选择一致，不再硬编码 /ole[1]）。
     mappings = find_ole_mappings(str(args.input), args.slide)
-    chosen = select_excel_ole(str(args.input), args.slide)
+    chosen = select_excel_ole(str(args.input), args.slide, mappings)
     if chosen is None:
         if not mappings:
             message = f"No OLE objects found on slide {args.slide} (no oleObject relationship in slide rels)"
@@ -222,8 +224,10 @@ def main():
         print(f"[OLE_NOTE] 此 xlsx 是独立的填充目标。填充后请用户在 Excel 中打开,")
         print(f"[OLE_NOTE] 选中表格 Ctrl+C, 回到 PPTX 的 slide {args.slide} 右键粘贴。")
         sys.exit(0)
-    else:
-        sys.exit(1)
+    fail("OLE_EXTRACT_FAILED",
+         f"Could not extract valid xlsx from OLE object {ole_num} (see [OLE_ERROR] above)",
+         "检查该 OLE 对象是否真的是 Excel 嵌入（内含内嵌 xlsx 流）；"
+         "必要时在 Excel 中打开原对象另存后重新嵌入")
 
 
 if __name__ == "__main__":

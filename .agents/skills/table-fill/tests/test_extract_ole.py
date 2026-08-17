@@ -247,6 +247,16 @@ class MainFailuresTests(OleFixtureMixin, unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn('"code": "INPUT_NOT_FOUND"', stderr)
 
+    def test_extract_failure_emits_defect_code(self):
+        rels = rels_xml(("rId1", OLE_REL, "../embeddings/oleObject1.bin"))
+        pptx = self.make_pptx(rels, embeddings={"oleObject1.bin": b"no zip markers here"})
+        fake = FakeOfficecli({1: probe_payload("Excel.Sheet.12", "rId1")})
+        code, stderr = self.run_main(pptx, fake)
+        self.assertEqual(code, 3)
+        self.assertIn('"code": "OLE_EXTRACT_FAILED"', stderr)
+        self.assertIn('"corrective_action"', stderr)
+        self.assertEqual(list((self.tmp / "out").glob("*")), [])
+
 
 class ExtractEndToEndTests(OleFixtureMixin, unittest.TestCase):
     """Multi-OLE fixture: the Excel.Sheet embedding is extracted, not the first."""
@@ -298,6 +308,25 @@ class ExtractEndToEndTests(OleFixtureMixin, unittest.TestCase):
         out_path = extract_ole.extract_xlsx_from_ole(str(pptx), 1, out_dir)
         self.assertIsNotNone(out_path)
         self.assertEqual(Path(out_path).read_bytes(), xlsx)
+
+
+class DocumentedFlattenEntriesTests(unittest.TestCase):
+    """AC4: LAYER1_OLE_HANDLING.md 的命令引用真实脚本与真实参数（可执行性守卫）。"""
+
+    def test_flatten_table_entry_exists_with_documented_flags(self):
+        src = (SKILL_ROOT / "scripts" / "flatten_table.py").read_text(encoding="utf-8")
+        for flag in ("--input", "--target", "--output", "--meta"):
+            self.assertIn(flag, src)
+
+    def test_flatten_workbook_entry_exists_with_documented_flags(self):
+        src = (SKILL_ROOT / "scripts" / "flatten_workbook.py").read_text(encoding="utf-8")
+        for flag in ("--input", "--plan", "--out-dir"):
+            self.assertIn(flag, src)
+
+    def test_layer1_doc_has_no_stale_script_and_documents_defect(self):
+        doc = (SKILL_ROOT / "references" / "LAYER1_OLE_HANDLING.md").read_text(encoding="utf-8")
+        self.assertNotIn("flatten_source", doc)
+        self.assertIn("OLE_NO_EXCEL_EMBEDDING", doc)
 
 
 if __name__ == "__main__":
