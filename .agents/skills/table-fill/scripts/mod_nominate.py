@@ -31,6 +31,15 @@ Fail-closed rules:
     directly — user adjudication wins over signal facts; fired exclusions
     still conflict.
 
+Two-phase rule loading (SKILL.md 硬性契约): nomination output carries per
+candidate only hits/pending/missed/fired_exclusions/summary — never the full
+rule set (ambiguous candidates additionally carry a compact rule_evidence
+summary sufficient for adjudication). After the user picks a MOD, the full
+rules are loaded via `load_rules_for_selected_mod()` (MOD file full text)
+and injected into the FillSpec authoring context. The hard requirement
+"candidate rules must be loaded before writing the spec" is unchanged —
+only load timing and granularity moved.
+
 The agent then applies the user's explicit choice (MOD NONE / a named MOD)
 and writes `selected_mod` into fill_spec.yaml.
 
@@ -140,8 +149,10 @@ def parse_mod_file(mods_dir: Path, path: str) -> dict:
 
 def parse_rule_table(text: str) -> list[dict]:
     """解析 MOD 文件的六列规则表 (| Rule ID | Group | Gate | Description |
-    Applies to | Notes |) 为结构化列表 — 随提名输出注入, 供 FillSpec 撰写
-    直接使用 (映射/公式链/路由/继承/校验规则), 不再猜测映射关系。"""
+    Applies to | Notes |) 为结构化列表 — 两段加载第二段的规则载体: 提名输出
+    **不含**完整规则集; 用户裁决后经 load_rules_for_selected_mod() 从 MOD
+    文件全文解析, 注入 FillSpec 撰写上下文 (映射/公式链/路由/继承/校验规则),
+    不再猜测映射关系。"""
     rows = []
     for line in text.splitlines():
         if not line.startswith("|"):
@@ -159,6 +170,79 @@ def parse_rule_table(text: str) -> list[dict]:
                 "notes": cells[5] if len(cells) > 5 else "",
             })
     return rows
+
+
+def load_rules_for_selected_mod(mods_dir: Path, path: str) -> list[dict]:
+    """两段加载第二段: 用户裁决后, 从选中 MOD 文件全文加载完整规则,
+    注入 FillSpec 撰写上下文 (映射/公式链/路由/继承/校验规则)。
+    提名输出不含完整规则集 — 硬性要求「候选规则进入 spec 撰写上下文前
+    必须已加载」由本函数 + 调用纪律保证。"""
+    return parse_mod_file(mods_dir, path).get("rules", [])
+
+
+def _rule_evidence(rules: list[dict]) -> list[dict]:
+    """ambiguous 裁决用规则证据摘要: 只取 id + description (足够裁决判断),
+    不携带 group/gate/applies_to/notes 完整规则集。"""
+    return [{"id": r["id"], "description": r["description"]} for r in rules]
+
+
+def _evaluate_entry(entry: dict, mods_dir: Path, evidence: str,
+                    digests: list[str], outlines: list[dict],
+                    ) -> tuple[dict, list[dict]]:
+    """单候选评估: 命中/待复验/未命中信号 + 排除 + 摘要。
+    返回 (候选字典, 完整规则) — 候选字典不含完整规则集; 完整规则只在
+    ambiguous 时降采样为证据摘要, 或裁决后由 load_rules_for_selected_mod()
+    全文加载。"""
+    meta = parse_mod_file(mods_dir, entry["path"])
+    hits, pending, missed = [], [], []
+    for sig in [s.strip() for s in entry["scope"].split(",") if s.strip()]:
+        if "::" not in sig:
+            continue
+        kind, value = sig.split("::", 1)
+        r = signal_matched(kind, value, evidence, digests, outlines)
+        if r is True:
+            hits.append(sig)
+        elif r is None:
+            pending.append(sig)
+        else:
+            missed.append(sig)
+    fired_excl, unverifiable_excl = exclusion_checks(
+        entry["exclusion"], evidence, digests, outlines)
+    return ({
+        "name": entry["name"],
+        "revision": entry["revision"],
+        "visibility": entry["visibility"],
+        "hits": hits,
+        "pending": pending,
+        "missed": missed,
+        "fired_exclusions": fired_excl,
+        "pending_exclusions": unverifiable_excl,
+        "summary": meta.get("summary", []),
+    }, meta.get("rules", []))
+
+
+def _evaluate_entries(entries: list[dict], mods_dir: Path, evidence: str,
+                      digests: list[str], outlines: list[dict],
+                      only_names: set[str] | None = None,
+                      ) -> tuple[list[dict], dict[str, list[dict]]]:
+    """批量候选评估 (统一输出形状: 候选不含完整规则集) — resolve() 与
+    main() 显式多 MOD 特例共用同一评估路径。"""
+    candidates, rules_by_name = [], {}
+    for e in entries:
+        if only_names is not None and e["name"] not in only_names:
+            continue
+        cand, rules = _evaluate_entry(e, mods_dir, evidence, digests, outlines)
+        candidates.append(cand)
+        rules_by_name[e["name"]] = rules
+    return candidates, rules_by_name
+
+
+def _attach_rule_evidence(candidates: list[dict],
+                          rules_by_name: dict[str, list[dict]]) -> list[dict]:
+    """ambiguous 时给各候选附裁决用规则证据摘要 (id+description)。"""
+    for c in candidates:
+        c["rule_evidence"] = _rule_evidence(rules_by_name.get(c["name"], []))
+    return candidates
 
 
 def load_digests(digest_arg: str, workdir: Path) -> list[str]:
@@ -395,40 +479,12 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
         entries = [e for e in entries if e["name"].lower() == selected or any(
             alias.strip().lower() == selected
             for alias in e["aliases"].split(",") if alias.strip())]
-    candidates = []
-    for e in entries:
-        meta = parse_mod_file(mods_dir, e["path"])
-        hits, pending, missed = [], [], []
-        for sig in [s.strip() for s in e["scope"].split(",") if s.strip()]:
-            if "::" not in sig:
-                continue
-            kind, value = sig.split("::", 1)
-            r = signal_matched(kind, value, evidence, digests, outlines)
-            if r is True:
-                hits.append(sig)
-            elif r is None:
-                pending.append(sig)
-            else:
-                missed.append(sig)
-        fired_excl, unverifiable_excl = exclusion_checks(
-            e["exclusion"], evidence, digests, outlines)
-        if not hits and not explicit_mod:
-            continue  # no verified signal touched this MOD — not a candidate
-                     # (pending/missed signals alone cannot nominate: a miss
-                     # means the MOD verifiably does not apply → status none,
-                     # nothing auto-resolved — fail-closed by absence)
-        candidates.append({
-            "name": e["name"],
-            "revision": e["revision"],
-            "visibility": e["visibility"],
-            "hits": hits,
-            "pending": pending,
-            "missed": missed,
-            "fired_exclusions": fired_excl,
-            "pending_exclusions": unverifiable_excl,
-            "summary": meta.get("summary", []),
-            "rules": meta.get("rules", []),
-        })
+    candidates, rules_by_name = _evaluate_entries(
+        entries, mods_dir, evidence, digests, outlines)
+    candidates = [c for c in candidates if c["hits"] or explicit_mod]
+    # 无命中且非显式指定 → 不是候选 (pending/missed 信号单独不能提名:
+    # miss 意味着该 MOD 可验证地不适用 → status none, 不自动 resolved —
+    # fail-closed by absence)
 
     if not candidates:
         return {"status": "none", "candidates": [],
@@ -452,7 +508,8 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
                        "exclusion signal fired"}
     hit_count = len([c for c in candidates if c["hits"]])
     if hit_count > 1:
-        return {"status": "ambiguous", "candidates": candidates,
+        return {"status": "ambiguous",
+                "candidates": _attach_rule_evidence(candidates, rules_by_name),
                 "why": "multiple MODs matched — different business meanings "
                        "must be user-adjudicated"}
     if (any(c["pending"] for c in candidates)
@@ -460,7 +517,8 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
             or any(c["pending_exclusions"] for c in candidates)):
         # Fail-closed: 未验证事实 (pending)、可验证未命中信号 (missed) 与
         # 无法核实的未知排除条件都阻断自动采用 — 询问用户, 不静默放行。
-        return {"status": "ambiguous", "candidates": candidates,
+        return {"status": "ambiguous",
+                "candidates": _attach_rule_evidence(candidates, rules_by_name),
                 "why": "the matching MOD has missed or unverifiable business "
                        "facts — user adjudication required"}
     return {"status": "resolved", "candidates": candidates,
@@ -499,9 +557,14 @@ def main() -> None:
     entries = parse_index(index)
     explicit = explicit_mod_mentions(entries, args.task)
     if len(explicit) > 1:
+        # 显式多 MOD 名: 与 resolve() 同形输出 (候选含摘要, 附裁决用规则证据
+        # 摘要, 不含完整规则集) — 完整规则裁决后经 load_rules_for_selected_mod()
+        # 从 MOD 文件全文加载。
+        cands, rules_by_name = _evaluate_entries(
+            entries, mods_dir, evidence, digests, outlines, only_names=set(explicit))
         result = {
             "status": "ambiguous",
-            "candidates": [{"name": name} for name in explicit],
+            "candidates": _attach_rule_evidence(cands, rules_by_name),
             "why": "multiple MOD names or aliases were explicitly mentioned",
         }
     else:

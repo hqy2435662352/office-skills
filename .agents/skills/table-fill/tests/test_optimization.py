@@ -138,6 +138,25 @@ class CompileTests(unittest.TestCase):
             compile_fill.compile_spec(spec, self.workdir["manifest"], self.tmp)
         self.assertEqual(ctx.exception.code, 3)
 
+    # ── Input hash binding ──
+    def test_plan_binds_staged_input_hashes(self):
+        """plan.input_hashes = compile-time sha256 of the staged sources+target
+        (recomputed, not copied from the manifest's outline-stage snapshot)."""
+        plan = compile_spec_with(self.workdir, spec_with(self.workdir))
+        self.assertEqual(set(plan["input_hashes"]),
+                         {"source_maoli.xlsx", "target.xlsx"})
+        # probe workdir has no real staged xlsx → binding is None (unverifiable;
+        # execute fails closed on a None binding)
+        self.assertIsNone(plan["input_hashes"]["source_maoli.xlsx"])
+        # with real staged files → sha256 bound
+        (self.tmp / "source_maoli.xlsx").write_bytes(b"SRC-BYTES")
+        (self.tmp / "target.xlsx").write_bytes(b"TARGET-BYTES")
+        plan2 = compile_spec_with(self.workdir, spec_with(self.workdir))
+        self.assertEqual(plan2["input_hashes"]["source_maoli.xlsx"],
+                         promote_output.sha256_file(self.tmp / "source_maoli.xlsx"))
+        self.assertEqual(plan2["input_hashes"]["target.xlsx"],
+                         promote_output.sha256_file(self.tmp / "target.xlsx"))
+
     # ── Selectors ──
     def test_selectors_filter_rows(self):
         spec = spec_with(self.workdir)
@@ -547,8 +566,10 @@ class ModNominateTests(unittest.TestCase):
         self.assertEqual(r["status"], "conflict")
         self.assertIn("证据缺失", r["why"])
 
-    def test_rules_loaded_with_candidates(self):
-        """规则随提名输出: 候选携带完整规则表 (映射/公式链直接可用)."""
+    def test_rules_not_in_nomination_two_phase_loading(self):
+        """两段加载 (SKILL.md 硬性契约): 提名输出不含完整规则集 (候选只带
+        hits/pending/missed/摘要); 用户裁决后经 load_rules_for_selected_mod()
+        从 MOD 文件全文加载完整规则, 注入 FillSpec 撰写上下文."""
         idx_dir = Path(__file__).parent / "_fixtures"
         index = idx_dir / "MOD_INDEX_rules.md"
         mods = idx_dir / "MODS_rules"
@@ -569,10 +590,48 @@ class ModNominateTests(unittest.TestCase):
         entries = mod_nominate.parse_index(index)
         r = mod_nominate.resolve(entries, mods, "报价汇总 迁移", ["digest"], [])
         self.assertEqual(r["status"], "resolved")
-        rules = r["candidates"][0]["rules"]
-        self.assertEqual([x["id"] for x in rules], ["FLD-006", "FRM-002"])
-        self.assertIn("源面价", rules[0]["description"])
-        self.assertEqual(rules[0]["group"], "business_transformation")
+        cand = r["candidates"][0]
+        # 提名输出: 摘要可供裁决, 完整规则集不随提名输出
+        self.assertIn("summary", cand)
+        self.assertNotIn("rules", cand)
+        # 裁决后第二段: 从 MOD 文件全文加载完整规则
+        full = mod_nominate.load_rules_for_selected_mod(mods, "MOD_rules.md")
+        self.assertEqual([x["id"] for x in full], ["FLD-006", "FRM-002"])
+        self.assertIn("源面价", full[0]["description"])
+        self.assertEqual(full[0]["group"], "business_transformation")
+        self.assertEqual(full[0]["notes"], "与 FLD-007 共同保证结算价等于面价")
+
+    def test_ambiguous_candidates_carry_rule_evidence_summary(self):
+        """多候选 ambiguous: 裁决选项附规则证据摘要 (id+description, 足够裁决
+        判断), 仍不含完整规则集 — 完整规则在选定后加载."""
+        idx_dir = Path(__file__).parent / "_fixtures"
+        index = idx_dir / "MOD_INDEX_ambig.md"
+        mods = idx_dir / "MODS_ambig"
+        mods.mkdir(exist_ok=True)
+        index.write_text(
+            "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| mod_a | a | semantic_type::quotation |  | MOD_a.md | 1 | private |\n"
+            "| mod_b | b | semantic_type::quotation |  | MOD_b.md | 1 | private |\n",
+            encoding="utf-8")
+        for name, rule_id in (("MOD_a.md", "FLD-006"), ("MOD_b.md", "FRM-002")):
+            (mods / name).write_text(
+                "## Applicability\n- semantic_type: quotation\n\n"
+                "## 业务逻辑摘要\n- x\n\n"
+                "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+                "|---|---|---|---|---|---|\n"
+                f"| {rule_id} | business_transformation | mod_gate | 描述{rule_id}。 | X | n |\n",
+                encoding="utf-8")
+        r = mod_nominate.resolve(mod_nominate.parse_index(index), mods,
+                                 "报价汇总 迁移", ["digest"], [])
+        self.assertEqual(r["status"], "ambiguous")
+        self.assertEqual(len(r["candidates"]), 2)
+        for cand in r["candidates"]:
+            self.assertNotIn("rules", cand)  # 不随提名输出完整规则集
+            self.assertIn("rule_evidence", cand)  # 附裁决用规则证据摘要
+            expect = "FLD-006" if cand["name"] == "mod_a" else "FRM-002"
+            self.assertEqual(cand["rule_evidence"][0]["id"], expect)
+            self.assertIn("description", cand["rule_evidence"][0])
 
     def test_out_relative_resolves_to_workdir(self):
         """--out 相对路径以 workdir 为基准 — CWD != workdir 时结果不乱落
@@ -638,20 +697,32 @@ class ReceiptHashTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, expect_code)
 
     def _gate_workdir(self, tmp) -> tuple[Path, dict]:
-        """Workdir with real draft/spec/plan + receipt + (pending|confirmed) gate."""
+        """Workdir with real draft/spec/plan + staged inputs + receipt + gate."""
         import zipfile
         workdir = Path(tmp)
         draft = workdir / "validated_draft.xlsx"
         with zipfile.ZipFile(draft, "w") as z:
             z.writestr("xl/workbook.xml", "<workbook/>")  # valid zip for the promote check
         (workdir / "fill_spec.yaml").write_text("task: x", encoding="utf-8")
-        (workdir / "execution_plan.json").write_text("{}", encoding="utf-8")
+        (workdir / "source_maoli.xlsx").write_bytes(b"SOURCE-STAGED")
+        (workdir / "template.xlsx").write_bytes(b"TEMPLATE-STAGED")
+        input_hashes = {
+            "source_maoli.xlsx": promote_output.sha256_file(workdir / "source_maoli.xlsx"),
+            "template.xlsx": promote_output.sha256_file(workdir / "template.xlsx"),
+        }
+        (workdir / "execution_plan.json").write_text(json.dumps(
+            {"target": "template.xlsx", "input_hashes": input_hashes},
+            ensure_ascii=False), encoding="utf-8")
         hashes = {
             "fill_spec_sha256": promote_output.sha256_file(workdir / "fill_spec.yaml"),
             "execution_plan_sha256": promote_output.sha256_file(workdir / "execution_plan.json"),
             "draft_sha256": promote_output.sha256_file(draft),
         }
-        receipt = {"draft_path": str(draft), **hashes}
+        receipt = {
+            "draft_path": str(draft), **hashes,
+            "source_hashes": {"source_maoli.xlsx": input_hashes["source_maoli.xlsx"]},
+            "template_sha256": input_hashes["template.xlsx"],
+        }
         (workdir / "draft_receipt.json").write_text(
             json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
         return workdir, hashes
@@ -780,6 +851,131 @@ class ReceiptHashTests(unittest.TestCase):
             with mock.patch("promote_output.shutil.copy2", side_effect=corrupt_copy):
                 self._promote(workdir, 3)
             self.assertEqual(final.read_bytes(), b"OLD-DELIVERED-FILE")
+
+    def test_promote_rejects_source_input_drift(self):
+        """Staged SOURCE changed after the gate → HASH_DRIFT (exit 3), no final."""
+        import execution_gate
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir, _ = self._gate_workdir(tmp)
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
+                execution_gate.main()
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
+                execution_gate.main()
+            (workdir / "source_maoli.xlsx").write_bytes(b"TAMPERED-SOURCE")
+            self._promote(workdir, 3)
+            self.assertFalse((workdir / "final.xlsx").exists())
+
+    def test_promote_rejects_template_input_drift(self):
+        """Staged TEMPLATE changed after the gate → HASH_DRIFT (exit 3)."""
+        import execution_gate
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir, _ = self._gate_workdir(tmp)
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
+                execution_gate.main()
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
+                execution_gate.main()
+            (workdir / "template.xlsx").write_bytes(b"TAMPERED-TEMPLATE")
+            self._promote(workdir, 3)
+            self.assertFalse((workdir / "final.xlsx").exists())
+
+    def test_promote_rejects_missing_input_evidence(self):
+        """Receipt without execution-time input hashes → HASH_DRIFT (fail-closed)."""
+        import execution_gate
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir, _ = self._gate_workdir(tmp)
+            receipt = json.loads(
+                (workdir / "draft_receipt.json").read_text(encoding="utf-8"))
+            del receipt["source_hashes"]
+            del receipt["template_sha256"]
+            (workdir / "draft_receipt.json").write_text(
+                json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
+                execution_gate.main()
+            with self.assertRaises(SystemExit):
+                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
+                execution_gate.main()
+            self._promote(workdir, 3)
+            self.assertFalse((workdir / "final.xlsx").exists())
+
+
+class ExecuteInputHashContractTests(unittest.TestCase):
+    """Issue 03 contract: execution-time recompute vs compile-time binding."""
+
+    def _make_workdir(self, tmp) -> Path:
+        workdir = Path(tmp)
+        (workdir / "source_maoli.xlsx").write_bytes(b"SRC-BYTES")
+        (workdir / "template.xlsx").write_bytes(b"TPL-BYTES")
+        return workdir
+
+    def _plan(self, workdir: Path) -> dict:
+        return {
+            "target": "template.xlsx",
+            "input_hashes": {
+                "source_maoli.xlsx":
+                    promote_output.sha256_file(workdir / "source_maoli.xlsx"),
+                "template.xlsx":
+                    promote_output.sha256_file(workdir / "template.xlsx"),
+            },
+        }
+
+    def test_no_drift_when_untampered(self):
+        import execute_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = self._make_workdir(tmp)
+            plan = self._plan(workdir)
+            actual, drifted = execute_batch.input_hash_drift(
+                workdir, plan, workdir / "template.xlsx")
+            self.assertEqual(drifted, [])
+            self.assertEqual(actual["source_maoli.xlsx"],
+                             promote_output.sha256_file(workdir / "source_maoli.xlsx"))
+            self.assertEqual(actual["template.xlsx"],
+                             promote_output.sha256_file(workdir / "template.xlsx"))
+
+    def test_tampered_source_detected(self):
+        import execute_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = self._make_workdir(tmp)
+            plan = self._plan(workdir)
+            (workdir / "source_maoli.xlsx").write_bytes(b"TAMPERED")
+            _actual, drifted = execute_batch.input_hash_drift(
+                workdir, plan, workdir / "template.xlsx")
+            self.assertEqual(drifted, ["source_maoli.xlsx"])
+
+    def test_tampered_template_detected(self):
+        import execute_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = self._make_workdir(tmp)
+            plan = self._plan(workdir)
+            (workdir / "template.xlsx").write_bytes(b"TAMPERED")
+            _actual, drifted = execute_batch.input_hash_drift(
+                workdir, plan, workdir / "template.xlsx")
+            self.assertEqual(drifted, ["template.xlsx"])
+
+    def test_missing_file_is_drift(self):
+        import execute_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = self._make_workdir(tmp)
+            plan = self._plan(workdir)
+            (workdir / "source_maoli.xlsx").unlink()
+            _actual, drifted = execute_batch.input_hash_drift(
+                workdir, plan, workdir / "template.xlsx")
+            self.assertEqual(drifted, ["source_maoli.xlsx"])
+
+    def test_none_binding_is_drift(self):
+        """Bound None (unverifiable at compile) must fail closed at execute."""
+        import execute_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = self._make_workdir(tmp)
+            plan = self._plan(workdir)
+            plan["input_hashes"]["source_maoli.xlsx"] = None
+            _actual, drifted = execute_batch.input_hash_drift(
+                workdir, plan, workdir / "template.xlsx")
+            self.assertEqual(drifted, ["source_maoli.xlsx"])
 
 
 class MultiTargetTests(unittest.TestCase):
@@ -3125,6 +3321,147 @@ class CapabilityMappingContractTests(unittest.TestCase):
         t.pop("base_last_row", None)
         self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", self._fail_codes(spec))
 
+    # ── issue 06: pptx 未支持声明 fail-closed (不再静默丢弃) ──
+
+    def _pptx_spec(self) -> dict:
+        """Base spec flipped to a pptx table target (slide[1]/table[@id=1]),
+        with the pptx-unsupported BASE_SPEC nulls dropped and a DOM-path
+        key_output (the supported pptx shape)."""
+        self.wd["manifest"]["target"]["sheet"] = "slide[1]/table[@id=1]"
+        spec = spec_with(self.wd)
+        spec["inputs"]["platform"] = "pptx"
+        spec["inputs"]["target_sheet"] = "slide[1]/table[@id=1]"
+        t = spec["mapping"]["targets"][0]
+        t["sheet"] = "slide[1]/table[@id=1]"
+        t["first_data_row"] = 2
+        t.pop("nulls", None)
+        spec["validation"]["key_outputs"] = ["/slide[1]/table[@id=1]/tr[2]/tc[1]"]
+        return spec
+
+    def _fail_defects(self, spec) -> list[dict]:
+        """Compile-fail defect payload (parsed stderr); asserts exit 3."""
+        from io import StringIO
+        buf = StringIO()
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                compile_fill.compile_spec(spec, self.wd["manifest"],
+                                          self.wd["workdir"])
+            self.assertEqual(ctx.exception.code, 3)
+        finally:
+            sys.stderr = old
+        return json.loads(buf.getvalue()).get("defects", [])
+
+    def test_pptx_per_row_formula_rejected(self):
+        """pptx formulas.per_row → PPTX_CAPABILITY_NOT_ROLLED_OUT (曾静默丢弃)."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"G": "IFERROR(ROUND(A{r}-B{r},2),0)"}}
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "per_row" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_aggregates_rejected(self):
+        """pptx formulas.aggregates → PPTX_CAPABILITY_NOT_ROLLED_OUT."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "aggregates": [{"col": "G", "rows": "1:{n}",
+                            "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]}
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "aggregates" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_merges_rejected(self):
+        """pptx merges → PPTX_CAPABILITY_NOT_ROLLED_OUT."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["merges"] = [
+            {"col": "E", "rows": "1:{n}", "style": "label"}]
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "merges" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_nulls_rejected(self):
+        """pptx nulls (克隆残留置空, pptx 无克隆) → PPTX_CAPABILITY_NOT_ROLLED_OUT."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["nulls"] = [{"col": "D", "rows": "all"}]
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "nulls" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_remove_rows_rejected(self):
+        """pptx remove_rows (无结构行操作) → PPTX_CAPABILITY_NOT_ROLLED_OUT."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["remove_rows"] = [3]
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "remove_rows" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_columns_props_rejected(self):
+        """pptx columns[].props (numberformat 白名单) → 拒绝 — pptx 文本格
+        无数字格式, props 曾静默不应用."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["columns"].append(
+            {"source": "B", "target": "E", "props": {"numberformat": "0.00"}})
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_CAPABILITY_NOT_ROLLED_OUT"
+                 and "props" in x.get("message", ""))
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_rows_out_of_bounds_rejected(self):
+        """first_data_row + 匹配行数越过表格实际行数 → 编译期拒绝
+        (PPTX_TARGET_ROWS_OUT_OF_BOUNDS), 而非执行期才失败."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["first_data_row"] = 19  # 19+3−1=21 > 20
+        defects = self._fail_defects(spec)
+        d = next(x for x in defects
+                 if x["code"] == "PPTX_TARGET_ROWS_OUT_OF_BOUNDS")
+        self.assertIn("first_data_row", d["message"])
+        self.assertIn("tr[21]", d["message"])
+        self.assertTrue(d["corrective_action"])
+
+    def test_pptx_rows_exactly_at_last_row_accepted(self):
+        """边界: 填充恰好止于表格最后一行 (first + n − 1 == dims.rows)
+        → 接受 (越界指 tr 超过实际行数, 不是首行+行数越过)."""
+        spec = self._pptx_spec()
+        spec["mapping"]["targets"][0]["first_data_row"] = 18  # 18+3−1=20 == 20
+        spec["validation"]["key_outputs"] = ["/slide[1]/table[@id=1]/tr[18]/tc[1]"]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        self.assertEqual(plan["operations"][-1]["path"],
+                         "/slide[1]/table[@id=1]/tr[20]/tc[3]")
+
+    def test_pptx_basic_fill_compiles(self):
+        """pptx 列值填充 (唯一已 rollout 能力) → 编译通过; ops 全为
+        tr/tc DOM 路径的 set + text 属性; readback 逐格登记."""
+        spec = self._pptx_spec()
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        ops = plan["operations"]
+        self.assertEqual(len(ops), 9)  # 3 源行 × 3 列映射
+        for op in ops:
+            self.assertEqual(op["command"], "set")
+            self.assertTrue(re.fullmatch(
+                r"/slide\[1\]/table\[@id=1\]/tr\[[234]\]/tc\[[123]\]", op["path"]),
+                op["path"])
+            self.assertEqual(set(op["props"]), {"text"})
+        rb = plan["readback"]
+        self.assertEqual(len(rb), 9)
+        self.assertTrue(all(r["kind"] == "value" for r in rb))
+        self.assertTrue(all(
+            r["path"].startswith("/slide[1]/table[@id=1]/tr[") for r in rb))
+
 
 class PreformattedQuotationPatternContractTests(unittest.TestCase):
     """issue 02 — 完整 Canonical Pattern `preformatted_quotation_inplace` 的
@@ -3417,7 +3754,10 @@ class CapabilitiesTests(unittest.TestCase):
                     "derived_subtraction_pattern", "mapped_group_column_anchor",
                     "lookup_missing_empty", "precision_keep", "per_group_total_blocks",
                     "per_group_total_hardcoded_ranges", "nulls_aggregate_same_col",
-                    "pptx_group_merges", "group_aggregates_egypt_3_groups",
+                    "pptx_group_merges", "pptx_inplace", "pptx_group_aggregates",
+                    "pptx_per_row_formula", "pptx_aggregates", "pptx_merges",
+                    "pptx_nulls", "pptx_remove_rows", "pptx_rows_out_of_bounds",
+                    "pptx_basic_fill", "group_aggregates_egypt_3_groups",
                     "group_aggregates_whole_run_gate", "lookup_table_empty",
                     "lookup_column_all_missing"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
@@ -3590,6 +3930,47 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("样式", row)
         self.assertLess(row.index("append-only"), row.index("inplace"),
                         "append-only 是首选, inplace 只能是条件选项")
+
+    def test_fillspec_pptx_capability_boundary(self):
+        """「多目标与 PPTX」章节声明 pptx 支持矩阵 + 行边界缺陷码 (issue 06)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^##\s+多目标与 PPTX", text, re.MULTILINE)
+        self.assertIsNotNone(m, "FILLSPEC.md 缺章节 ## 多目标与 PPTX")
+        section = text[m.end():]
+        for word in ("PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                     "PPTX_TARGET_ROWS_OUT_OF_BOUNDS", "fail-closed",
+                     "不再静默丢弃"):
+            self.assertIn(word, section, f"多目标与 PPTX 缺词 {word!r}")
+        self.assertIn("PPTX_TARGET_ROWS_OUT_OF_BOUNDS", self._error_code_table())
+        self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", self._error_code_table())
+
+    def test_fillspec_q18_pptx_capability(self):
+        """契约章节含 Q18 小节: pptx 支持矩阵与行边界 (issue 06;
+        Q17 = issue 05 恰好一次, 撞号重排为 Q18)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q18:.*\n", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q18 小节")
+        q18 = section[m.end():]
+        self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", q18)
+        self.assertIn("PPTX_TARGET_ROWS_OUT_OF_BOUNDS", q18)
+        self.assertIn("test_pptx_e2e.py", q18)
+
+    def test_skill_md_pptx_support_matrix(self):
+        """SKILL.md PPTX 小节声明支持矩阵 (issue 06) — frontmatter「任意方向」
+        与能力边界不再矛盾 (静默丢弃措辞被 fail-closed 替代)."""
+        text = self._skill_md_text()
+        self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", text)
+        self.assertIn("不再静默丢弃", text)
+        self.assertIn("PPTX_TARGET_ROWS_OUT_OF_BOUNDS", text)
+        self.assertIn("支持矩阵 (issue 06 fail-closed)", text)
+
+    def test_known_traps_pptx_silent_drop(self):
+        """KNOWN_TRAPS 含「PPTX 未支持声明静默丢失」机械事实 (issue 06)."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8")
+        self.assertIn("PPTX 未支持声明静默丢失", text)
+        self.assertIn("PPTX_TARGET_ROWS_OUT_OF_BOUNDS", text)
 
     def test_skill_md_authoring_procedure_words(self):
         """SKILL.md 撰写规程: 先写后编译 + scratch 纪律词存在."""

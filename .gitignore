@@ -41,3 +41,7 @@ test_fixtures/
 /table-fill-governance/
 # issue tracker 为本地工作文件, 不追踪
 /.scratch/
+
+# table-fill 本地私有物 (不随版本控制/发布推送)
+.agents/skills/table-fill/references/MOD_tcl_*
+.agents/skills/table-fill/evals/

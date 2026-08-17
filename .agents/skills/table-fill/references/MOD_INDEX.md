@@ -53,17 +53,21 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
    只消费 flatten 机械产出的 digest: dimension_set 按 digest 表头角色核对 (可验证 →
    真 hit/miss), 其余结构信号标记"待L2复验"。
 2. 运行 `python scripts/mod_nominate.py --task "<任务文本>" --files <文件名,...> --outline <outline.txt> --out 展平元数据输出/mod_nomination.md`
-3. 呈现提名卡 (命中信号/待复验信号/业务逻辑摘要 + 完整规则表)。**适用性由用户裁决**:
-   选择 `/mod <NAME>` 或 `/mod NONE`。agent 不做排除判定, 不猜业务对象身份。
-4. **规则随提名输出**: `mod_resolution.json` 候选携带完整规则 (`rules` 字段,
-   Rule ID/Group/Gate/Description/Applies to/Notes)。**候选出现即加载**
-   (resolved/ambiguous/conflict 一律加载, 多候选加载全部) — 映射/公式链/
-   路由/继承/校验规则进入 FillSpec 撰写上下文, 不再猜测映射关系。选中 →
-   `selected_mod` 写入 fill_spec.yaml (无状态机, 无 gate_confirmed);
-   NONE → 与现行无 MOD 流程一致。
+3. 呈现提名卡 (候选名 + 命中/待复验信号 + 业务逻辑摘要 + 裁决选项;
+   ambiguous 时附各候选的**规则证据摘要** id+description, 足够裁决判断)。
+   **不含完整规则集** — 适用性由用户裁决: 选择 `/mod <NAME>` 或 `/mod NONE`。
+   agent 不做排除判定, 不猜业务对象身份。
+4. **规则裁决后加载 (两段加载)**: 用户选定后, 才从**选中** MOD 文件全文
+   (或 `mod_resolution.json` 的 `rules` 字段) 加载完整规则, 注入 FillSpec
+   撰写上下文 — 映射/公式链/路由/继承/校验规则进入 spec 撰写上下文, 不再
+   猜测映射关系。选中 → `selected_mod` 写入 fill_spec.yaml (无状态机,
+   无 gate_confirmed); NONE → 与现行无 MOD 流程一致。**硬性要求不变**:
+   候选规则进入 spec 撰写上下文前必须已加载 — 改变的是加载时机与粒度,
+   不是是否加载。
    > **执行 vs 治理文档边界**: 执行任务只消费 `mod_resolution.json` 的
-   > `rules`/`summary` + MOD 文件 (MOD_INDEX 指向的文件)。**不读
-   > `MOD_TEMPLATE.md`** — 那是"新建/修改 MOD 文件"的治理规范, 与执行无关
+   > `summary`/信号 + **选中 MOD 文件全文** (两段加载第二段: 完整规则从
+   > MOD 文件全文解析, 由 `mod_nominate.load_rules_for_selected_mod()` 提供)。
+   > **不读 `MOD_TEMPLATE.md`** — 那是"新建/修改 MOD 文件"的治理规范, 与执行无关
    > (2026-08-12 实测: 误读全文浪费数分钟)。
 5. **L2 复验**: flatten 完成后用全量事实核对被选 MOD 的结构类信号。吻合 → 继续;
    冲突 → 呈现冲突点, 用户重新裁决 (保留规则/降级 NONE/换 MOD)。

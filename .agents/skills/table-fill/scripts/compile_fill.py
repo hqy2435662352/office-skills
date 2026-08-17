@@ -45,7 +45,7 @@ except ImportError:
 
 MANIFEST_NAME = "prepare_manifest.json"
 
-from _officecli import ensure_utf8_stdio, fail, record_timing  # noqa: E402
+from _officecli import ensure_utf8_stdio, fail, record_timing, sha256_file  # noqa: E402
 PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
 
@@ -64,6 +64,26 @@ STYLE_DEFAULTS = {
 }
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def bind_input_hashes(workdir: Path, inputs: dict) -> dict:
+    """Compile-time binding of the STAGED input files' content hashes.
+
+    plan.input_hashes = {staged_name: sha256} for every source + the target —
+    the exact files execute_batch.py will read at execution time. This is
+    recomputed at COMPILE time (not copied from prepare_manifest.json
+    files[].sha256, which is an outline-stage snapshot that goes stale after
+    repair_row_gaps modifies the staged target — repair resyncs fingerprints
+    but not files[].sha256; recompile rebinds). A staged file missing at
+    compile time binds None (unverifiable — execute fails closed on it)."""
+    names = list(inputs.get("sources") or []) + [inputs.get("target")]
+    out = {}
+    for name in names:
+        if not name:
+            continue
+        p = workdir / name
+        out[name] = sha256_file(p) if p.is_file() else None
+    return out
 
 
 def col_idx_to_letter(idx: int) -> str:
@@ -540,9 +560,13 @@ def compute_layout_block(clone_roles: list, n_rows: int, cursor: int,
     return roles, data_start
 
 
-def compute_layout(blocks: list[dict], platform: str, target: dict) -> tuple[list[dict], list]:
+def compute_layout(blocks: list[dict], platform: str, target: dict,
+                   defects: list, table_rows: int | None = None) -> tuple[list[dict], list]:
     """xlsx: blocks lay out sequentially from base_last_row (cursor advances
-    across blocks). pptx: single block, fixed tr rows from first_data_row.
+    across blocks). pptx: single block, fixed tr rows from first_data_row;
+    tr coordinates are checked against the table's ACTUAL row count (issue 06:
+    pptx rows are pre-built — out-of-bounds is a spec error at compile time,
+    never a runtime surprise).
 
     Returns (all_roles, data_starts) — data_starts[i] is block i's first data
     row (xlsx) or tr index (pptx)."""
@@ -555,6 +579,18 @@ def compute_layout(blocks: list[dict], platform: str, target: dict) -> tuple[lis
             fail("SPEC_FIRST_ROW", "pptx targets need first_data_row (1-based tr index)",
                  "Declare first_data_row in the target entry")
         n = len(blocks[0].get("_rows", []))
+        last_tr = first + n - 1
+        if table_rows is not None and n > 0 and last_tr > table_rows:
+            defects.append({
+                "code": "PPTX_TARGET_ROWS_OUT_OF_BOUNDS",
+                "message": f"first_data_row {first} + {n} matched rows ends at "
+                           f"tr[{last_tr}] but the table has only {table_rows} rows — "
+                           "pptx rows are pre-built and cannot be cloned",
+                "corrective_action": "Re-read the digest's table row count and fix "
+                                     "first_data_row, or narrow the selectors, or add "
+                                     "the missing rows once with python-pptx BEFORE "
+                                     "running officecli (禁止在 officecli 之后重新 import)",
+            })
         roles = [{"kind": "data", "tr": first + i, "template_tr": None} for i in range(n)]
         return roles, [first]
     base = target.get("base_last_row")
@@ -2226,7 +2262,8 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     for b in block_infos:
         b["cfg"]["_rows"] = b["rows"]
 
-    roles, data_starts = compute_layout(blocks_cfg, platform, target_cfg)
+    roles, data_starts = compute_layout(blocks_cfg, platform, target_cfg,
+                                        defects, dims.get("rows"))
     for b, start in zip(block_infos, data_starts):
         b["data_start"] = start
     for b in block_infos:
@@ -2254,20 +2291,67 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                                        "pptx model is already pre-built-row fills",
                             "corrective_action": "Drop mode: inplace from the pptx spec"})
         for b in block_infos:
-            if b["cfg"].get("group_merges"):
+            cfg = b["cfg"]
+            label = b["label"]
+            # fail-closed (issue 06): every declaration the pptx lowering does
+            # NOT implement must be rejected here — build_ops_pptx only lowers
+            # column value fills + DOM-path sets, everything else was silently
+            # dropped (compile passed, no ops generated).
+            if cfg.get("group_merges"):
                 defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": "group_merges lowering for pptx (vMerge/"
-                                           "rowspan mechanics) is staged: verify against "
-                                           "the spike fixture before rollout",
+                                "message": f"{label}: group_merges lowering for pptx "
+                                           "(vMerge/rowspan mechanics) is staged: verify "
+                                           "against the spike fixture before rollout",
                                 "corrective_action": "Use xlsx for group_merges, or wait "
                                                       "for the pptx lowering rollout"})
-            if b["cfg"].get("formulas", {}).get("group_aggregates"):
+            if cfg.get("formulas", {}).get("group_aggregates"):
                 defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": "group_aggregates lowering for pptx is staged — "
-                                           "formula cells are xlsx-only; verify against "
-                                           "the spike fixture before rollout",
+                                "message": f"{label}: group_aggregates lowering for "
+                                           "pptx is staged — formula cells are xlsx-only; "
+                                           "verify against the spike fixture before rollout",
                                 "corrective_action": "Use xlsx for group_aggregates, or "
                                                      "wait for the pptx lowering rollout"})
+            if cfg.get("formulas", {}).get("per_row"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: formulas.per_row lowering for pptx "
+                                           "is not rolled out — pptx cells hold text, "
+                                           "not formulas",
+                                "corrective_action": "Use xlsx for per_row formulas, or "
+                                                     "precompute the derived values into "
+                                                     "column mappings"})
+            if cfg.get("formulas", {}).get("aggregates"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: formulas.aggregates lowering for "
+                                           "pptx is not rolled out — formula cells are "
+                                           "xlsx-only",
+                                "corrective_action": "Use xlsx for aggregates, or "
+                                                     "precompute the aggregate values"})
+            if cfg.get("merges"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: merges lowering for pptx is not "
+                                           "rolled out — pptx merge mechanics differ "
+                                           "(vMerge/rowspan spike pending)",
+                                "corrective_action": "Use xlsx for merges, or drop the "
+                                                     "declaration"})
+            if cfg.get("nulls"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: nulls is meaningless for pptx — "
+                                           "there is no clone residue to clear (rows are "
+                                           "pre-built, nothing is cloned)",
+                                "corrective_action": "Drop nulls from the pptx spec"})
+            if cfg.get("remove_rows"):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: remove_rows lowering for pptx is "
+                                           "not rolled out — pptx has no structural row "
+                                           "ops",
+                                "corrective_action": "Drop remove_rows from the pptx spec"})
+            if any(col.get("props") for col in cfg.get("columns", [])):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": f"{label}: columns[].props (numberformat) is "
+                                           "not applied on pptx — pptx cells are text "
+                                           "and carry no number format",
+                                "corrective_action": "Drop props from pptx column "
+                                                     "mappings"})
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
@@ -2397,11 +2481,11 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             positions.extend(roles[i]["tr"] for i in range(len(data_rows)))
     row_map = [(d["src"], d["orig"], positions[i]) for i, d in enumerate(data_rows)]
 
-    # Global exactly-once invariant: every (source, original_row) enters at most
-    # one target row. Blocks (or rows.sources entries) whose selectors overlap
-    # silently double quantities/amounts/aggregates while coverage (an
-    # existence lower bound, not an upper bound) still passes — reject
-    # fail-closed (there is no reuse syntax; FILLSPEC Q17).
+    # Global exactly-once invariant (issue 05): every (source, original_row)
+    # enters at most one target row. Blocks (or rows.sources entries) whose
+    # selectors overlap silently double quantities/amounts/aggregates while
+    # coverage (an existence lower bound, not an upper bound) still passes —
+    # reject fail-closed (there is no reuse syntax; FILLSPEC Q17).
     consumed: dict[tuple[str, int], list[int]] = {}
     for src, orig, trow in row_map:
         consumed.setdefault((src, orig), []).append(trow)
@@ -2512,6 +2596,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         "platform": platform,
         "target": inputs["target"],
         "target_sheet": inputs["target_sheet"],
+        "input_hashes": bind_input_hashes(workdir, inputs),
         "fingerprints": {"source_structure": mfp.get("source_structure"),
                          "target_structure": mfp.get("target_structure")},
         "blocks": blocks,

@@ -1,0 +1,98 @@
+# fill_spec.yaml — v2.5 模板 (复制后按 digest/业务语义修改)
+# 完整 schema 见 references/FILLSPEC.md。要点:
+#   - fingerprints 必须 == prepare_manifest.json (prepare_run.py 输出)
+#   - data 的 template_row 必须是合并区外的非锚点数据行
+#   - 克隆行携带的未填列必须进 nulls
+#   - 派生数值公式默认 ROUND(...,2) 防浮点残值 (text overflow)
+#   - key_outputs 必须是被本 plan 写入的格
+
+task:
+  intent: <一句话说明填充意图>
+  selected_mod: NONE            # 或 MOD 名 (来自 mod_resolution.json)
+  selected_mod_revision: null
+
+inputs:
+  sources: [<staged 源文件名>]
+  target: <staged 目标文件名>
+  source_sheets:
+    - source: <staged 源文件名>
+      sheets: [<展平过的源 sheet 名>]
+  target_sheet: <目标 sheet 名>   # pptx 用 slide[N]/table[@id=M]
+
+fingerprints:
+  source_structure: <prepare_manifest.json.fingerprints.source_structure>
+  target_structure: <prepare_manifest.json.fingerprints.target_structure>
+
+mapping:
+  targets:
+    - sheet: <目标 sheet 名>
+      base_last_row: <目标 digest 的最后数据行>
+      clone_roles:
+        - role: spacer
+        - role: title
+          template_row: <目标块标题行>
+          value: "<可选: 新块标题文本>"
+        - role: header
+          template_row: <目标块表头行>
+        - role: data
+          template_row: <非锚点数据行>
+      rows:
+        source: <展平条目 name (manifest.flattened[].name)>
+        selectors:
+          - column: <列>
+            pattern: "<glob>"          # 或 not_pattern / not_value
+        # sources:                    # 多源合并: 按列表顺序拼进同一数据块
+        #   - source: <展平条目 name>
+        #     selectors: [...]
+      columns:
+        - source: <源列>
+          target: <目标列>
+        # - target: <列>
+        #   lookup: {name: <lookup名>, field: <字段>, missing: empty}
+        # - source: [P, Q]
+        #   target: N                  # 多列求和
+        # - target: J
+        #   value: "0"                 # 常量
+        #   transform: round4          # 内置舍入: 15 位成本值防溢出
+        #   precision: keep            # 显式接受长精度 (窄列溢出自负)
+      lookups:                          # 可选
+        - name: <lookup名>
+          from: <lookup JSON 文件名>
+          key_column: <源列>
+          fields: [<字段列表>]
+          missing: empty
+      formulas:                         # 可选
+        per_row:
+          <列>: "IFERROR(ROUND(...,2),0)"   # {r}=数据行号
+        aggregates:
+          - col: <列>
+            rows: "1:{n}"                    # {n}=数据行数
+            formula: "IFERROR(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),0)"
+            style: anchor
+      merges:                           # 可选
+        - col: <列>
+          rows: "1:{n}"
+          style: label                  # 或 anchor
+      nulls:                            # 克隆残留置空 (必查!)
+        - col: <列>
+          rows: all                     # 或 [1,3] / "2:4"
+      remove_rows: []                   # 源行数 < 模板行数时, 自底向上
+
+decisions:
+  - <业务决策, 每条一行>
+gaps:
+  - <数据缺口 / 未决项, 每条一行>
+lineage:
+  - source: <源展平 csv>
+    role: primary
+    note: <覆盖说明>
+  - source: <lookup 文件>
+    role: lookup
+    note: <说明>
+
+validation:
+  required_coverage:
+    - source: <源展平 csv>
+      rows: [<关键源行号>]
+  required_empty: []                # 额外 EMPTY 断言 (裸坐标或 /Sheet/A1)
+  key_outputs: [<被写入的关键格, 如 A25, O25>]

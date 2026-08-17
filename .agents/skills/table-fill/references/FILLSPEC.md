@@ -496,6 +496,28 @@ formulas:
   若未来出现"同一源行要进入两个目标位置"的真实业务需求, 需先新增显式复用
   声明语法 (另开 ticket), 不允许静默重复消费。
 
+### Q18: PPTX 目标能声明什么？不支持的声明会怎样？
+
+> issue 06: pptx 未 rollout 声明曾**静默丢弃** (编译通过、plan 无对应操作)。
+> 现 fail-closed — 编译期拒绝 + corrective_action, 不再静默。
+
+| 声明 | 行为 |
+|---|---|
+| `columns` 列值填充 / DOM-path `sets` | ✅ 编译通过 — pptx 当前唯一支持能力 |
+| `formulas.per_row` / `formulas.aggregates` / `formulas.group_aggregates` | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — 公式格是 xlsx 能力 |
+| `merges` / `group_merges` | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — pptx 合并 lowering (vMerge/rowspan) 未 rollout |
+| `nulls` | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — pptx 无克隆, 无残留可清 |
+| `remove_rows` | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — pptx 无结构行操作 |
+| `mode: inplace` | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — 表行本就预建 |
+| `columns[].props` (numberformat) | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` — pptx 文本格无数字格式 |
+| `first_data_row + 匹配行数 − 1` > 表格实际行数 | ❌ `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` — pptx 行不能克隆, 越界必须在编译期拒绝 |
+
+- 修复路径: 值类需求预计算进 `columns`; 公式/合并类需求用 xlsx 平台表达;
+  行数不足用 python-pptx **一次性**加行 (禁止在 officecli 操作后重新 import)。
+- 背书: `tests/test_optimization.py` (CapabilityMappingContractTests) +
+  探针矩阵 `pptx_*` 行 + 真实 PPTX E2E (`tests/test_pptx_e2e.py`, 缺模板/
+  officecli 时显式 skip)。
+
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
@@ -546,6 +568,23 @@ formulas:
 - 无 inplace 区 → 无行移位 → readback 坐标 == 模板坐标。
 - 结论: Agent 永远不用计算移位后的行号。
 
+### E5: 输入哈希在哪些边界重算绑定?
+
+> 审计 issue 03 (2026-08-13): Draft 执行与提升必须重新绑定 source/template
+> 内容哈希, 杜绝 "哈希齐全但输入漂移" 的 Draft。绑定边界:
+>
+> | 边界 | 动作 |
+> |---|---|
+> | **compile** | `compile_fill.py` 重算 staged 输入 (sources + target) 的内容 sha256, 写入 `plan.input_hashes` (按 staged 文件名) — **不是** 抄 prepare_manifest.json 的 `files[].sha256` (那是 outline 期快照, repair_row_gaps 修改 staged 文件后**过期** — repair 只重算指纹, 不刷新 files[].sha256; 重编译即重绑定, repair 流程天然兼容) |
+> | **execute** | `execute_batch.py` 在 `copy_template` **之前**重算 staged 输入哈希, 与 `plan.input_hashes` 比对; 漂移/缺失绑定 → `INPUT_HASH_DRIFT` / `INPUT_HASH_BINDING_MISSING` (exit 3, corrective_action: 恢复未漂移输入或重 prepare+重编译) — 绝不带着漂移输入开始填充 |
+> | **receipt** | `draft_receipt.json` 的 `source_hashes` / `template_sha256` 是**执行时重算值** (不再无条件抄 manifest); 另记 `input_hash_check` = {bound, actual, drifted}, 一致/漂移可查 |
+> | **promote** | `promote_output.py` 的 HASH_DRIFT 核对范围含 source/template: plan 绑定 / receipt / 当前 staged 文件三方一致, 任一漂移 → exit 3 (fail-closed: 缺绑定或缺 receipt 证据也拒绝) |
+
+- staged 输入 = 本次填充的输入快照; compile 后手工改动 staged 文件 (非
+  repair 流程) 会先被 execute 拒绝, 不会再出现"读旧 manifest 哈希"的盲区。
+- `.gate3_confirmed` 绑定三元组结构不变 (spec/plan/draft) — 输入哈希由
+  plan 背书 (plan 本身在门禁三元组内)。
+
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
 > 新增 MOD 规则入库时对照此表: 判断"这条业务规则能否表达、用什么模式表达"。
@@ -564,7 +603,7 @@ formulas:
 | 0-口径 | 常量 `value: "0"` / 空源留空 / 多列求和缺失按 0 | 一等 |
 | 常量 | `columns.value` | 一等 |
 | 查表 | `mapping.lookups` + `columns.lookup` | 一等 |
-| pptx 分组合并 / 占位区 | — | **暂无**: `PPTX_CAPABILITY_NOT_ROLLED_OUT` (spike 夹具验证后 rollout) |
+| pptx 分组合并 / 占位区 / 公式 / 合并 / 置空 / 删行 | — | **暂无**: `PPTX_CAPABILITY_NOT_ROLLED_OUT` (spike 夹具验证后 rollout; 曾静默丢弃, issue 06 起编译期拒绝); pptx 当前支持 = 列值填充 + DOM-path sets; 行越界 → `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` |
 
 ## 多目标与 PPTX
 
@@ -575,11 +614,18 @@ formulas:
   columns target 用列字母, Compiler 自动映射 `tc[索引]`; 单元格属性为 `text`;
   `first_data_row` 声明首个数据 tr; 无克隆/合并/公式; key_outputs /
   required_empty 用完整 tr/tc 路径。
-- **PPTX 能力边界 (v2.5)**: `sets` 支持 (完整 DOM 路径
-  `/slide[N]/table[@id=M]/tr[X]/tc[Y]`, 值/清空均可); `group_merges` 的
-  pptx lowering (vMerge/rowspan) 按 spike 夹具验证后再 rollout — 当前声明 →
-  编译拒绝 (PPTX_CAPABILITY_NOT_ROLLED_OUT); `mode: inplace` 对 pptx 无意义
-  (表行本就预建) → 同样拒绝。
+- **PPTX 能力边界 (v2.5, issue 06 fail-closed)**: PPTX 当前能力 = **列值填充**
+  (`columns` → 每格 `text` 写入) + **DOM-path `sets`**
+  (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`, 值/清空均可)。其余声明一律编译期拒绝
+  (`PPTX_CAPABILITY_NOT_ROLLED_OUT`, **不再静默丢弃**):
+  `formulas.per_row` / `formulas.aggregates` / `formulas.group_aggregates`
+  (公式格是 xlsx 能力)、`merges` / `group_merges` (pptx 合并 lowering
+  vMerge/rowspan 未 rollout)、`nulls` (无克隆残留可清)、`remove_rows` (无结构
+  行操作)、`mode: inplace` (表行本就预建)、`columns[].props` (pptx 文本格无
+  数字格式)。
+- **PPTX 行边界 (issue 06)**: `first_data_row + 匹配行数 − 1` 越过表格实际行数
+  → 编译期拒绝 `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` — pptx 行不能克隆, 越界必须
+  在编译期暴露, 而非执行期才失败。
 
 ## v2.5: Row Layout Mode — inplace 占位区
 
@@ -682,6 +728,8 @@ digest, 不要 unzip sheet XML 考古。
 | 错误码 | 含义 | 修复 |
 |---|---|---|
 | FILLSPEC_FINGERPRINT_MISMATCH | 结构变了, spec 过期 | 重跑 prepare_run, 读新 digest, 更新 spec |
+| INPUT_HASH_DRIFT | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 copy_template 前拒绝 (exit 3), 或 promote 的 HASH_DRIFT 三方核对拒绝 | 恢复未漂移的 staged 输入, 或重跑 prepare_run + compile_fill.py 重绑定 (见 E5) |
+| INPUT_HASH_BINDING_MISSING | plan 无 input_hashes 绑定 (旧版 compile 产物), execute 无法核对输入 | 重跑 compile_fill.py 重绑定后重执行 (见 E5) |
 | CLONE_SOURCE_IS_ANCHOR | 数据克隆源是合并锚点 | 换非锚点数据行 |
 | CLONE_RESIDUE_UNHANDLED | template_row 携带某列值但未覆盖 | 加 columns mapping 或 nulls |
 | DUPLICATE_TARGET_WRITE | 同一格被写两次 | 检查 columns/nulls/formulas/group/sets 重叠 |
@@ -715,4 +763,5 @@ digest, 不要 unzip sheet XML 考古。
 | SET_OUT_OF_BOUNDS | sets.path 超出 digest 维度 / 格式非法 | 用模板坐标裸格或完整 DOM 路径 |
 | PROPS_WHITELIST_VIOLATION | props 超出 {numberformat} | 只用白名单键 |
 | CAPABILITY_NOT_ROLLED_OUT | 声明 spike 未解锁的能力 (如 group_aggregates.whole_run 跨块总计, 落点语义待 spike) | 用已解锁表达 (每组合一块 + 块级 aggregates), 或等 spike 结论落地 |
-| PPTX_CAPABILITY_NOT_ROLLED_OUT | pptx 声明 inplace / group_merges / group_aggregates | 用 xlsx, 或等 pptx lowering 验证后 rollout |
+| PPTX_CAPABILITY_NOT_ROLLED_OUT | pptx 声明未 rollout 能力: inplace / group_merges / group_aggregates / formulas (per_row·aggregates) / merges / nulls / remove_rows / columns[].props — 曾静默丢弃, 现编译期拒绝 (issue 06) | 用 xlsx, 或等 pptx lowering 验证后 rollout; 值类需求预计算进 columns; 删除多余声明 |
+| PPTX_TARGET_ROWS_OUT_OF_BOUNDS | first_data_row + 匹配行数 − 1 越过表格实际行数 (pptx 行不能克隆) | 重读 digest 修 first_data_row / 收窄 selectors / python-pptx 一次性加行 (禁在 officecli 之后重新 import) |

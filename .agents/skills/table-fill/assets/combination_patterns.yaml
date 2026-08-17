@@ -1,0 +1,277 @@
+# combination_patterns.yaml — FillSpec 组合模式速查与复制源
+#
+# 用法: 不确定"某个组合怎么写"时, 先在此文件找模式复制 (改列名即可)。
+# 本文件只承载构造骨架 (data-neutral 片段), 不承载 capability status;
+# 机制能力疑问 (支持/拒绝/接受性/Probe/Rescue) 按 references/CAPABILITY_EVIDENCE.md
+# 处理 — 该参考是唯一能力政策源, 按需加载。
+#
+# 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书
+# (tests/test_optimization.py: FillSpecContractTests / CapabilityMappingContractTests);
+# 运行时可用 compile_fill.py --capabilities 直接向编译器查询整个契约矩阵。
+#
+# 完整 Canonical Pattern 准入说明 (issue 02):
+#   - 完整 Canonical Pattern (如 preformatted_quotation_inplace) 入库必须同时满足:
+#     ① 来自真实任务; ② 有通过的 Validated Draft (E2E) 支撑; ③ skeleton 显著减少
+#     未来布局/业务表达决策。仅可编译、假想组合、单特性示例、语法展示不入库。
+#   - 局部片段 (feature snippets, 如 group_aggregates / per_group_total_explicit_ranges)
+#     与完整 Canonical Pattern 并存; 未经验证的组合 (如 append + group_aggregates
+#     完整骨架) 不拼接成完整 Pattern。
+#   - 无 Candidate / Provisional / 评分 / 复用阈值层级; Pattern 是推荐构造路径,
+#     不是能力白名单, 不声明 cross-Run support/rejection。
+
+patterns:
+  # ── Q1: group_merges 列 × 公式/聚合 ──
+  - id: group_merges_plus_aggregate_diff_col
+    question: group_merges 列要和聚合共存, 怎么写?
+    answer: 聚合必须放独立列 (同列 → DUPLICATE_TARGET_WRITE)
+    fragment: |
+      group_merges:
+        - col: A
+          group_by: A
+      formulas:
+        aggregates:
+          - col: V
+            rows: "1:{n}"
+            formula: "IFERROR(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),0)"
+            style: anchor
+
+  - id: aggregate_or_per_row_independent_col
+    question: 派生公式/聚合能写在映射列上吗?
+    answer: 不能 — 派生列必须是独立未映射列 (同列 → DUPLICATE_TARGET_WRITE)
+    fragment: |
+      formulas:
+        per_row:
+          G: "IFERROR(ROUND(A{r}-B{r},2),0)"
+        aggregates:
+          - col: V
+            rows: "1:{n}"
+            formula: "SUM(T{r1}:T{r2})"
+            style: anchor
+
+  # ── Q2: 算术派生列 (FLD-006 减法) ──
+  - id: derived_subtraction
+    question: 原型机成本 = 面价 − 铜管成本 怎么写?
+    answer: per_row formula + ROUND(...,2), 独立未映射列
+    fragment: |
+      formulas:
+        per_row:
+          O: "IFERROR(ROUND(J{r}-K{r}-L{r}-M{r}-N{r},2),0)"
+
+  - id: derived_ratio
+    question: 比率列怎么写?
+    answer: per_row formula + ROUND(...,4) (比率用 4 位)
+    fragment: |
+      formulas:
+        per_row:
+          U: "IFERROR(IF(S{r}=0,0,T{r}/S{r}),0)"
+
+  # ── Q3: 映射列 × 合并列 ──
+  - id: mapped_group_column
+    question: 映射列同时做分组合并, 怎么写?
+    answer: 同列声明 mapping + group_merges 即可 — 锚点写物化值, 非锚点自动清空
+    fragment: |
+      columns:
+        - source: A
+          target: A
+      group_merges:
+        - col: A
+          group_by: A
+          style: label
+
+  - id: unmapped_group_column_label
+    question: 无映射列的分组合并怎么写?
+    answer: label 必填 ("" = 清空锚点); 缺 label → GROUP_MERGE_ANCHOR_UNCOVERED
+    fragment: |
+      group_merges:
+        - col: F
+          group_by: A
+          label: ""      # 无映射列的锚点文本 ("" = 清空)
+
+  # ── Q5: 0-口径 ──
+  - id: zero_policy
+    question: 报价缺失行 (0-口径) 怎么写?
+    answer: 常量 "0" + 缺失源留空; 数值 0 不是缺失, 原样写入
+    fragment: |
+      columns:
+        - target: J
+          value: "0"              # 常量 (0-口径)
+        - source: [P, Q]
+          target: N               # 多列求和, 缺失/空/"-" 按 0
+
+  # ── Q6: lookup missing ──
+  - id: lookup_missing_empty
+    question: 查表键缺失时怎么处理?
+    answer: "missing: empty → 缺失格留空; missing: error → 编译失败 (LOOKUP_KEY_MISSING)"
+    fragment: |
+      columns:
+        - target: D
+          lookup: {name: sku_fields, field: factory_model, missing: empty}
+      lookups:
+        - name: sku_fields
+          from: inheritance.json
+          key_column: G
+          fields: [factory_model, compressor]
+          missing: empty
+
+  # ── Q7: 精度 ──
+  - id: round4_precision
+    question: 15 位成本值怎么处理?
+    answer: "首选 transform: round4; precision: keep 只在列宽确有余量时用"
+    fragment: |
+      columns:
+        - source: D
+          target: B
+          transform: round4
+
+  # ── 能力映射表: 每组合计 (单块 + 显式范围聚合 — 复制即用) ──
+  - id: per_group_total_explicit_ranges
+    question: 每组合计 (块内多组、每组一行合计) 怎么写?
+    answer: 单块 + 多条显式范围聚合 — 每组一行合计, V/W 同块各写各组范围;
+      聚合列不进 nulls (进 nulls → 锚点双写 DUPLICATE_TARGET_WRITE, 特征
+      "first as empty")、不与 group_merges 同列、范围不越块 (相对块内数据行);
+      rows 改为你各组实际行数即可
+    fragment: |
+      formulas:
+        aggregates:
+          - col: V
+            rows: "1:2"                    # 组 1 的数据行范围
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: W
+            rows: "1:2"                    # 组 1 的第二聚合列 (同块同范围)
+            formula: "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: V
+            rows: "3:5"                    # 组 2 的数据行范围
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+          - col: W
+            rows: "3:5"                    # 组 2 的第二聚合列
+            formula: "IFERROR(ROUND(SUM(U{r1}:U{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+
+  # ── Q14: 每组合计 (一等 group_aggregates) ──
+  - id: per_group_total_group_aggregates
+    question: 系列盈亏按产品组合计 (每组合计, 动态组边界) 怎么写?
+    answer: "一等表达 — group_aggregates: group_by 分组列 (必须有列映射), 聚合公式自动落到各组锚点行, 组边界由数据决定"
+    fragment: |
+      formulas:
+        group_aggregates:
+          - group_by: A
+            col: V
+            formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+            style: anchor
+    note: |
+      组聚合列必须独立于 nulls / group_merges / per_row (同列 →
+      DUPLICATE_TARGET_WRITE); whole_run 跨块总计 spike 前声明 →
+      CAPABILITY_NOT_ROLLED_OUT。
+
+  # ── 能力映射表: 每组合计 (动态边界 → 拆块变通) ──
+  - id: per_group_total_blocks
+    question: 组合边界由数据决定 (范围不可静态枚举) 的每组合计怎么写?
+    answer: 变通 — 按组合拆 blocks[], 每块各自 aggregates (组合边界由数据决定);
+      一等能力是 group_aggregates (见 per_group_total_group_aggregates);
+      静态范围优先用 per_group_total_explicit_ranges
+    fragment: |
+      blocks:
+        - clone_roles: [spacer, title, header, data]
+          rows:
+            source: source_maoli
+            selectors:
+              - column: A
+                pattern: "家用*"
+          formulas:
+            aggregates:
+              - col: V
+                rows: "1:{n}"
+                formula: "SUM(T{r1}:T{r2})"
+                style: anchor
+        - clone_roles: [spacer, title, header, data]
+          rows:
+            source: source_maoli
+            selectors:
+              - column: A
+                pattern: "商用*"
+          formulas:
+            aggregates:
+              - col: V
+                rows: "1:{n}"
+                formula: "SUM(T{r1}:T{r2})"
+                style: anchor
+
+  # ── 完整 Canonical Pattern: 预格式报价模板 (issue 02, MXP 同形) ──
+  - id: preformatted_quotation_inplace
+    question: 预格式报价模板 (带样式占位区 + 分组合并 + 绝对写 + 数字格式) 怎么写?
+    answer: 完整 skeleton 一次实例化 — 按下方替换表把占位标记换成 digest/业务映射
+      事实即得合法 FillSpec; inplace 占位区消费, 编译器推导尾部 Trim (N<capacity)
+      与 overflow 克隆 (N>capacity), 不手算行数
+    fragment: |
+      # ── 参数替换表 (一次实例化: 把下面的占位标记换成 digest/业务映射事实) ──
+      # <TARGET_SHEET>    目标 sheet 名 (来自 outline/digest)
+      # <BASE_LAST_ROW>   模板最后一行 (digest 行数, ≥ 占位区末端)
+      # <REGION_START>    占位区首行 (模板坐标)
+      # <REGION_CAPACITY> 占位区行数
+      # <TEMPLATE_ROW>    克隆格式源行 (占位区内非合并锚点行)
+      # <SOURCE_NAME>     展平源名 (manifest flattened name; 需过滤时加 selectors)
+      # 源列 → 目标列: <GROUP_SRC>→<GROUP_COL> 组键 | <MODEL_SRC>→<MODEL_COL> 型号
+      #   <CAP_SRC>→<CAP_COL> 规格/能力 | <DESC_SRC>→<DESC_COL> 描述
+      #   <PRICE_SRC>→<PRICE_COL> 金额 (numberformat 列)
+      # <LABEL_COL>       label-only 分组合并列 (无列映射, label 必填)
+      # <NUMFMT>          numberformat 格式串 (如 "$#,##0.00", 按业务实际改)
+      # <HDR_ADDR>/<HDR_VALUE>   表头绝对写 1 (模板坐标, 占位区之上)
+      # <HDR2_ADDR>/<HDR2_VALUE> 表头绝对写 2 (模板坐标, 占位区之上)
+      # <FOOT_ADDR>/<FOOT_VALUE> 占位区之下绝对写 — Trim 后由 Excel 行移位搬移,
+      #                           编译器把 readback/记录翻译为最终坐标, 不手算
+      # <KO1..KO6>        key_outputs (模板坐标): 表头写 / 组锚点 / 末行值格 / 区下写
+      mapping:
+        targets:
+          - sheet: <TARGET_SHEET>
+            base_last_row: <BASE_LAST_ROW>
+            clone_roles:
+              - role: data
+                mode: inplace
+                start_row: <REGION_START>
+                capacity: <REGION_CAPACITY>
+                template_row: <TEMPLATE_ROW>
+            rows:
+              source: <SOURCE_NAME>
+            columns:
+              - source: <GROUP_SRC>
+                target: <GROUP_COL>
+              - source: <MODEL_SRC>
+                target: <MODEL_COL>
+              - source: <CAP_SRC>
+                target: <CAP_COL>
+              - source: <DESC_SRC>
+                target: <DESC_COL>
+              - source: <PRICE_SRC>
+                target: <PRICE_COL>
+                props:
+                  numberformat: "<NUMFMT>"
+            group_merges:
+              - col: <GROUP_COL>
+                group_by: <GROUP_COL>
+                style: label
+              - col: <LABEL_COL>
+                group_by: <GROUP_COL>
+                label: ""
+            sets:
+              - path: <HDR_ADDR>
+                value: "<HDR_VALUE>"
+              - path: <HDR2_ADDR>
+                value: "<HDR2_VALUE>"
+              - path: <FOOT_ADDR>
+                value: "<FOOT_VALUE>"
+      validation:
+        required_coverage: []
+        required_empty: []
+        key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>, <KO5>, <KO6>]
+    note: |
+      完整 Canonical Pattern (准入见本文件头部说明): 真实预格式报价 Validated Draft
+      E2E 同形骨架 (tests/test_mxp_e2e.py, 2026-08-16 入库), 数据中立, 不携带客户/
+      sheet/行号/价格/lookup/文案事实。结构关系全部在同一 fragment: terminal inplace
+      消费 → 编译器 Trim (N<capacity, 尾部) / overflow 克隆 (N>capacity) → mapped +
+      label-only 两类 group_merges → block-external sets (模板坐标, 区下位移由 Excel
+      行移位搬移) → 代表列 numberformat → key_outputs/readback 指针。替换后编译失败
+      = 结构事实与 digest 不符, 以 compile 缺陷码为准修正。Pattern 是推荐构造路径,
+      不是能力白名单, 不声明 cross-Run support; 同类组合未逐一验证, 不做支持承诺。

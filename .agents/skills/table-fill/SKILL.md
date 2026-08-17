@@ -3,7 +3,8 @@ name: table-fill
 description: >
   Use this skill whenever the user asks to fill, populate, map, or transfer data
   between spreadsheet tables — in any direction (xlsx→pptx, xlsx→xlsx, pptx→pptx,
-  pptx→xlsx). Activate immediately on phrases like "fill", "populate", "map", "展平",
+  pptx→xlsx; PPTX targets: column value fills + DOM-path sets — formulas/merges/
+  nulls/remove_rows are compile-time rejected). Activate immediately on phrases like "fill", "populate", "map", "展平",
   "读源数据→填模板", "把数据填到模板里", or "从源表出报告", even if the user does not
   explicitly name the source and target formats. Also activate when the user describes
   a multi-file data transfer workflow involving Office tables.
@@ -29,7 +30,9 @@ metadata:
 
 # Table Fill (v2.5)
 
-Fill, migrate, or aggregate data between Office tables (xlsx/pptx, any direction)
+Fill, migrate, or aggregate data between Office tables (xlsx/pptx, any direction —
+PPTX targets: column value fills + DOM-path sets; formulas/merges/nulls/remove_rows
+are compile-time rejected)
 with one canonical business-semantics file, one execution, one human gate, and
 full traceability. V2 replaced the old four-layer flow: it merged the batch
 builder / mapping renderer / validator / smoke test into a single Compiler, made
@@ -86,12 +89,12 @@ v2.5 is a skill-level workflow. It does NOT simulate V3 runtime governance:
 
 | 对象 | 类型 | 权威性 |
 |---|---|---|
-| staged source/target | 输入快照 | 本次运行输入事实 (prepare_manifest.json 记录哈希) |
+| staged source/target | 输入快照 | 本次运行输入事实 (compile 期绑定到 plan.input_hashes; prepare_manifest.json 的 files[].sha256 是 outline 期快照, repair 后过期) |
 | `fill_spec.yaml` | Canonical | 唯一业务语义、映射、转换和追溯事实源 |
 | `execution_plan.json` | Derived | Compiler 从 FillSpec 物化的操作和验证预期 |
 | `mapping.md` | Derived | Compiler 生成的人类审查视图 (编辑 spec, 从不编辑它) |
 | `validated_draft.*` | Derived Result | 已执行并通过验证的候选交付文件 |
-| `draft_receipt.json` | Evidence | 输入/Spec/Plan/Draft 哈希 + 验证结果 |
+| `draft_receipt.json` | Evidence | 输入哈希 (执行时重算 + 绑定比对) / Spec/Plan/Draft 哈希 + 验证结果 |
 | `.gate3_pending` | Skill-only Marker | 流程提示, 不是可信授权状态 |
 | final output | Delivery | Validated Draft 的提升副本 (哈希一致) |
 
@@ -336,22 +339,25 @@ python scripts/execute_batch.py --plan execution_plan.json \
   --template target_baojia.xlsx --workdir <dir> [--round N]
 ```
 
-1. 复制 staged target → `validated_draft.<ext>` (模板永不被修改)。
-2. 按 plan 执行 (≤50 op/chunk, chunk 间坐标探针; 执行尾部显式
+1. **输入哈希核对**: staged 输入与 `plan.input_hashes` (compile 期绑定)
+   比对 — 漂移 → `INPUT_HASH_DRIFT` (exit 3), 在复制模板**之前**拒绝。
+2. 复制 staged target → `validated_draft.<ext>` (模板永不被修改)。
+3. 按 plan 执行 (≤50 op/chunk, chunk 间坐标探针; 执行尾部显式
    `officecli close` 刷盘 — resident 延迟写被 taskkill 会丢尾部 chunk)。
-3. `officecli validate` **先于** issue delta (validate 刷新编辑并强制公式求值)。
-4. issue delta vs 模板基线 — 只认**新增** issue (模板自带基线 issue 是噪音)。
-5. readback 全部由 Compiler 派生 — 值比较做数字归一化,**但只限真数值形态**
+4. `officecli validate` **先于** issue delta (validate 刷新编辑并强制公式求值)。
+5. issue delta vs 模板基线 — 只认**新增** issue (模板自带基线 issue 是噪音)。
+6. readback 全部由 Compiler 派生 — 值比较做数字归一化,**但只限真数值形态**
    (容忍 `138.00` vs `138`、`$1,234.5` vs `1234.5`、`12.5%`); 字母数字标识
    (SKU/型号/Z 码) 按文本精确比较, 写错必须被拦截。公式格断言非空,
    nulls 断言 EMPTY。**禁止手写 checks**。
    Readback 用单次范围 get 批量读取 (179 格 ≈ 1s, 而非逐格 ~90s)。
-6. **结构 readback (v2.5)**: 最终行数断言 (FINAL_ROW_COUNT_MISMATCH) + group_merges
+7. **结构 readback (v2.5)**: 最终行数断言 (FINAL_ROW_COUNT_MISMATCH) + group_merges
    边界断言 (GROUP_BOUNDARY_MISMATCH — validate 对合并残留视而不见)。
-7. **Render QA (v2.5)**: `--render png|html|none` — 只渲染受影响区域
+8. **Render QA (v2.5)**: `--render png|html|none` — 只渲染受影响区域
    (plan.render_qa.region), 单次终局。纯文本模型用 html 结构检查,
    **不得声称视觉验证**; 失败 → RENDER_QA_FAILED。
-8. 写 `draft_receipt.json` (source/template/spec/plan/draft 哈希, op 计数,
+9. 写 `draft_receipt.json` (source/template 哈希为**执行时重算值** +
+   `input_hash_check` 绑定比对, spec/plan/draft 哈希, op 计数,
    coverage, readback, structural, render_qa, issue delta, validate)。
    **Draft 保留, 不删除**。
 
@@ -396,6 +402,8 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 1. 要求存在正向确认记录 `.gate3_confirmed` — marker 缺失不是确认 (fail-closed)。
 2. 三方哈希核对: 确认记录 / draft_receipt / 当前文件 (spec+plan+draft) —
    任一漂移 → 拒绝 (exit 3), 需重新生成 draft 并重新 Gate。
+   **输入哈希三方核对**: plan.input_hashes / receipt 执行时值 / 当前 staged
+   文件 — 任一漂移 → HASH_DRIFT (exit 3)。
 3. 原子复制 draft → final, 验证 final 哈希 == draft 哈希。
 4. 最小 ZIP/结构确认 (pptx 查 presentation.xml)。
 5. 写 `final_receipt.json`。**Gate 后绝不再次执行填充。**
@@ -406,12 +414,16 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 - `prepare_run.py` 直接展平 pptx 表格 (每格值写入, 无克隆/合并/公式)。
 - FillSpec 的 columns target 仍用列字母 (A..Z) — Compiler 自动映射为 `tc[索引]`。
 - **pptx 单元格属性是 `text`, 不是 xlsx 的 `value`** — Compiler 已内置该差异。
-- `first_data_row` 声明首个数据 tr; 匹配行数必须等于可填行数 (无克隆, 行需预先存在;
-  需要加行时 agent 用 python-pptx **一次性**创建后永久关闭 — 禁止在 officecli
-  操作后重新 import)。
-- v2.5: `sets` 支持完整 DOM 路径 (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`);
-  `group_merges`/`group_aggregates`/`mode: inplace` 的 pptx 侧在 spike 夹具
-  验证前拒绝 (PPTX_CAPABILITY_NOT_ROLLED_OUT)。
+- **支持矩阵 (issue 06 fail-closed)**: PPTX 当前能力 = 列值填充 (`columns`)
+  + DOM-path `sets` (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`, 值/清空均可);
+  其余声明 — `formulas` (per_row/aggregates/group_aggregates)、
+  `merges`/`group_merges`、`nulls`、`remove_rows`、`mode: inplace`、
+  `columns[].props` — 一律编译期拒绝 (`PPTX_CAPABILITY_NOT_ROLLED_OUT`,
+  corrective_action 点名声明), **不再静默丢弃**。
+- `first_data_row` 声明首个数据 tr; 匹配行数必须等于可填行数 (无克隆, 行需
+  预先存在); `first_data_row + 匹配行数 − 1` 越过表格实际行数 → 编译期拒绝
+  (`PPTX_TARGET_ROWS_OUT_OF_BOUNDS`); 需要加行时 agent 用 python-pptx
+  **一次性**创建后永久关闭 — 禁止在 officecli 操作后重新 import。
 - pptx 的 key_outputs / required_empty 用完整路径
   (`/slide[N]/table[@id=M]/tr[X]/tc[Y]`)。
 - 模板自身 validate 失败 (如 chart schema 扩展) 时, validate 按基线噪音记录
