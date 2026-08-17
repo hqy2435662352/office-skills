@@ -3,8 +3,9 @@
 scripts/preflight.py — Layer 0: environment pre-flight check.
 
 Runs before Layer 1. Verifies that the execution environment won't cause
-silent failures downstream: ASCII-safe paths, no stale officecli residents,
-Python encoding functional.
+silent failures downstream: Python >= 3.10 (the scripts use PEP 604 unions,
+slots=True and PEP 585 generics), ASCII-safe paths, no stale officecli
+residents, Python encoding functional.
 
 Fingerprint cache (2026-08-09):
   Static environment checks (officecli presence/version, Python encoding,
@@ -31,6 +32,33 @@ from pathlib import Path
 from _officecli import clean_residents, officecli  # noqa: E402
 
 CACHE_FILENAME = ".preflight_cache.json"
+
+
+def check_python_version():
+    """Verify Python >= 3.10 (PEP 604 unions, slots=True, PEP 585 generics).
+
+    Source audit (2026-08-17): full scan confirmed actual floor = 3.10.
+    - PEP 604 unions (X | Y, runtime-evaluated): structure_digest.py,
+      mod_nominate.py (no __future__ annotations import)
+    - dataclass(slots=True) (3.10 param): _mod_catalog.py, mod_capture.py
+    - PEP 585 builtin generics (list[], dict[]): note_phase.py, stage_files.py,
+      etc.
+    - No 3.11+ features found (no match statements, no zip(strict=),
+      no str.removeprefix/removesuffix, no typing 3.11+ features).
+
+    Returns None on 3.10+; a structured defect dict on older Pythons.
+    """
+    if sys.version_info >= (3, 10):
+        return None
+    return {
+        "code": "PYTHON_VERSION_TOO_LOW",
+        "message": (
+            f"Python {sys.version_info.major}.{sys.version_info.minor} detected; "
+            "3.10+ is required (PEP 604 unions, dataclass(slots=True), "
+            "PEP 585 generics)."
+        ),
+        "corrective_action": "Upgrade Python to 3.10 or later."
+    }
 
 
 def check_ascii_path(workdir):
@@ -197,6 +225,21 @@ def main():
         workdir_is_ascii = True
     except UnicodeEncodeError:
         workdir_is_ascii = False
+
+    # Check 0: Python version — must run before anything else and never be
+    # cache-suppressed: a <3.10 interpreter cannot even import the scripts
+    # (PEP 604 unions / slots=True / PEP 585 generics), so fail fast.
+    result = check_python_version()
+    if result:
+        report = {
+            "status": "FATAL",
+            "code": "PREFLIGHT_FATAL",
+            "issue_count": 1,
+            "issues": [result],
+            "corrective_action": result["corrective_action"],
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2), file=sys.stderr)
+        sys.exit(1)
 
     # Check 1: ASCII path (0ms, but must run every time — a non-ASCII workdir
     # warning must never be suppressed by a stale cache)
