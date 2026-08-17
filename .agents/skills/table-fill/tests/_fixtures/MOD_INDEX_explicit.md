@@ -1,3 +1,5 @@
+## Registered MODs
+
 | MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |
 |---|---|---|---|---|---|---|
 | old_migration | old | semantic_type::quotation,target_title::报价汇总 | 目标缺少24角色表头指纹 | MOD_old.md | 3 | private |

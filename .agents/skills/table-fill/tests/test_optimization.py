@@ -307,6 +307,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_test"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| test_mod | tm | semantic_type::quotation,dimension_set::product_sku |  | MOD_test.md | 1 | private |\n",
@@ -344,6 +345,7 @@ class ModNominateTests(unittest.TestCase):
         # conflict: exclusion fired (24-col fingerprint missing)
         index2 = idx_dir / "MOD_INDEX_test2.md"
         index2.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| t24 | t | semantic_type::quotation | 目标缺少24角色表头指纹 | MOD_test.md | 1 | private |\n",
@@ -372,6 +374,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_roles"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| t24r | t | semantic_type::quotation | "
@@ -411,6 +414,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_marker"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| tmark | t | semantic_type::quotation,sheet_marker::三三三\\|333 |  | MOD_test.md | 1 | private |\n",
@@ -454,6 +458,7 @@ class ModNominateTests(unittest.TestCase):
         index = idx_dir / "MOD_INDEX_auto.md"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             f"| tauto | t | {scope} | {exclusion} | MOD_test.md | 1 | private |\n",
@@ -575,6 +580,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_rules"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| trules | t | semantic_type::quotation |  | MOD_rules.md | 1 | private |\n",
@@ -609,6 +615,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_ambig"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| mod_a | a | semantic_type::quotation |  | MOD_a.md | 1 | private |\n"
@@ -644,6 +651,7 @@ class ModNominateTests(unittest.TestCase):
             mods = workdir / "MODS"
             mods.mkdir(exist_ok=True)
             idx.write_text(
+                "## Registered MODs\n\n"
                 "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
                 "|---|---|---|---|---|---|---|\n"
                 "| t_out | t | semantic_type::quotation |  | MOD_test.md | 1 | private |\n",
@@ -667,6 +675,7 @@ class ModNominateTests(unittest.TestCase):
         mods = idx_dir / "MODS_explicit"
         mods.mkdir(exist_ok=True)
         index.write_text(
+            "## Registered MODs\n\n"
             "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
             "|---|---|---|---|---|---|---|\n"
             "| old_migration | old | semantic_type::quotation,target_title::报价汇总 | 目标缺少24角色表头指纹 | MOD_old.md | 3 | private |\n"

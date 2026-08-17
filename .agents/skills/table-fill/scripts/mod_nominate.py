@@ -69,6 +69,7 @@ from _officecli import (  # noqa: E402
     sha256_file,
 )
 from _mod_catalog import (  # noqa: E402
+    ModRuleParseError,
     index_entry_to_dict,
     parse_mod_index,
     parse_mod_rules,
@@ -149,8 +150,17 @@ def parse_rule_table(text: str) -> list[dict]:
 
     Accepts both R01 and RTE-001 Rule ID formats (per MOD_TEMPLATE.md).
     No Rule ID format restriction — _mod_catalog.parse_mod_rules accepts any ID.
+
+    Rule table is OPTIONAL at nomination phase (two-phase loading contract:
+    complete rules are only loaded after the user selects the MOD via
+    load_rules_for_selected_mod). A MOD file without a rule table yields []
+    rather than raising — the raise-on-empty contract belongs to capture-time
+    validation in mod_capture.py, not to nomination.
     """
-    return [rule_to_dict(r) for r in parse_mod_rules(text)]
+    try:
+        return [rule_to_dict(r) for r in parse_mod_rules(text)]
+    except ModRuleParseError:
+        return []
 
 
 def load_rules_for_selected_mod(mods_dir: Path, path: str) -> list[dict]:
