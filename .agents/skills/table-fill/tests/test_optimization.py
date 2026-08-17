@@ -4518,6 +4518,104 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("text", text[m.end():],
                       "OFFICECLI_REFERENCE PPTX 段缺 text 属性")
 
+    # ── issue 09: Office 访问与 UTF-8 适配器规则 (结构解析 vs officecli 适配器) ──
+
+    def _tool_traps_text(self) -> str:
+        return (SKILL_ROOT / "references" / "TOOL_TRAPS.md").read_text(
+            encoding="utf-8")
+
+    def test_tool_traps_adapter_rule_wording(self):
+        """TOOL_TRAPS 编码统一行声明适配器硬性规则 (issue 09): officecli 子进程
+        调用一律走 `_officecli.officecli()` (UTF-8 subprocess)."""
+        text = self._tool_traps_text()
+        self.assertIn("一律走", text)
+        self.assertIn("_officecli.officecli()", text)
+
+    def test_tool_traps_structure_parsing_rule_wording(self):
+        """TOOL_TRAPS 明确两条规则分开 (issue 09): ZIP/XML 结构解析允许直读,
+        与 officecli 适配器规则并存 — 结构解析规则不得被"全走 officecli"吞掉."""
+        text = self._tool_traps_text()
+        self.assertIn("ZIP/XML", text)
+        self.assertIn("结构解析", text)
+        self.assertIn("_officecli.officecli()", text)
+
+    def test_skill_md_adapter_rule_wording(self):
+        """SKILL.md frontmatter: 「All read/write goes through officecli」已
+        精确化 — 两条规则分开 (issue 09): 结构解析允许直读 ZIP/XML, 任何
+        officecli 子进程调用必须经 `_officecli.officecli()`."""
+        text = self._skill_md_text()
+        self.assertIn("ZIP/XML", text)
+        self.assertIn("_officecli.officecli()", text)
+        self.assertIn("结构解析", text)
+
+    def test_adapter_rule_consistent_across_docs(self):
+        """SKILL.md 与 TOOL_TRAPS.md 的适配器措辞一致 (issue 09): 两边都声明
+        officecli 调用走 `_officecli.officecli()` 且结构解析 (ZIP/XML) 允许直读."""
+        skill = self._skill_md_text()
+        traps = self._tool_traps_text()
+        for text, name in ((skill, "SKILL.md"), (traps, "TOOL_TRAPS.md")):
+            self.assertIn("_officecli.officecli()", text,
+                          f"{name} 缺适配器规则词 _officecli.officecli()")
+            self.assertIn("ZIP/XML", text,
+                          f"{name} 缺结构解析规则词 ZIP/XML")
+
+
+class OfficecliAdapterAuditTests(unittest.TestCase):
+    """issue 09 静态审计: scripts/ 下禁止直接 subprocess.run(["officecli", ...])
+    绕过 `_officecli.officecli()` 共享适配器 (Windows 中文输出 / 错误处理 /
+    resident 清理行为一致). 豁免需在 EXEMPTIONS 登记理由 — 当前无豁免."""
+
+    # 已登记豁免: {路径: 理由}. 默认收敛, 新增绕过必须先记录豁免理由.
+    EXEMPTIONS: dict[str, str] = {}
+
+    # _officecli.py 是适配器本体, 是唯一允许的 officecli subprocess 宿主.
+    ADAPTER_FILE = "_officecli.py"
+
+    DIRECT_CALL_RE = re.compile(
+        r'subprocess\.run\(\s*\[\s*["\']officecli["\']', re.DOTALL)
+
+    def _scripts(self):
+        return sorted((SKILL_ROOT / "scripts").glob("*.py"))
+
+    def test_no_direct_officecli_subprocess_bypass(self):
+        """scripts/ 下除适配器本体 (与已登记豁免) 外, 无直接
+        subprocess.run(["officecli", ...]) 绕过共享适配器 (issue 09)."""
+        offenders = []
+        for py in self._scripts():
+            if py.name == self.ADAPTER_FILE or py.name in self.EXEMPTIONS:
+                continue
+            text = py.read_text(encoding="utf-8")
+            for m in self.DIRECT_CALL_RE.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
+                offenders.append(f"{py.name}:{line}")
+        self.assertEqual(
+            offenders, [],
+            "scripts/ 存在绕过 _officecli.officecli() 的直接 officecli "
+            f"subprocess 调用: {', '.join(offenders)}")
+
+    def test_scripts_import_adapter_or_exempt(self):
+        """任何含 officecli 关键字调用的脚本必须经 `from _officecli import
+        officecli` (豁免除外) — 防止换一种裸调用写法绕过审计 (issue 09)."""
+        import re as _re
+        call_re = _re.compile(r'\b(officecli|officecli_validate)\(')
+        for py in self._scripts():
+            if py.name == self.ADAPTER_FILE or py.name in self.EXEMPTIONS:
+                continue
+            text = py.read_text(encoding="utf-8")
+            if not call_re.search(text):
+                continue  # 不调用 officecli, 无关
+            self.assertIn(
+                "from _officecli import", text,
+                f"{py.name} 调用 officecli 但未导入共享适配器 (issue 09)")
+
+    def test_officecli_adapter_module_documented_contract(self):
+        """适配器本体仍声明为唯一 subprocess 宿主 (issue 09): _officecli.py
+        的模块 docstring 描述 UTF-8 子进程包装职责."""
+        text = (SKILL_ROOT / "scripts" / self.ADAPTER_FILE).read_text(
+            encoding="utf-8")
+        self.assertIn("UTF-8 subprocess", text)
+        self.assertIn("never raw PowerShell", text)
+
 
 class ReadbackNormalizationTests(unittest.TestCase):
     """Q10 readback value 断言: 数值归一化只适用于真数值形态; 字母数字标识

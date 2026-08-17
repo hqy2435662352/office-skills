@@ -14,11 +14,14 @@
   `officecli close` 刷盘；手写/一次性命令时**自己负责 close**。
 
 ```python
-# ✅ 直接调用——无需 open；写操作收尾显式 close 刷盘
-subprocess.run(["officecli", "get", "file.xlsx", "/Sheet/A1", "--json"], ...)
-subprocess.run(["officecli", "set", "file.xlsx", "/Sheet/A1", "--prop", "value=hello"], ...)
-subprocess.run(["officecli", "batch", "file.xlsx", "--input", "batch.json"], ...)
-subprocess.run(["officecli", "close", "file.xlsx"], ...)   # 刷盘; 无 resident 时 no-op
+# ✅ 直接调用——无需 open；写操作收尾显式 close 刷盘。
+# 一律经共享适配器 `_officecli.officecli()`（UTF-8 subprocess, errors=replace）,
+# 禁止裸 subprocess.run(["officecli", ...]) 绕过 (issue 09)。
+from _officecli import officecli
+officecli("get", "file.xlsx", "/Sheet/A1", "--json")
+officecli("set", "file.xlsx", "/Sheet/A1", "--prop", "value=hello")
+officecli("batch", "file.xlsx", "--input", "batch.json")
+officecli("close", "file.xlsx")   # 刷盘; 无 resident 时 no-op
 ```
 
 > 权威依据: `references/LAYER4_EXECUTE_LOOP.md`「resident 刷盘 (2026-08-12 实测)」
@@ -153,8 +156,9 @@ PPTX 目标的文本 cell 必须显式设置字体，属性用 `text`（不是 x
 # ❌ 错误：PowerShell 管道
 officecli get "C:\含中文\file.xlsx" "/A1" --json
 
-# ✅ 正确：Python subprocess
-subprocess.run(["officecli", "get", filepath, path, "--json"], capture_output=True)
+# ✅ 正确：Python 走共享适配器 `_officecli.officecli()`（UTF-8 subprocess）
+from _officecli import officecli
+officecli("get", filepath, path, "--json")
 ```
 
 **临时文件路径**：使用 ASCII 纯英文路径（`C:\Temp\oc_work\`）。

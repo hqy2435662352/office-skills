@@ -12,14 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 from _officecli import (  # noqa: E402
-    ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
-    sha256_file,
+    ensure_utf8_stdio as _utf8_stdio, fail, officecli,
+    record_timing as _record_timing, sha256_file,
 )
 
 
@@ -169,23 +168,18 @@ def main() -> int:
         fail("INPUT_NOT_FOUND", f"input file not found: {args.input}", "Stage the XLSX before Layer 1")
 
     try:
-        proc = subprocess.run(
-            ["officecli", "view", str(args.input), "text"],
-            capture_output=True,
-            timeout=600,
-            check=False,
-        )
+        proc = officecli("view", str(args.input), "text", timeout=600)
     except OSError as exc:
         fail("OFFICECLI_ERROR", str(exc), "Check officecli installation and PATH")
     if proc.returncode != 0:
         fail(
             "OFFICECLI_VIEW_FAILED",
-            proc.stderr.decode("utf-8", errors="replace"),
+            proc.stderr,
             "Read the structured stderr and retry once after the standard fix",
             exit_code=3,
         )
 
-    rows = parse_view_text(proc.stdout.decode("utf-8", errors="replace"))
+    rows = parse_view_text(proc.stdout)
     candidates, sheet_meta = candidate_rows(rows, set(args.sheet) if args.sheet else None)
     payload = {
         "schema": "table-fill-inheritance-index-v1",

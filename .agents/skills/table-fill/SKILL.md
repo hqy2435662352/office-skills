@@ -18,8 +18,11 @@ description: >
   MOD Resolution interrupts only on genuine semantic ambiguity.
 license: MIT
 compatibility: >
-  Required: officecli (on PATH), Python 3.8+ (PyYAML).
-  All read/write goes through officecli. No openpyxl, no pandas, no python-pptx in the pipeline.
+  Required: officecli (on PATH), Python 3.10+ (PyYAML).
+  Two rules for Office access: (a) structure parsing (column widths / row gaps /
+  OLE) may read ZIP/XML directly; (b) every officecli subprocess call must go
+  through scripts/_officecli.py officecli() (shared UTF-8 adapter). No openpyxl,
+  no pandas, no python-pptx in the pipeline.
   Must co-load: officecli-xlsx (path syntax, open/save lifecycle, batch patterns, QA gates)
   Recommended: officecli-win (Windows subprocess encoding workaround)
 metadata:
@@ -44,12 +47,16 @@ V2 catches them in the Compiler (static validation, Section 9 below) before any
 file is touched, then proves executability exactly once on the draft, then lets
 you approve that validated draft — so what you approve is what gets delivered.
 
-**Why officecli over openpyxl**: All operations use officecli exclusively. Three
-reasons: (1) `add --type row` auto-updates dependent structures (formulas,
-conditional formatting sqref, data validation, named ranges); (2) python-pptx's
-`save()` silently overwrites all officecli-written changes; (3) openpyxl's
-dimension metadata is unreliable. If data cleaning or aggregation is needed, use
-pandas separately before entering the pipeline — never inside it.
+**Why officecli over openpyxl**: All Office content read/write goes through
+officecli exclusively (structure parsing — column widths / row gaps / OLE — may
+read ZIP/XML directly, no officecli needed). Every officecli subprocess call
+must go through the shared adapter `scripts/_officecli.py` → `officecli()`
+(UTF-8 subprocess). Three reasons: (1) `add --type row` auto-updates dependent
+structures (formulas, conditional formatting sqref, data validation, named
+ranges); (2) python-pptx's `save()` silently overwrites all officecli-written
+changes; (3) openpyxl's dimension metadata is unreliable. If data cleaning or
+aggregation is needed, use pandas separately before entering the pipeline —
+never inside it.
 
 ## ⚠️ 依赖加载（必须先执行）
 
@@ -81,7 +88,9 @@ v2.5 is a skill-level workflow. It does NOT simulate V3 runtime governance:
 5. 输出必须通过结构、值、公式和 readback 验证 — the draft passes validate +
    issue-delta + compiler-derived readback before the gate.
 6. Windows、中文路径和 OfficeCLI 调用必须稳定 — ASCII workdir, UTF-8 subprocess,
-   resident cleanup, retry helpers (all in `scripts/_officecli.py`).
+   resident cleanup, retry helpers (all in `scripts/_officecli.py`). 两条规则分开:
+   Office 内容结构解析 (列宽/行号空洞/OLE) 允许直接读 ZIP/XML; 任何 officecli
+   子进程调用必须经 `_officecli.officecli()` 共享适配器, 禁止裸 subprocess.
 7. 同一业务事实只能有一个权威来源 — business semantics live ONLY in fill_spec.yaml;
    everything else (plan, mapping.md, readback, receipt) is derived.
 

@@ -8,8 +8,10 @@ Usage:
   python flatten_table_ocl.py --input file.xlsx --target "SheetName" --output out.csv
 """
 
-import subprocess, json, csv, re, sys, argparse, time
+import json, csv, re, sys, argparse, time
 from pathlib import Path
+
+from _officecli import officecli  # noqa: E402  (shared UTF-8 adapter)
 
 
 # ── Column utilities (identical to original) ──────────────────────────
@@ -38,27 +40,20 @@ def parse_merge(merge_str):
     return (m.group(1), int(m.group(2)), m.group(3), int(m.group(4))) if m else None
 
 
-# ── officecli calls (pure subprocess, no openpyxl) ────────────────────
+# ── officecli calls (all via shared _officecli.officecli() adapter, no openpyxl) ─
 
 def officecli_get(filepath, sheet, range_str, depth=0):
     """Read cells via officecli get. Returns parsed JSON."""
     path = f"/{sheet}/{range_str}"
-    result = subprocess.run(
-        ["officecli", "get", str(filepath), path, "--depth", str(depth), "--json"],
-        capture_output=True,
-        timeout=120,
-    )
-    return json.loads(result.stdout.decode("utf-8"))
+    result = officecli("get", str(filepath), path, "--depth", str(depth), "--json",
+                       timeout=120)
+    return json.loads(result.stdout)
 
 
 def officecli_outline(filepath):
     """Get sheet metadata via officecli view outline."""
-    result = subprocess.run(
-        ["officecli", "view", str(filepath), "outline", "--json"],
-        capture_output=True,
-        timeout=30,
-    )
-    return json.loads(result.stdout.decode("utf-8"))
+    result = officecli("view", str(filepath), "outline", "--json", timeout=30)
+    return json.loads(result.stdout)
 
 
 # ── Dimension discovery via officecli (replaces openpyxl) ─────────────
@@ -429,10 +424,9 @@ def collect_formula_facts(filepath, sheet, num_cols, data_start_row):
     """
     facts = {"formulas": {}, "column_numfmt": {}}
     try:
-        proc = subprocess.run(
-            ["officecli", "query", str(filepath), f"{sheet}!cell:has(formula)", "--json"],
-            capture_output=True, timeout=120)
-        data = json.loads(proc.stdout.decode("utf-8"))
+        proc = officecli("query", str(filepath), f"{sheet}!cell:has(formula)", "--json",
+                         timeout=120)
+        data = json.loads(proc.stdout)
         # 全量保留公式 (锚点/普通行都需要); 去重交给 digest 展示层做归一
         for res in data.get("data", {}).get("results", []):
             path = res.get("path", "")
@@ -455,10 +449,9 @@ def collect_formula_facts(filepath, sheet, num_cols, data_start_row):
         hi = min(num_cols, 26)
         start = max(1, data_start_row)
         rng = f"A{start}:{col_idx_to_letter(hi - 1)}{start + 4}"
-        proc = subprocess.run(
-            ["officecli", "get", str(filepath), f"/{sheet}/{rng}", "--depth", "2", "--json"],
-            capture_output=True, timeout=120)
-        data = json.loads(proc.stdout.decode("utf-8"))
+        proc = officecli("get", str(filepath), f"/{sheet}/{rng}", "--depth", "2", "--json",
+                         timeout=120)
+        data = json.loads(proc.stdout)
         for res in data.get("data", {}).get("results", []):
             for ch in res.get("children", []):
                 m = re.search(r"/([A-Z]+)(\d+)$", ch.get("path", ""))

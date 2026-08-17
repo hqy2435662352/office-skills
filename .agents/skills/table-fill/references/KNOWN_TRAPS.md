@@ -22,7 +22,7 @@
 | **`issues` 不是独立命令** | `officecli issues` 报 Unrecognized command | `issues` 是 `view` 的 mode（`officecli view <file> issues`） | 结构检查用 `officecli view <file> issues --json`（响应在 `data.issues`）。脚本已按此实现 |
 | **`numFmt` 大小写歧义** | 部分版本读回格式丢失 | help 官方键是 `numberformat`（别名 `format`/`numfmt`） | 统一写 `numberformat` |
 | **Access denied on set** | officecli set 报 PermissionError | 模板/副本只读（copy2 保留只读属性） | `_officecli.force_writable` 在每次复制后执行 |
-| **中文路径乱码/拒绝** | 乱码或 Access denied | PowerShell GBK 编码；officecli set/batch 不支持中文路径 | Python `subprocess.run()` UTF-8；一律 stage 到 ASCII workdir |
+| **中文路径乱码/拒绝** | 乱码或 Access denied | PowerShell GBK 编码；officecli set/batch 不支持中文路径 | officecli 调用一律 `_officecli.officecli()`（UTF-8 subprocess）；一律 stage 到 ASCII workdir |
 | **验证对象=模板基线 issue 噪音** | 输出仍有几百条 issues，误判失败 | 模板自带基线 issue（埃及模板 235 条） | 只认 issue **delta**（输出 − 模板）；`issues_delta` 内置 |
 | **flatten 标题行虚假数据** | 展平 CSV 中横向合并标题行显示上一数据行值 | 旧前向填充把合并区覆盖当纵向合并 | flatten 已修复（仅纵向合并传播锚点值）；重新 flatten |
 | **全表继承查询重复扫描** | 逐码 get D/F/X，耗时和上下文暴涨 | SKU 命中不携带相邻角色字段 | 用 `build_inheritance_index.py` 一次 `officecli view text`；索引生成后封闭取数 |

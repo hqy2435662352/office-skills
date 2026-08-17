@@ -28,6 +28,8 @@ import os, sys, json, argparse, subprocess, stat, shutil, platform
 from datetime import datetime
 from pathlib import Path
 
+from _officecli import clean_residents, officecli  # noqa: E402
+
 CACHE_FILENAME = ".preflight_cache.json"
 
 
@@ -52,7 +54,7 @@ def check_ascii_path(workdir):
 def check_officecli():
     """Verify officecli is on PATH and functional."""
     try:
-        r = subprocess.run(["officecli", "--version"], capture_output=True, timeout=10)
+        r = officecli("--version", timeout=10)
         if r.returncode != 0:
             return {
                 "code": "OFFICECLI_NOT_FUNCTIONAL",
@@ -86,8 +88,7 @@ def check_resident_cleanup():
             capture_output=True, text=True, timeout=10
         )
         if "officecli.exe" in r.stdout:
-            subprocess.run(["taskkill", "/F", "/IM", "officecli.exe"],
-                          capture_output=True, timeout=10)
+            clean_residents()  # shared adapter: taskkill 强杀 + 句柄释放纪律
             return {"code": "RESIDENT_CLEANED",
                     "message": "Stale officecli resident processes were terminated.",
                     "corrective_action": "Re-run preflight to confirm clean state."}

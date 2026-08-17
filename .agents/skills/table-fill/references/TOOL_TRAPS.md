@@ -10,7 +10,7 @@ officecli-win 聚焦编码与 subprocess。
 |------|------|---------|
 | bash for 循环 + 中文路径变量 | `for n in a b; do ... ${n}_meta.json ...` 展开失败, 报 META_NOT_FOUND | 避免在路径中做变量拼接; 显式写全路径或改用 Python 脚本 |
 | `grep -P` (Perl 正则) | 报 "grep: -P supports only unibyte and UTF-8 locales" | 用基本 grep / `grep -E`, 或 Python re |
-| raw PowerShell 管道 | GBK 编码损坏中文输出 (乱码) | 一律 Python `subprocess.run(..., encoding="utf-8")` |
+| raw PowerShell 管道 | GBK 编码损坏中文输出 (乱码) | officecli 调用一律 Python `_officecli.officecli()`（UTF-8 subprocess）；非 officecli 命令用 `subprocess.run(..., encoding="utf-8")` |
 | 中文路径 `set`/`batch` | Access denied (get 可能正常) | 所有输入先 stage 到 ASCII workdir (stage_files.py) |
 | 输出文件只读属性 | copy2 保留源只读位 → officecli 写失败 | execute 已有 force_writable; 手工复制后用 `chmod +w` |
 
@@ -58,6 +58,6 @@ officecli-win 聚焦编码与 subprocess。
 
 | 规范 | 内容 | 防的坑 |
 |------|------|--------|
-| **编码统一** | officecli 输出一律走 `_officecli.officecli()`（UTF-8 subprocess），产物一律 UTF-8 文件落盘后读取。禁止 PowerShell 管道、禁止把中文经控制台 print 再人工读。解码兜底：先按 UTF-8，若出现 U+FFFD 再用 GBK 试（不应发生——若发生说明调用绕过了共享适配器）。 | GBK 管道乱码、乱码 outline 喂给提名、试错解码浪费 |
+| **编码统一** | 两条规则分开（issue 09）：**结构解析**（列宽/行号空洞/OLE 结构）允许直接读 ZIP/XML，不经 officecli；**任何 officecli 子进程调用一律走 `_officecli.officecli()`**（UTF-8 subprocess），产物一律 UTF-8 文件落盘后读取。禁止裸 `subprocess.run(["officecli", ...])`、禁止 PowerShell 管道、禁止把中文经控制台 print 再人工读。解码兜底：先按 UTF-8，若出现 U+FFFD 再用 GBK 试（不应发生——若发生说明调用绕过了共享适配器）。 | GBK 管道乱码、乱码 outline 喂给提名、试错解码浪费、绕过适配器行为不一致 |
 | **路径绝对化** | 任何脚本调用（尤其带 `--cwd` 或 `workdir` 参数时）一律绝对路径：`python C:\...\scripts\flatten_workbook.py` 而非 `scripts/flatten_workbook.py`——`--cwd` 会切换子进程工作目录，相对路径直接 exit 2。V2 自带相位计时，旧 `run_timed.py` 包装已移除。 | run_timed --cwd 相对路径 exit 2 |
 | **readback 不手写** | V2 的验证链只有 Compiler 派生的绝对路径 readback（`/Sheet/A1`、`/slide[N]/table[@id=M]/tr[X]/tc[Y]`）。旧版 `verify_output.py` 的裸路径歧义（`A25` → `/A25` 根路径假失败）已随该脚本删除而根治。手动抽查时一律 `Sheet!A1` 或 `/Sheet/A1` 全限定形式，禁止裸坐标。 | verify 假失败轮次、多跑一轮验证 |

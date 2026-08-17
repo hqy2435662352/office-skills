@@ -12,8 +12,9 @@ import re
 import json
 import zipfile
 import argparse
-import subprocess
 from pathlib import Path
+
+from _officecli import officecli  # noqa: E402  (shared UTF-8 adapter)
 
 
 def find_ole_mapping(pptx_path, target_slide):
@@ -119,11 +120,9 @@ def main():
 
     # Step 1: Detect OLE first
     try:
-        result = subprocess.run(
-            ["officecli", "get", str(args.input), f"/slide[{args.slide}]/ole[1]", "--depth", "0", "--json"],
-            capture_output=True, timeout=15,
-        )
-        data = json.loads(result.stdout.decode("utf-8"))
+        result = officecli("get", str(args.input), f"/slide[{args.slide}]/ole[1]",
+                           "--depth", "0", "--json", timeout=15)
+        data = json.loads(result.stdout)
         if not data.get("success"):
             print(f"[OLE_ERROR] No OLE objects found on slide {args.slide}", file=sys.stderr)
             sys.exit(1)
@@ -136,12 +135,10 @@ def main():
     if ole_num is None:
         # Fallback: try sequential numbers
         for n in range(1, 10):
-            result = subprocess.run(
-                ["officecli", "get", str(args.input), f"/slide[{args.slide}]/ole[{n}]", "--depth", "0", "--json"],
-                capture_output=True, timeout=10,
-            )
+            result = officecli("get", str(args.input), f"/slide[{args.slide}]/ole[{n}]",
+                               "--depth", "0", "--json", timeout=10)
             try:
-                data = json.loads(result.stdout.decode("utf-8"))
+                data = json.loads(result.stdout)
                 if data.get("success"):
                     ole_num = n
                     break
