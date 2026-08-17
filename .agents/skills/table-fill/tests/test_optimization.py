@@ -4463,6 +4463,61 @@ class DocCoverageGuardTests(unittest.TestCase):
         for word in ("整行双引号包裹", "SPEC_NON_STRING_ITEM", "corrective_action"):
             self.assertIn(word, row)
 
+    # ── issue 07: OFFICECLI_REFERENCE 对齐当前执行契约 + 关键词守卫 ──
+    # (只守关键词, 不复制整段文档; 权威契约在 LAYER4 / FILLSPEC / KNOWN_TRAPS)
+
+    def _officecli_reference_text(self) -> str:
+        return (SKILL_ROOT / "references" / "OFFICECLI_REFERENCE.md").read_text(
+            encoding="utf-8")
+
+    def test_officecli_reference_flush_contract(self):
+        """写持久化契约: resident 延迟写 + 显式 close 刷盘 (与 LAYER4 /
+        KNOWN_TRAPS 同源); 禁止回退到「立即生效/直接修改文件」表述."""
+        text = self._officecli_reference_text()
+        for word in ("resident", "close", "刷盘", "延迟"):
+            self.assertIn(word, text, f"OFFICECLI_REFERENCE 缺写持久化词 {word!r}")
+        for stale in ("立即生效", "直接修改文件", "不需要额外保存"):
+            self.assertNotIn(stale, text,
+                             f"OFFICECLI_REFERENCE 仍含陈旧表述 {stale!r}")
+
+    def test_officecli_reference_op_order_invariant(self):
+        """op 恒序 clear→add→remove→merge→fill (与 FILLSPEC E1 / KNOWN_TRAPS
+        同源): OFFICECLI_REFERENCE 与 KNOWN_TRAPS 都按此序含全部五个阶段,
+        remove 不得排在 add 之前."""
+        norm = lambda s: re.sub(r"\s+", "", s)  # noqa: E731
+        invariant = "clear→add→remove→merge→fill"
+        ref = norm(self._officecli_reference_text())
+        self.assertIn(invariant, ref,
+                      "OFFICECLI_REFERENCE 缺 op 恒序 clear→add→remove→merge→fill")
+        traps = norm((SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8"))
+        self.assertIn(invariant, traps,
+                      "KNOWN_TRAPS 缺 op 恒序 (remove/add 交互行)")
+
+    def test_officecli_reference_xlsx_props(self):
+        """属性名: xlsx 用 value/numberformat (PROPS_WHITELIST 同源), pptx 用
+        text; 禁止回退到把 xlsx text/numFmt 写成 JSON props."""
+        text = self._officecli_reference_text()
+        for word in ("value", "numberformat"):
+            self.assertIn(word, text, f"OFFICECLI_REFERENCE 缺 xlsx 属性词 {word!r}")
+        # 陈旧属性名的"处方形" (JSON prop 写法) 禁止; 文档提及其为陈旧别名
+        # (警示) 是允许的 — 同 KNOWN_TRAPS「text 属性漂移」「numFmt 大小写歧义」
+        self.assertNotIn('"numFmt"', text,
+                         "OFFICECLI_REFERENCE 仍把 numFmt 写成 JSON prop")
+        m = re.search(r"```json\n(.*?)```", text, re.DOTALL)
+        self.assertIsNotNone(m, "OFFICECLI_REFERENCE 缺 batch JSON 示例")
+        batch_example = m.group(1)
+        self.assertNotIn('"text"', batch_example,
+                         "batch JSON 示例 (xlsx) 仍用 text 属性")
+        self.assertIn('"value"', batch_example,
+                      "batch JSON 示例 (xlsx) 缺 value 属性")
+        self.assertIn('"numberformat"', batch_example,
+                      "batch JSON 示例 (xlsx) 缺 numberformat 属性")
+        m = re.search(r"### PPTX 特殊要求", text)
+        self.assertIsNotNone(m, "OFFICECLI_REFERENCE 缺 PPTX 特殊要求 小节")
+        self.assertIn("text", text[m.end():],
+                      "OFFICECLI_REFERENCE PPTX 段缺 text 属性")
+
 
 class ReadbackNormalizationTests(unittest.TestCase):
     """Q10 readback value 断言: 数值归一化只适用于真数值形态; 字母数字标识

@@ -2,18 +2,27 @@
 
 ## 基本用法（必读）
 
-**officecli 不需要显式 `open` / `save`。** 每个命令直接读写文件，写操作立即生效：
+**officecli 是命令式调用，没有 openpyxl 式显式 `open` / `save` 步骤**，但写入
+**不是立即落盘**的 —— 这是 **resident 延迟写**模型（2026-08-12 实测）：
+
+- 任何调用都可能启动 resident 常驻进程（例如坐标探针 `get`）。resident 启动后，
+  后续操作在**内存中**应用，磁盘写延迟到 save/close/idle。
+- 收尾必须显式 `officecli close <file>` 刷盘（无 resident 时 close 是 no-op）。
+  **用 taskkill 强杀 resident（`clean_residents()`）会丢掉未刷盘的尾部操作**
+  （实测 E15–E19 随机缺失）。
+- table-fill 流程中 `execute_batch.py` 已在 chunk 循环尾 + 主流程尾显式
+  `officecli close` 刷盘；手写/一次性命令时**自己负责 close**。
 
 ```python
-# ✅ 直接操作——无需 open
+# ✅ 直接调用——无需 open；写操作收尾显式 close 刷盘
 subprocess.run(["officecli", "get", "file.xlsx", "/Sheet/A1", "--json"], ...)
-subprocess.run(["officecli", "set", "file.xlsx", "/Sheet/A1", "--prop", "text=hello"], ...)
+subprocess.run(["officecli", "set", "file.xlsx", "/Sheet/A1", "--prop", "value=hello"], ...)
 subprocess.run(["officecli", "batch", "file.xlsx", "--input", "batch.json"], ...)
+subprocess.run(["officecli", "close", "file.xlsx"], ...)   # 刷盘; 无 resident 时 no-op
 ```
 
-`officecli open` 是可选的性能优化——它会启动一个常驻进程，后续命令通过内存通信而非每次打开文件。**对于 batch 操作不需要**，batch 本身已经是一次性批量执行。
-
-**所有 officecli 写操作直接修改文件**，不需要额外保存步骤。这与 openpyxl 的 `wb.save()` 模式完全不同——如果用 openpyxl 的思维去理解 officecli，会误以为需要 `open` 显式打开文件。
+> 权威依据: `references/LAYER4_EXECUTE_LOOP.md`「resident 刷盘 (2026-08-12 实测)」
+> 与 `references/KNOWN_TRAPS.md`「resident 延迟写被 taskkill 丢尾部 chunk」。
 
 ## batch JSON 格式（执行机制）
 
@@ -22,16 +31,20 @@ LLM 不直接生成。`execute_batch.py` 用 `officecli batch` 执行。格式�
 
 ```json
 [
+  {"command": "add", "parent": "/SheetName", "type": "row", "props": {"cols": 10}},
+  {"command": "add", "parent": "/SheetName", "type": "row", "from": "/SheetName/row[3]", "after": "/SheetName/row[7]"},
   {"command": "remove", "path": "/SheetName/row[28]"},
   {"command": "remove", "path": "/SheetName/row[27]"},
-  {"command": "add", "parent": "/SheetName", "type": "row", "props": {"cols": 10}},
   {"command": "set", "path": "/SheetName/B2", "props": {"merge": "B2:B7"}},
-  {"command": "set", "path": "/SheetName/C5", "props": {"text": "空调", "font.color": "000000"}},
-  {"command": "set", "path": "/SheetName/D5", "props": {"text": "37.65", "numFmt": "#,##0.00"}},
+  {"command": "set", "path": "/SheetName/C5", "props": {"value": "空调", "font.color": "000000"}},
+  {"command": "set", "path": "/SheetName/D5", "props": {"value": "37.65", "numberformat": "#,##0.00"}},
   {"command": "set", "path": "/SheetName/col[D]", "props": {"width": 18}},
   {"command": "set", "path": "/SheetName/row[1]", "props": {"height": 24}}
 ]
 ```
+
+(顺序 = op 恒序 `clear → add → remove → merge → fill`, 见下「全局排序不变量」;
+示例省略 clear 段 —— 清空旧值/置空用 `{"value": ""}` / `{"value": null}`。)
 
 ### batch JSON 命令速查
 
@@ -40,8 +53,9 @@ LLM 不直接生成。`execute_batch.py` 用 `officecli batch` 执行。格式�
 | `add` (row) | 插入空行 | `parent`, `type` | `cols`, `height` |
 | `add` (row clone) | 插入带格式行 | `parent`, `type`, `from` | `cols` |
 | `remove` | 删除行 | `path` | — |
-| `set` (clear cell) | 清空值保留格式 | `path` | `{"text": ""}` |
-| `set` (cell) | 写值/格式 | `path` | `text`, `formula`, `numFmt`, `font.color`, `fill`, `bold`, `merge` |
+| `set` (clear cell) | 清空值保留格式 | `path` | `{"value": ""}` |
+| `set` (cell, xlsx) | 写值/格式 | `path` | `value`, `formula`, `numberformat`, `font.color`, `fill`, `bold`, `merge` |
+| `set` (cell, pptx) | 写文本 | `path` | `text`, `font`, `size` |
 | `set` (col) | 列宽 | `path` | `width` |
 | `set` (row) | 行高/隐藏 | `path` | `height`, `hidden` |
 | `set` (sheet) | 冻结/标签色 | `path` | `freeze`, `tabColor` |
@@ -63,16 +77,23 @@ LLM 不直接生成。`execute_batch.py` 用 `officecli batch` 执行。格式�
 ⚠️ 若省略 `after`，三行全插入到 sheet 末尾而非 row[5] 之后。
 `from` 会克隆源行的 cell 内容、样式和单行合并单元格；相对公式引用自动偏移。
 
-### 严格排序规则
+### 全局排序不变量（op 恒序）
 
-batch.json 中的操作必须按此顺序排列（SKILL.md `[REQUIREMENT]`）：
-1. **remove**（删行）——从底向上
-2. **add**（插行）——从底向上
-3. **set merge**（合并单元格）
-4. **set value/format**（填值、设格式）
-5. **set structural**（列宽、行高、冻结）
+batch.json 的操作顺序由 `compile_fill.py` 生成，**全局恒为
+`clear → add → remove → merge → fill`**（append-only 形态；inplace 混合形态的
+精确序列见 `references/FILLSPEC.md`「执行顺序保证」E1）。细则：
 
-前两步改变坐标系统，后续 set 必须基于新坐标。
+1. **clear** — 清空旧值/置空（`{"value": ""}` 清空、`{"value": null}` 置空）
+2. **add**（插行）— 自顶向下（配合 `after` 定位；值写入**不穿插** add，防
+   duplicate_row）
+3. **remove**（删行）— 自底向上；remove_rows 是模板坐标，与 add 区无交集
+   （`REMOVE_TARGETS_APPEND_ZONE` 编译期保证）
+4. **merge**（合并单元格）
+5. **fill**（填值/公式/格式）
+
+add/remove 改变坐标系统，后续 set 必须基于新坐标。**手写 batch 即违规** —— batch
+一律由 `compile_fill.py` 生成（见 `references/TOOL_TRAPS.md`「手写 checks /
+batch」）。
 
 ### 路径格式
 
@@ -95,12 +116,18 @@ batch.json 中的操作必须按此顺序排列（SKILL.md `[REQUIREMENT]`）：
 - ✅ `"fill": "FFFF00"` — 背景颜色
 - ❌ `"color": "FF0000"` — 歧义，会被拒绝
 
+**xlsx 单元格属性是 `value` / `numberformat`；pptx 文本格属性是 `text`。**
+`text`/`numFmt` 不是 xlsx 官方属性（`text` 仅是未文档化兼容别名，与 `value`
+混用时值会丢失；`numFmt` 大小写歧义会导致格式读回丢失）—— 一律写 `value` /
+`numberformat`（见 `references/KNOWN_TRAPS.md`「`text` 属性漂移」「`numFmt`
+大小写歧义」）。
+
 十六进制颜色不要加 `#`：`FF0000`，不是 `#FF0000`。
 公式不要加 `=`：`"formula": "SUM(B2:B4)"`，不是 `"=SUM(B2:B4)"`。
 
 ### PPTX 特殊要求
 
-PPTX 目标的文本 cell 必须显式设置字体：
+PPTX 目标的文本 cell 必须显式设置字体，属性用 `text`（不是 xlsx 的 `value`）：
 
 ```json
 {"command": "set", "path": "/slide[5]/table[@id=2]/tr[3]/tc[3]", "props": {"text": "19.07", "font": "微软雅黑", "size": "9pt"}}

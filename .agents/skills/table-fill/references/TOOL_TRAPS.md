@@ -27,15 +27,14 @@ officecli-win 聚焦编码与 subprocess。
 | L3 继承字段二次扫描 | 先 `query cell:contains(SKU)` 再 `view text` 找 D/F/X | 用 `build_inheritance_index.py` 一次 view text 生成结构化索引；禁止追加逐码查询 |
 | 步骤耗时无法复盘 | 只看终端输出或聊天时间戳 | 脚本自动写 `run_timing.json`（machine 相位）+ `note_phase.py`（agent 思考），Gate 报告读取 manifest |
 
-## 3. 冒烟/执行/验证机制
+## 3. 执行/验证机制
 
 | 陷阱 | 现象 | 正确做法 |
 |------|------|---------|
-| smoke_test 成功后删除输出 | PASS 后 smoke_test_output.xlsx 被清理, 无法复查 | 复查数据用 `--checks` 在冒烟时断言; 失败记录是唯一产物 |
-| `--checks` 前导 `/` 路径 | Git Bash MSYS2 把参数中 `/` 前导 token 转换成 Windows 路径 (`/11_FRESH本土/T26` → `C:/Program Files/Git/11_FRESH本土/T26`), 整参或逗号列表末 token 都可能中招, 行为不稳定 | checks 跨 sheet 一律用 `Sheet!A1` 形式 (无前导 /), 解析器内部转 `/Sheet/A1`; 或整命令前缀 `MSYS_NO_PATHCONV=1` |
-| 空断言写成 `J33=` | 解析器把空串期望当"非空检查", 冒烟反向失败 (expected non-empty, actual 空) | 空断言必须写 `J33=EMPTY` (字面 EMPTY); 无格式裸空行 (spacer) 的 officecli 渲染值为 `(empty)`, 用 `A40=(empty)` 断言 |
+| validated_draft 被当临时文件清理 | 执行后 draft 被删/移动, Gate 与提升前无法复查 | Draft **保留不删除** (SKILL.md §5)；复查/提升一律指向 `validated_draft.<ext>`；promote 是哈希验证复制, 永不二次执行 |
+| resident 未 close 刷盘 | readback 全过但最终文件缺尾部 chunk 值 | 收尾显式 `officecli close` 刷盘 (execute_batch 已内置; 手写命令自己负责) — 见 KNOWN_TRAPS「resident 延迟写」 |
 | 失败记录字段 | 新版本含 `defect_class` / `standard_fix` | **先读 standard_fix 再动手**, 不要逐格 get 侦查 |
-| 手写 checks / batch | 与 Compiler 冲突 | readback 与 ops 必须由 compile_fill.py 派生; 手写即违规 |
+| 手写 checks / batch | 与 Compiler 冲突 | readback 与 ops 必须由 compile_fill.py 派生; 手写即违规 (依据: SKILL.md「禁止手写 checks」/ LAYER4_EXECUTE_LOOP.md「Readback」/ compile_fill.py docstring) |
 
 ## 4. batch 生成
 
