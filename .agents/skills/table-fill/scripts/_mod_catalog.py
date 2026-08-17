@@ -244,6 +244,10 @@ def replace_index_row(
 _RULE_COLUMNS = frozenset(
     {"Rule ID", "Group", "Gate", "Description", "Applies to", "Notes"}
 )
+# Valid Rule ID: starts with uppercase letter, then uppercase letters / digits / hyphens.
+# Accepts both short (R01) and long (RTE-001) formats per MOD_TEMPLATE.md.
+# Rejects garbage rows where the first column is not a plausible Rule ID.
+_RULE_ID_RE = re.compile(r"^[A-Z][A-Z0-9-]*$")
 
 
 def parse_mod_rules(text: str) -> list[ModRule]:
@@ -282,6 +286,10 @@ def parse_mod_rules(text: str) -> list[ModRule]:
             if cells and cells[-1] == "":
                 cells.pop()
             if len(cells) < 5:
+                continue
+
+            # Skip rows whose first column is not a valid Rule ID format
+            if not _RULE_ID_RE.match(cells[0]):
                 continue
 
             rule = ModRule(

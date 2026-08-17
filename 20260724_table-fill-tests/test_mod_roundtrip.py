@@ -553,5 +553,321 @@ class TestCatalogPipeHandling(unittest.TestCase):
                       "Escaped pipe should be unescaped to literal |")
 
 
+# ── Test: ModCaptureTests — unit tests for mod_capture internals ─────────
+
+
+class ModCaptureTests(unittest.TestCase):
+    """Unit tests for mod_capture.py internal validation logic.
+
+    Directly tests _validate_request, _validate_source, _build_index_entry,
+    and _build_mod_content without subprocess E2E overhead.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ── _validate_request: pipe handling ─────────────────────────────────
+
+    def test_validate_request_bare_pipe_in_scope_rejected(self):
+        """Bare pipe in scope_signals → raises CaptureError."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="sig::a|b", aliases="", exclusion_signals="",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    def test_validate_request_escaped_pipe_in_scope_accepted(self):
+        """Escaped pipe (\\|) in scope_signals → no error."""
+        from mod_capture import CaptureRequest, _validate_request
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals=r"sig::a\|b", aliases="", exclusion_signals="",
+        )
+        _validate_request(req)  # Should not raise
+
+    def test_validate_request_bare_pipe_in_aliases_rejected(self):
+        """Bare pipe in aliases → raises CaptureError."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="s", aliases="a|b", exclusion_signals="",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    def test_validate_request_escaped_pipe_in_aliases_accepted(self):
+        """Escaped pipe (\\|) in aliases → no error."""
+        from mod_capture import CaptureRequest, _validate_request
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="s", aliases=r"a\|b", exclusion_signals="",
+        )
+        _validate_request(req)
+
+    def test_validate_request_bare_pipe_in_exclusion_rejected(self):
+        """Bare pipe in exclusion_signals → raises CaptureError."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="s", aliases="", exclusion_signals="ex|cl",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    def test_validate_request_escaped_pipe_in_exclusion_accepted(self):
+        """Escaped pipe (\\|) in exclusion_signals → no error."""
+        from mod_capture import CaptureRequest, _validate_request
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="s", aliases="", exclusion_signals=r"ex\|cl",
+        )
+        _validate_request(req)
+
+    def test_validate_request_double_backslash_pipe_rejected(self):
+        """Double backslash + bare pipe (\\\\|) → still rejected."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="sig::a\\\\|b", aliases="", exclusion_signals="",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    def test_validate_request_multiple_escaped_pipes_accepted(self):
+        """Multiple escaped pipes in scope → no error."""
+        from mod_capture import CaptureRequest, _validate_request
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals=r"sig::a\|b\|c", aliases="", exclusion_signals="",
+        )
+        _validate_request(req)
+
+    def test_validate_request_invalid_action_rejected(self):
+        """Invalid action → raises CaptureError."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="delete", source=Path("."),
+            scope_signals="s", aliases="", exclusion_signals="",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    def test_validate_request_empty_scope_rejected(self):
+        """Empty scope_signals → raises CaptureError."""
+        from mod_capture import CaptureRequest, _validate_request, CaptureError
+
+        req = CaptureRequest(
+            mod_name="T", action="create", source=Path("."),
+            scope_signals="", aliases="", exclusion_signals="",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_request(req)
+
+    # ── _validate_source ────────────────────────────────────────────────
+
+    def test_validate_source_with_valid_rules_returns_rules(self):
+        """Valid source with R01 rules → returns list of rules."""
+        from mod_capture import _validate_source
+
+        src = Path(self.tmpdir) / "valid.md"
+        src.write_text(
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| R01 | mapping | mod_gate | Test. | * | |\n",
+            encoding="utf-8",
+        )
+        rules = _validate_source(src)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].rule_id, "R01")
+
+    def test_validate_source_with_no_rules_raises(self):
+        """Source with header but no rules → raises CaptureError."""
+        from mod_capture import _validate_source, CaptureError
+
+        src = Path(self.tmpdir) / "empty.md"
+        src.write_text(
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CaptureError):
+            _validate_source(src)
+
+    def test_validate_source_with_no_table_raises(self):
+        """Source with no table at all → raises CaptureError."""
+        from mod_capture import _validate_source, CaptureError
+
+        src = Path(self.tmpdir) / "notable.md"
+        src.write_text("# Just text\nNo table here.\n", encoding="utf-8")
+        with self.assertRaises(CaptureError):
+            _validate_source(src)
+
+    def test_validate_source_missing_file_raises(self):
+        """Nonexistent source → raises CaptureError."""
+        from mod_capture import _validate_source, CaptureError
+
+        with self.assertRaises(CaptureError):
+            _validate_source(Path("/nonexistent/file.md"))
+
+    def test_validate_source_r01_and_rte001_both_accepted(self):
+        """Both R01 and RTE-001 Rule IDs accepted by source validation."""
+        from mod_capture import _validate_source
+
+        src = Path(self.tmpdir) / "mixed.md"
+        src.write_text(
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| R01 | mapping | mod_gate | Short. | * | |\n"
+            "| RTE-001 | validation | execution_gate | Long. | * | |\n",
+            encoding="utf-8",
+        )
+        rules = _validate_source(src)
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0].rule_id, "R01")
+        self.assertEqual(rules[1].rule_id, "RTE-001")
+
+    # ── _build_index_entry ──────────────────────────────────────────────
+
+    def test_build_index_entry_has_correct_fields(self):
+        """Index entry from request has correct mod_name, revision=1, visibility=private."""
+        from mod_capture import CaptureRequest, _build_index_entry
+
+        req = CaptureRequest(
+            mod_name="MYMOD", action="create", source=Path("."),
+            scope_signals="sig::test", aliases="a1, a2",
+            exclusion_signals="excl::x",
+        )
+        entry = _build_index_entry(req)
+        self.assertEqual(entry.mod_name, "MYMOD")
+        self.assertEqual(entry.aliases, "a1, a2")
+        self.assertEqual(entry.scope_signals, "sig::test")
+        self.assertEqual(entry.exclusion_signals, "excl::x")
+        self.assertEqual(entry.path, "MOD_MYMOD.md")
+        self.assertEqual(entry.revision, 1)
+        self.assertEqual(entry.visibility, "private")
+
+    # ── _build_mod_content ──────────────────────────────────────────────
+
+    def test_build_mod_content_contains_rule_count(self):
+        """MOD content includes the rule count."""
+        from mod_capture import CaptureRequest, _build_mod_content
+
+        req = CaptureRequest(
+            mod_name="TEST", action="create", source=Path("."),
+            scope_signals="sig::t", aliases="", exclusion_signals="",
+        )
+        content = _build_mod_content("TEST", "body", req, 3)
+        self.assertIn("Rule count: 3", content)
+        self.assertIn("MOD_TEST", content)
+
+    def test_build_mod_content_with_revision(self):
+        """MOD content includes the revision number."""
+        from mod_capture import CaptureRequest, _build_mod_content
+
+        req = CaptureRequest(
+            mod_name="REV", action="create", source=Path("."),
+            scope_signals="sig::t", aliases="", exclusion_signals="",
+        )
+        content = _build_mod_content("REV", "body", req, 1, revision=5)
+        self.assertIn("Revision: 5", content)
+
+
+# ── Test: _mod_catalog Rule ID validation ────────────────────────────────
+
+
+class TestRuleIdValidation(unittest.TestCase):
+    """_mod_catalog.parse_mod_rules validates Rule ID format."""
+
+    def test_valid_short_id_accepted(self):
+        """R01-style short ID is accepted."""
+        from _mod_catalog import parse_mod_rules
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| R01 | mapping | mod_gate | Test. | * | |\n"
+        )
+        rules = parse_mod_rules(text)
+        self.assertEqual(len(rules), 1)
+
+    def test_valid_long_id_accepted(self):
+        """RTE-001-style long ID is accepted."""
+        from _mod_catalog import parse_mod_rules
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| RTE-001 | mapping | mod_gate | Test. | * | |\n"
+        )
+        rules = parse_mod_rules(text)
+        self.assertEqual(len(rules), 1)
+
+    def test_lowercase_id_rejected(self):
+        """Lowercase rule ID (r01) is rejected."""
+        from _mod_catalog import parse_mod_rules, ModRuleParseError
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| r01 | mapping | mod_gate | Test. | * | |\n"
+        )
+        with self.assertRaises(ModRuleParseError):
+            parse_mod_rules(text)
+
+    def test_numeric_only_id_rejected(self):
+        """Pure numeric ID (001) is rejected."""
+        from _mod_catalog import parse_mod_rules, ModRuleParseError
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| 001 | mapping | mod_gate | Test. | * | |\n"
+        )
+        with self.assertRaises(ModRuleParseError):
+            parse_mod_rules(text)
+
+    def test_garbage_id_rejected(self):
+        """Non-rule garbage row (e.g. Chinese text) is rejected."""
+        from _mod_catalog import parse_mod_rules, ModRuleParseError
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| 这不是规则 | mapping | mod_gate | Test. | * | |\n"
+        )
+        with self.assertRaises(ModRuleParseError):
+            parse_mod_rules(text)
+
+    def test_mixed_valid_and_invalid_rows(self):
+        """Valid rows are kept; invalid rows are silently skipped."""
+        from _mod_catalog import parse_mod_rules
+
+        text = (
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| R01 | mapping | mod_gate | Valid. | * | |\n"
+            "| not-a-rule | mapping | mod_gate | Invalid. | * | |\n"
+            "| RTE-002 | validation | execution_gate | Also valid. | * | |\n"
+        )
+        rules = parse_mod_rules(text)
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0].rule_id, "R01")
+        self.assertEqual(rules[1].rule_id, "RTE-002")
+
+
 if __name__ == "__main__":
     unittest.main()

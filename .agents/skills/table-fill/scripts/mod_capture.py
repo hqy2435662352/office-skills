@@ -30,6 +30,10 @@ from _mod_catalog import (  # noqa: E402
 )
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# Matches a bare pipe '|' that is NOT preceded by a backslash.
+# Handles double-backslash correctly: '\\|' (literal backslash + bare pipe)
+# still matches because the regex skips past '\\\\' pairs before checking.
+_BARE_PIPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\|")
 _EXIT_OK, _EXIT_ENV, _EXIT_BUSINESS = 0, 1, 3
 
 
@@ -102,7 +106,6 @@ def _validate_request(req: CaptureRequest) -> None:
     # Reject pipe injection: '|' in table columns breaks markdown parsing.
     # Allow escaped pipes ('\|') which are a valid markdown table convention
     # for literal pipe characters inside cell values (e.g. sheet_marker::X\|Y).
-    _BARE_PIPE_RE = re.compile(r"(?<!\\)\|")
     for field_name, value in [
         ("aliases", req.aliases),
         ("scope_signals", req.scope_signals),
