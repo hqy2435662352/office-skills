@@ -1,4 +1,4 @@
-"""Private MOD capture — create or update with backups. Emits structured UTF-8 JSON.
+"""MOD capture — create or update with backups. Emits structured UTF-8 JSON.
 
 Exit codes: 0=success, 1=environment, 3=business validation.
 """
@@ -54,6 +54,7 @@ class CaptureRequest:
     scope_signals: str
     aliases: str
     exclusion_signals: str
+    visibility: str = "private"
 
 
 def _skill_root() -> str:
@@ -119,6 +120,46 @@ def _validate_request(req: CaptureRequest) -> None:
                 _EXIT_ENV,
             )
 
+# ── Decontamination patterns ──────────────────────────────────────────────
+
+# Forbidden patterns for public MODs: single-run facts must not appear.
+_DECONTAMINATION_PATTERNS = [
+    (re.compile(r"\b(?:TCL|FRESH)\b"), "customer_name",
+     "Specific customer name (TCL/FRESH)"),
+    (re.compile(r"三三三|333"), "sheet_marker",
+     "Specific sheet marker (三三三/333)"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}"), "date",
+     "Specific date (YYYY-MM-DD)"),
+    (re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}"), "date",
+     "Specific date (YYYY.M.D)"),
+    (re.compile(r"-?\d+(?:\.\d+)?%"), "percentage",
+     "Specific percentage"),
+    (re.compile(r"(?:USD|RMB|CNY)\s*\d"), "currency",
+     "Specific currency amount"),
+    (re.compile(r"\d+(?:\.\d+)?\s*(?:米|meter)"), "fixed_number",
+     "Specific measurement (e.g. 5 米)"),
+    (re.compile(r"\d+\s*[~\-至]\s*\d+\s*(?:米|meter)"), "fixed_number",
+     "Specific measurement range"),
+]
+
+
+def _check_decontamination(content: str) -> tuple[bool, list[dict]]:
+    """Check MOD content for decontamination violations (public MODs only).
+
+    Returns (has_violations, violations) where violations is a list of dicts
+    with keys: pattern_type, description, match.
+    """
+    violations = []
+    for pattern, pattern_type, description in _DECONTAMINATION_PATTERNS:
+        match = pattern.search(content)
+        if match:
+            violations.append({
+                "pattern_type": pattern_type,
+                "description": description,
+                "match": match.group(),
+            })
+    return bool(violations), violations
+
 
 def _check_preconditions(
     mod_name: str, existing: list[ModIndexEntry], refs_dir: str,
@@ -140,7 +181,7 @@ def _build_index_entry(req: CaptureRequest) -> ModIndexEntry:
         mod_name=req.mod_name, aliases=req.aliases,
         scope_signals=req.scope_signals,
         exclusion_signals=req.exclusion_signals,
-        path=f"MOD_{req.mod_name}.md", revision=1, visibility="private")
+        path=f"MOD_{req.mod_name}.md", revision=1, visibility=req.visibility)
 
 
 def _build_mod_content(
@@ -148,8 +189,8 @@ def _build_mod_content(
 ) -> str:
     lines = [
         f"# MOD_{name}\n\n## Purpose\n\n",
-        "Private MOD created by table-fill capture.\n",
-        f"Revision: {revision}\nVisibility: private\nRule count: {n}\n\n",
+        "MOD created by table-fill capture.\n",
+        f"Revision: {revision}\nVisibility: {req.visibility}\nRule count: {n}\n\n",
         "## Metadata\n\n",
         f"- Scope Signals: {req.scope_signals}\n",
     ]
@@ -182,6 +223,18 @@ def _atomic_write(path: str, content: str) -> None:
 def _do_create(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission contract
     _validate_request(req)
     rules = _validate_source(req.source)
+    # Decontamination check for public MODs
+    if req.visibility == "public":
+        source_text = req.source.read_text(encoding="utf-8")
+        has_violations, violations = _check_decontamination(source_text)
+        if has_violations:
+            violation_msgs = [f"  - [{v['pattern_type']}] {v['description']}: '{v['match']}'"
+                              for v in violations]
+            raise CaptureError(
+                f"Decontamination violations in public MOD source:\n" +
+                "\n".join(violation_msgs),
+                _EXIT_BUSINESS,
+            )
     body = req.source.read_text(encoding="utf-8")
     index_path = _mod_index_path()
     index_text = Path(index_path).read_text(encoding="utf-8")
@@ -191,7 +244,7 @@ def _do_create(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
                   _build_mod_content(req.mod_name, body, req, len(rules)))
     _atomic_write(index_path, rebuild_index_text(index_text, _build_index_entry(req)))
     return {"action": "create", "mod_name": req.mod_name, "revision": 1,
-            "visibility": "private", "rule_count": len(rules),
+            "visibility": req.visibility, "rule_count": len(rules),
             "index_updated": True, "scope_signals": req.scope_signals,
             "exit_code": _EXIT_OK}
 
@@ -200,6 +253,18 @@ def _do_update(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
     """Update an existing MOD — single-user best effort, not atomic concurrency."""
     _validate_request(req)
     rules = _validate_source(req.source)
+    # Decontamination check for public MODs
+    if req.visibility == "public":
+        source_text = req.source.read_text(encoding="utf-8")
+        has_violations, violations = _check_decontamination(source_text)
+        if has_violations:
+            violation_msgs = [f"  - [{v['pattern_type']}] {v['description']}: '{v['match']}'"
+                              for v in violations]
+            raise CaptureError(
+                f"Decontamination violations in public MOD source:\n" +
+                "\n".join(violation_msgs),
+                _EXIT_BUSINESS,
+            )
     body = req.source.read_text(encoding="utf-8")
     index_path = _mod_index_path()
     index_text = Path(index_path).read_text(encoding="utf-8")
@@ -217,7 +282,7 @@ def _do_update(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
     new_entry = ModIndexEntry(
         mod_name=req.mod_name, aliases=req.aliases,
         scope_signals=req.scope_signals, exclusion_signals=req.exclusion_signals,
-        path=f"MOD_{req.mod_name}.md", revision=new_revision, visibility="private")
+        path=f"MOD_{req.mod_name}.md", revision=new_revision, visibility=req.visibility)
     for p in (mod_path, index_path):
         shutil.copy2(p, p + ".bak")
     try:
@@ -234,7 +299,7 @@ def _do_update(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
             shutil.copy2(bak, mod_path)
         raise CaptureError("Index write failed; MOD restored from backup", _EXIT_ENV)
     return {"action": "update", "mod_name": req.mod_name,
-            "revision": new_revision, "visibility": "private",
+            "revision": new_revision, "visibility": req.visibility,
             "rule_count": len(rules), "index_updated": True,
             "scope_signals": req.scope_signals, "exit_code": _EXIT_OK}
 
@@ -250,13 +315,16 @@ def _emit_json(data: dict, exit_code: int) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(
-        description="Create a private MOD from a prepared rule-source file.")
+        description="Create or update a MOD from a prepared rule-source file.")
     p.add_argument("--source", required=True)
     p.add_argument("--mod-name", required=True)
     p.add_argument("--action", required=True, choices=["create", "update"])
     p.add_argument("--scope-signals", required=True)
     p.add_argument("--aliases", default="")
     p.add_argument("--exclusion-signals", default="")
+    p.add_argument("--visibility", default="private", choices=["private", "public"],
+                   help="MOD visibility (default: private). "
+                        "Public MODs are checked for decontamination violations.")
     args = p.parse_args(argv)
 
     try:
@@ -265,6 +333,7 @@ def main(argv: list[str] | None = None) -> None:
             source=Path(args.source).resolve(),
             scope_signals=args.scope_signals,
             aliases=args.aliases, exclusion_signals=args.exclusion_signals,
+            visibility=args.visibility,
         )
     except Exception as exc:
         _emit_json({"error": f"Invalid arguments: {exc}", "exit_code": _EXIT_ENV},
