@@ -99,16 +99,20 @@ def _validate_request(req: CaptureRequest) -> None:
         raise CaptureError(f"Unsupported action '{req.action}'", _EXIT_ENV)
     if not req.scope_signals or not req.scope_signals.strip():
         raise CaptureError("Scope signals must be non-empty", _EXIT_ENV)
-    # Reject pipe injection: '|' in table columns breaks markdown parsing
+    # Reject pipe injection: '|' in table columns breaks markdown parsing.
+    # Allow escaped pipes ('\|') which are a valid markdown table convention
+    # for literal pipe characters inside cell values (e.g. sheet_marker::X\|Y).
+    _BARE_PIPE_RE = re.compile(r"(?<!\\)\|")
     for field_name, value in [
         ("aliases", req.aliases),
         ("scope_signals", req.scope_signals),
         ("exclusion_signals", req.exclusion_signals),
     ]:
-        if "|" in value:
+        if _BARE_PIPE_RE.search(value):
             raise CaptureError(
                 f"Invalid character '|' in {field_name}: "
-                "pipe characters break markdown table parsing",
+                "bare pipe characters break markdown table parsing; "
+                "use '\\|' for a literal pipe",
                 _EXIT_ENV,
             )
 

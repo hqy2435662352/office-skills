@@ -1,7 +1,8 @@
 """Typed, immutable MOD catalog models and parsers.
 
 Seven-column MOD_INDEX.md parser and six-column MOD rule table parser.
-Single source consumed by mod_nominate.py and mod_capture.py.
+Single source consumed by mod_nominate.py (nomination resolution) and
+mod_capture.py (private MOD create/update).
 
 All parsing is read-only: functions accept strings and return typed,
 immutable objects. No filesystem access, no mutation, no state.
@@ -299,3 +300,37 @@ def parse_mod_rules(text: str) -> list[ModRule]:
         )
 
     return rules
+
+
+# ── Dict conversion helpers (for mod_nominate.py compatibility) ────────────
+
+
+def index_entry_to_dict(entry: ModIndexEntry) -> dict:
+    """Convert a ModIndexEntry to the dict shape expected by mod_nominate.py.
+
+    Key mapping: mod_name→name, scope_signals→scope, exclusion_signals→exclusion.
+    """
+    return {
+        "name": entry.mod_name,
+        "aliases": entry.aliases,
+        "scope": entry.scope_signals,
+        "exclusion": entry.exclusion_signals,
+        "path": entry.path,
+        "revision": entry.revision,
+        "visibility": entry.visibility,
+    }
+
+
+def rule_to_dict(rule: ModRule) -> dict:
+    """Convert a ModRule to the dict shape expected by mod_nominate.py.
+
+    Key mapping: rule_id→id.
+    """
+    return {
+        "id": rule.rule_id,
+        "group": rule.group,
+        "gate": rule.gate,
+        "description": rule.description,
+        "applies_to": rule.applies_to,
+        "notes": rule.notes,
+    }

@@ -55,13 +55,24 @@ Exit codes: 0=pass (nomination is advisory, every status is a legal result)
 import argparse
 import fnmatch
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 from _officecli import (  # noqa: E402
     ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
     sha256_file,
+)
+from _mod_catalog import (  # noqa: E402
+    index_entry_to_dict,
+    parse_mod_index,
+    parse_mod_rules,
+    rule_to_dict,
 )
 
 SEMANTIC_KEYWORDS = {
@@ -95,22 +106,8 @@ DIMENSION_SET_FACTS = {
 
 
 def parse_index(path: Path) -> list[dict]:
-    rows = []
-    text = path.read_text(encoding="utf-8")
-    for line in text.splitlines():
-        if not line.startswith("|") or "*(no MODs registered)*" in line:
-            continue
-        cells = [c.strip().replace(r"\|", "|")
-                 for c in re.split(r"(?<!\\)\|", line.strip("|"))]
-        if len(cells) < 7 or cells[0] in ("MOD Name", "---", ""):
-            continue
-        rows.append({
-            "name": cells[0], "aliases": cells[1],
-            "scope": cells[2],   # \| 已在分割时反转义
-            "exclusion": cells[3], "path": cells[4], "revision": cells[5],
-            "visibility": cells[6],
-        })
-    return rows
+    """Parse MOD_INDEX.md via the shared _mod_catalog parser, returning dicts."""
+    return [index_entry_to_dict(e) for e in parse_mod_index(path.read_text(encoding="utf-8"))]
 
 
 def explicit_mod_mentions(entries: list[dict], task: str) -> list[str]:
@@ -148,28 +145,12 @@ def parse_mod_file(mods_dir: Path, path: str) -> dict:
 
 
 def parse_rule_table(text: str) -> list[dict]:
-    """解析 MOD 文件的六列规则表 (| Rule ID | Group | Gate | Description |
-    Applies to | Notes |) 为结构化列表 — 两段加载第二段的规则载体: 提名输出
-    **不含**完整规则集; 用户裁决后经 load_rules_for_selected_mod() 从 MOD
-    文件全文解析, 注入 FillSpec 撰写上下文 (映射/公式链/路由/继承/校验规则),
-    不再猜测映射关系。"""
-    rows = []
-    for line in text.splitlines():
-        if not line.startswith("|"):
-            continue
-        cells = [c.strip().replace(r"\|", "|")
-                 for c in re.split(r"(?<!\\)\|", line.strip("|"))]
-        if len(cells) < 5 or cells[0] in ("Rule ID", "---"):
-            continue
-        if re.fullmatch(r"[A-Z]+(?:-[A-Z]+)?-\d{3}", cells[0]):
-            rows.append({
-                "id": cells[0], "group": cells[1] if len(cells) > 1 else "",
-                "gate": cells[2] if len(cells) > 2 else "",
-                "description": cells[3] if len(cells) > 3 else "",
-                "applies_to": cells[4] if len(cells) > 4 else "",
-                "notes": cells[5] if len(cells) > 5 else "",
-            })
-    return rows
+    """Parse rule table via the shared _mod_catalog parser, returning dicts.
+
+    Accepts both R01 and RTE-001 Rule ID formats (per MOD_TEMPLATE.md).
+    No Rule ID format restriction — _mod_catalog.parse_mod_rules accepts any ID.
+    """
+    return [rule_to_dict(r) for r in parse_mod_rules(text)]
 
 
 def load_rules_for_selected_mod(mods_dir: Path, path: str) -> list[dict]:
