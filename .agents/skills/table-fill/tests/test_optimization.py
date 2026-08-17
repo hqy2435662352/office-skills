@@ -1607,6 +1607,87 @@ class MultiBlockTests(unittest.TestCase):
             self.assertEqual(e_formulas, ["A8*2", "A13*2"])
 
 
+class SourceConsumptionUniquenessTests(unittest.TestCase):
+    """Issue 05: (source, original_row) 全局恰好一次 — 跨块/跨源条目重复消费
+    编译期拒绝 (fail-closed); 单消费 (MultiSource/MultiBlock 既有场景) 不回归."""
+
+    def _two_blocks_same_source_spec(self, wd, sel_a, sel_b) -> dict:
+        spec = spec_with(wd)
+        block_template = {
+            "clone_roles": [
+                {"role": "spacer"},
+                {"role": "title", "template_row": 1, "value": "块标题"},
+                {"role": "header", "template_row": 2},
+                {"role": "data", "template_row": 3},
+            ],
+        }
+        b1 = dict(block_template, rows={"source": "source_maoli",
+                                        "selectors": sel_a})
+        b2 = dict(block_template, rows={"source": "source_maoli",
+                                        "selectors": sel_b})
+        spec["mapping"]["targets"][0]["blocks"] = [b1, b2]
+        spec["validation"]["key_outputs"] = ["A8", "A13"]
+        return spec
+
+    def test_two_blocks_overlapping_selectors_rejected(self):
+        """两个 block 的 selectors 命中同一源行 → SOURCE_ROW_CONSUMED_TWICE
+        (缺陷码 + corrective_action), 不再静默重复消费."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = self._two_blocks_same_source_spec(
+                wd, [{"column": "A", "pattern": "家用*"}],
+                [{"column": "A", "pattern": "家用*"}])
+            from io import StringIO
+            buf = StringIO()
+            old = sys.stderr
+            sys.stderr = buf
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    compile_fill.compile_spec(spec, wd["manifest"], tmp)
+                self.assertEqual(ctx.exception.code, 3)
+            finally:
+                sys.stderr = old
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload["code"], "SOURCE_ROW_CONSUMED_TWICE")
+            self.assertIn("source_maoli_flat.csv", payload["message"])
+            self.assertIn("101", payload["message"])
+            self.assertTrue(payload.get("corrective_action"))
+
+    def test_same_block_two_sources_entries_overlapping_rejected(self):
+        """同一块 rows.sources 两个条目选中同一源行 → SOURCE_ROW_CONSUMED_TWICE."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = spec_with(wd)
+            spec["mapping"]["targets"][0]["rows"] = {
+                "sources": [
+                    {"source": "source_maoli",
+                     "selectors": [{"column": "A", "pattern": "家用*"}]},
+                    {"source": "source_maoli",
+                     "selectors": [{"column": "A", "pattern": "家用*"}]},
+                ],
+            }
+            codes = compile_fail_codes(wd, spec)
+            self.assertIn("SOURCE_ROW_CONSUMED_TWICE", codes)
+
+    def test_disjoint_selectors_across_blocks_still_compiles(self):
+        """块间 selectors 不相交 (家用* vs 商用*) → 编译通过, row_map 每行唯一."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = self._two_blocks_same_source_spec(
+                wd, [{"column": "A", "pattern": "家用*"}],
+                [{"column": "A", "pattern": "商用*"}])
+            plan = compile_fill.compile_spec(spec, wd["manifest"], tmp)
+            pairs = [(s, o) for s, o, _ in plan["row_map"]]
+            self.assertEqual(len(pairs), len(set(pairs)))
+            self.assertEqual(len(pairs), 3)  # 家用×2 (block1) + 商用×1 (block2)
+
+
 class InplacePositionModelTests(unittest.TestCase):
     """ADR 0007 position-model boundary: inplace reuse / trim / hybrid overflow /
     group_merges / sets / props."""

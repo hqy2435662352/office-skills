@@ -33,6 +33,7 @@
 | **selectors 用目标列数校验 (2026-08-12)** | 27 列源表进 6 列目标时报 `selector column 'L' out of range` | selector 校验误用目标 dims.cols | Compiler 已改按**源表实际宽度**校验 selector 列 |
 | **MOD 自动裁决 fail-open (2026-08-17)** | marker/dimension_set 信号 missed 或未知排除条件时 MOD 仍自动 resolved → 错误业务规则进入 FillSpec | `signal_matched` 把「有 digest 文本」当 dimension_set 命中, `resolve` 终态只查 hit/pending 从不读 missed, 未知排除 `continue` 默认放行 | `resolve()` fail-closed: `missed` 非空 → ambiguous (询问用户); 未知排除 → `pending_exclusions` → ambiguous; `dimension_set` 按 digest 表头角色事实核对 (可验证时真 hit/miss, 未喂 digest → pending); 唯一豁免 = 用户显式指定 MOD (用户裁决优先, 排除冲突仍触发) |
 | **readback 字母数字标识误判数值 (2026-08-17)** | SKU/型号/Z 码写错未被 readback 拦截: `Z001` vs `X001` 都归一成 1.0 通过, `SN-001` 归一成 −1.0 | 旧归一化先 `re.sub` 删一切非 `[0-9+-.]` 字符再 `float()` — 字母数字标识被剥成纯数字 | 归一化只认真数值字面量: 剥离 `,`/`%`/货币符号后**整体**必须是合法十进制数, 含字母 → `number_normalized()` 返回 None → 文本精确比较 (见 FILLSPEC Q10) |
+| **跨块重复消费源行 (2026-08-17)** | 两个 block 的 selectors 命中同一源行 → 数据行翻倍 (数量/金额/聚合翻倍), coverage 仍显示通过 | 编译器只做逐块/逐源覆盖**存在性**检查 (覆盖下限, 非唯一性上限): 同一 `(source, original_row)` 可在多个块/多源条目中被重复消费 | 编译器现以 `SOURCE_ROW_CONSUMED_TWICE` (exit 3) 编译拒绝 — 每条被消费的源记录**恰好一次**, 无显式复用语法 (默认 fail-closed); 收窄 selectors (pattern/not_pattern/not_value) 或拆源消除重叠 (见 FILLSPEC Q17) |
 
 ## spike 四坑 (pptx 合并 lowering)
 

@@ -232,6 +232,10 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 - `required_coverage`: 关键源行必须被消费 (编译失败而非警告)。
   `rows` 引用**展平 CSV 的原始行号** (CSV 每行最后一列携带的源表行号),
   不是目标 sheet 行号。
+- **恰好一次不变量 (2026-08-17)**: 每条被消费的 `(源, 原始行)` 在整个 plan
+  中**全局唯一** — 跨 block / 同一块内 `rows.sources` 多个条目的 selectors
+  命中同一源行 → 编译拒绝 `SOURCE_ROW_CONSUMED_TWICE` (exit 3, 默认
+  fail-closed, 无显式复用语法; 见 Q17)。
 - `key_outputs`: Gate/readback 的采样格。必须是 plan 实际写入的格
   (值/公式/空皆可) — 指向未写入的格 → 编译失败 (KEY_OUTPUT_UNWRITTEN)。
 - `required_empty`: 额外 EMPTY 断言 (rarely needed — nulls 已覆盖大多数)。
@@ -478,6 +482,19 @@ formulas:
   同步由 repair 脚本自动完成, 唯一手工动作 = 更新 spec 指纹 + 重编译。
 - 注意: `repair_row_gaps.py` 修复后若仍报空洞 (复见), 先查 `officecli close`
   刷盘 (脚本已内置), 再查 staged 文件是否被后续 flatten 覆盖过。
+
+### Q17: 多个块 (或多源条目) 的 selectors 选中同一源行怎么办?
+
+| 情形 | 行为 |
+|---|---|
+| 两个 block 的 selectors 命中同一源行 (或同一块内 `rows.sources` 两个条目选中同一行) | ❌ `SOURCE_ROW_CONSUMED_TWICE` (exit 3) — 数据行/数量/金额/聚合翻倍但 coverage 仍显示通过, 编译器现做 `(source, original_row)` 全局唯一性检查并拒绝 |
+| 各块 (各条目) 的 selectors 不相交 — 每个源行至多被一个块消费 | ✅ 编译通过 |
+
+- 规则: **默认 fail-closed** — 每条被消费的 `(源, 原始行)` 全 plan 全局唯一,
+  且目前**没有** `reuse`/`repeat`/`multi` 显式复用语法。selectors 重叠必须
+  通过收窄 `pattern` / `not_pattern` / `not_value` 消除 (或把行拆到不同源)。
+  若未来出现"同一源行要进入两个目标位置"的真实业务需求, 需先新增显式复用
+  声明语法 (另开 ticket), 不允许静默重复消费。
 
 ## 执行顺序保证 (Execution Order Contract)
 
