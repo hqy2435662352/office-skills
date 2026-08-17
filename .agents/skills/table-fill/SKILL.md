@@ -341,8 +341,10 @@ python scripts/execute_batch.py --plan execution_plan.json \
    `officecli close` 刷盘 — resident 延迟写被 taskkill 会丢尾部 chunk)。
 3. `officecli validate` **先于** issue delta (validate 刷新编辑并强制公式求值)。
 4. issue delta vs 模板基线 — 只认**新增** issue (模板自带基线 issue 是噪音)。
-5. readback 全部由 Compiler 派生 — 值比较做数字归一化 (容忍
-   `138.00` vs `138`), 公式格断言非空, nulls 断言 EMPTY。**禁止手写 checks**。
+5. readback 全部由 Compiler 派生 — 值比较做数字归一化,**但只限真数值形态**
+   (容忍 `138.00` vs `138`、`$1,234.5` vs `1234.5`、`12.5%`); 字母数字标识
+   (SKU/型号/Z 码) 按文本精确比较, 写错必须被拦截。公式格断言非空,
+   nulls 断言 EMPTY。**禁止手写 checks**。
    Readback 用单次范围 get 批量读取 (179 格 ≈ 1s, 而非逐格 ~90s)。
 6. **结构 readback (v2.5)**: 最终行数断言 (FINAL_ROW_COUNT_MISMATCH) + group_merges
    边界断言 (GROUP_BOUNDARY_MISMATCH — validate 对合并残留视而不见)。

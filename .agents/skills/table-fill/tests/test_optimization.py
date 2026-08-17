@@ -14,6 +14,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 import compile_fill  # noqa: E402
+import execute_batch  # noqa: E402
 import mod_nominate  # noqa: E402
 import promote_output  # noqa: E402
 from _mod_catalog import parse_mod_index  # noqa: E402
@@ -3999,6 +4000,64 @@ class DocCoverageGuardTests(unittest.TestCase):
         row = m.group(0)
         for word in ("整行双引号包裹", "SPEC_NON_STRING_ITEM", "corrective_action"):
             self.assertIn(word, row)
+
+
+class ReadbackNormalizationTests(unittest.TestCase):
+    """Q10 readback value 断言: 数值归一化只适用于真数值形态; 字母数字标识
+    (SKU/型号/Z 码) 一律按文本精确比较 (issue 04 — 阻止 Z001 vs X001 误判相等)."""
+
+    def _check(self, expected: str, actual: str, kind: str = "value") -> dict | None:
+        """readback 断言最小面: read_map 命中即不触碰文件系统 (book 不打开)."""
+        return execute_batch.check_expectation(
+            Path("unused.xlsx"), "/S/A1", kind, expected,
+            {"/S/A1": actual})
+
+    def test_number_normalized_rejects_non_numeric_literals(self):
+        """Z001 / SN-001 / ABC123 等字母数字标识不是数值字面量 → None
+        (禁止归一化把 SN-001 变成 -1.0、Z001/X001 都变成 1.0); 指数/NaN
+        形态同样不归一化 (保守方向: 拿不准就文本比较)."""
+        for s in ("Z001", "X001", "SN-001", "ABC123", "1e5", "NaN"):
+            self.assertIsNone(execute_batch.number_normalized(s),
+                              f"{s!r} 不应被数值归一化")
+
+    def test_number_normalized_accepts_true_numeric_forms(self):
+        """真数值形态 (含货币/千分位/百分比装饰与前导符号) 仍归一化."""
+        cases = {"138.00": 138.0, "138": 138.0, "$1,234.5": 1234.5,
+                 "1,234.50": 1234.5, "-45.2%": -45.2, "12.5%": 12.5,
+                 " 12 ": 12.0, "+12": 12.0, ".5": 0.5}
+        for s, want in cases.items():
+            self.assertEqual(execute_batch.number_normalized(s), want, s)
+
+    def test_alphanumeric_id_mismatch_readback_fails(self):
+        """Z001 vs X001 → 文本精确比较 → 失败 (不再归一化为 1.0 误判相等)."""
+        failure = self._check("Z001", "X001")
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure["expected"], "Z001")
+        self.assertEqual(failure["actual"], "X001")
+
+    def test_sn_style_id_exact_text_compare(self):
+        """SN-001 类标识按文本精确比较: 相同通过, 不同失败."""
+        self.assertIsNone(self._check("SN-001", "SN-001"))
+        failure = self._check("SN-001", "SN-002")
+        self.assertIsNotNone(failure)
+
+    def test_numeric_forms_still_normalize_pass(self):
+        """真数值形态差异仍被容忍: 138.00 vs 138、$1,234.5 vs 1234.5、百分比."""
+        self.assertIsNone(self._check("138.00", "138"))
+        self.assertIsNone(self._check("$1,234.5", "1234.5"))
+        self.assertIsNone(self._check("12.5%", "12.5"))
+
+    def test_numeric_mismatch_still_fails(self):
+        """真数值形态的真正差异仍失败 (容差不掩盖差异)."""
+        self.assertIsNotNone(self._check("138.00", "139"))
+        self.assertIsNotNone(self._check("$1,234.5", "1,235"))
+
+    def test_empty_nonempty_kinds_unaffected(self):
+        """empty/nonempty 断言不经过数值归一化, 行为不变."""
+        self.assertIsNone(self._check("", "", kind="empty"))
+        self.assertIsNotNone(self._check("", "X", kind="empty"))
+        self.assertIsNone(self._check("x", "SN-001", kind="nonempty"))
+        self.assertIsNotNone(self._check("x", "", kind="nonempty"))
 
 
 class ModCatalogIndexTests(unittest.TestCase):

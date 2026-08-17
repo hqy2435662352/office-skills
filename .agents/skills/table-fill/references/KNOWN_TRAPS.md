@@ -32,6 +32,7 @@
 | **resident 延迟写被 taskkill 丢尾部 chunk (2026-08-12)** | readback 全过但最终文件缺最后一批值 (如 13 行填了前 8 行) | 坐标探针 `officecli get` 启动 resident 后, 后续 batch 在内存中应用、磁盘写延迟到 save/close/idle；结尾 `clean_residents()` taskkill 把未刷盘的 chunk 丢了 | `execute_batch.py` 已在 chunk 循环尾部与主流程结尾显式 `officecli close` 刷盘 (无 resident 时 close 是 no-op)；遇此症状先重跑执行并核对 `_draft_failure.json` |
 | **selectors 用目标列数校验 (2026-08-12)** | 27 列源表进 6 列目标时报 `selector column 'L' out of range` | selector 校验误用目标 dims.cols | Compiler 已改按**源表实际宽度**校验 selector 列 |
 | **MOD 自动裁决 fail-open (2026-08-17)** | marker/dimension_set 信号 missed 或未知排除条件时 MOD 仍自动 resolved → 错误业务规则进入 FillSpec | `signal_matched` 把「有 digest 文本」当 dimension_set 命中, `resolve` 终态只查 hit/pending 从不读 missed, 未知排除 `continue` 默认放行 | `resolve()` fail-closed: `missed` 非空 → ambiguous (询问用户); 未知排除 → `pending_exclusions` → ambiguous; `dimension_set` 按 digest 表头角色事实核对 (可验证时真 hit/miss, 未喂 digest → pending); 唯一豁免 = 用户显式指定 MOD (用户裁决优先, 排除冲突仍触发) |
+| **readback 字母数字标识误判数值 (2026-08-17)** | SKU/型号/Z 码写错未被 readback 拦截: `Z001` vs `X001` 都归一成 1.0 通过, `SN-001` 归一成 −1.0 | 旧归一化先 `re.sub` 删一切非 `[0-9+-.]` 字符再 `float()` — 字母数字标识被剥成纯数字 | 归一化只认真数值字面量: 剥离 `,`/`%`/货币符号后**整体**必须是合法十进制数, 含字母 → `number_normalized()` 返回 None → 文本精确比较 (见 FILLSPEC Q10) |
 
 ## spike 四坑 (pptx 合并 lowering)
 
