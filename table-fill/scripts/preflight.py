@@ -19,6 +19,29 @@ import os, sys, json, argparse, subprocess, stat
 from pathlib import Path
 
 
+def check_python_version():
+    """Verify Python >= 3.10 (PEP 604 unions, slots=True, PEP 585 generics).
+
+    Source audit (2026-08-17): full scan confirmed actual floor = 3.10.
+    - PEP 604 unions (X | Y, runtime-evaluated): structure_digest.py, mod_nominate.py
+      (no __future__ annotations import)
+    - dataclass(slots=True) (3.10 param): _mod_catalog.py, mod_capture.py
+    - PEP 585 builtin generics (list[], dict[]): note_phase.py, stage_files.py, etc.
+    - No 3.11+ features found (no match statements, no zip(strict=),
+      no str.removeprefix/removesuffix, no typing 3.11+ features).
+    """
+    if sys.version_info >= (3, 10):
+        return None
+    return {
+        "code": "PYTHON_VERSION_TOO_LOW",
+        "message": (
+            f"Python {sys.version_info.major}.{sys.version_info.minor} detected; "
+            "3.10+ is required (PEP 604 unions, dataclass(slots=True), PEP 585 generics)."
+        ),
+        "corrective_action": "Upgrade Python to 3.10 or later."
+    }
+
+
 def check_ascii_path(workdir):
     """officecli batch/set fails on Chinese paths on Windows. Require ASCII."""
     try:
@@ -107,6 +130,13 @@ def main():
     args = parser.parse_args()
 
     issues = []
+
+    # Check 0: Python version (must be first — other checks may use 3.10+ syntax)
+    result = check_python_version()
+    if result:
+        issues.append(result)
+        print(json.dumps({"status": "FATAL", "issues": issues}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
 
     # Check 1: ASCII path
     result = check_ascii_path(str(args.workdir))

@@ -17,7 +17,7 @@ description: >
   after Layer 3 is MANDATORY — do not proceed to Layer 4 until the user confirms.
 license: MIT
 compatibility: >
-  Required: officecli (on PATH), Python 3.8+
+  Required: officecli (on PATH), Python 3.10+
   All read/write goes through officecli. No openpyxl, no pandas, no python-pptx in the pipeline.
   Must co-load: officecli-xlsx (for path syntax, open/save lifecycle, batch patterns, QA gates)
   Recommended: officecli-win (for Windows subprocess encoding workaround)
