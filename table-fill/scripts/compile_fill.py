@@ -2622,7 +2622,12 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             defects.append({"code": "KEY_OUTPUT_UNWRITTEN", "path": path,
                             "message": f"key_output {path} is never written by this plan",
                             "corrective_action": "Reference a cell that the mapping fills "
-                                                 "(or a formula cell)"})
+                                                 "(or a formula cell); row numbers can be "
+                                                 "taken straight from this plan's "
+                                                 "blocks[].data_start / merge & aggregate "
+                                                 "anchor cells, or from combination_patterns "
+                                                 "skeleton key_output slots — don't "
+                                                 "hand-derive template rows"})
     if defects:
         fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
              "Fix the spec and re-run compile_fill.py", defects)

@@ -148,13 +148,16 @@ mapping:
     - sheet: 11_FRESH本土
       base_last_row: 21
       columns: [...]            # 公共配置放 target 级 (可选)
-      formulas: [...]
+      formulas:
+        per_row: {...}          # 公共 per_row 公式链 (target 级, 可选)
       merges: [...]
       nulls: [...]
       blocks:                   # 缺省时 = 单个隐式块 (旧行为, 向后兼容)
         - clone_roles: [spacer, title←17, header←18, data←10]
           rows: {source: <家用展平名>, selectors: [...]}
-          # columns/formulas/merges/nulls 缺省继承 target 级, 只写差异
+          # columns/merges/group_merges/nulls 缺省继承 target 级, 只写差异
+          # ⚠ formulas 例外: 块级一旦声明 formulas, 其 per_row 不继承 target 级
+          #   (整体取代), 必须整段携带共享 per_row (见下方继承契约 + 反例警示)
           formulas: {aggregates: [...]}   # 块内聚合 rows "1:{n}", {n}=块内行数
           merges: [...]
         - clone_roles: [spacer, title←17, header←18, data←10]
@@ -164,10 +167,56 @@ mapping:
 
 - 每块独立: clone_roles 布局、rows 匹配、聚合/合并/置空、标题值; 块间行号由
   Compiler 从 base_last_row 顺序推进 (块1 数据行 → 块2 spacer/title/header/data)。
-- **公共配置继承**: 块的 columns/formulas/merges/nulls/remove_rows 缺省继承
-  target 级同名配置 — 两块共享的列映射/公式链只写一次, 块内只写差异。
+- **公共配置继承**: 块的 columns/merges/group_merges/nulls/remove_rows 缺省继承
+  target 级同名配置 — 两块共享的列映射/合并/置空只写一次, 块内只写差异。
+- **块级 `formulas` 是例外 (取代而非继承)**: 块级一旦声明 `formulas`，其
+  `per_row` **不继承** target 级、必须整段携带；只有块级**不声明** `formulas`
+  才缺省继承 target 级 formulas (含 per_row)。这正是「只写差异」措辞的误导点 —
+  它只对 columns/merges/nulls/group_merges 成立, 对 `formulas` 不成立。
 - {n} 在块内 = 该块数据行数; 聚合/合并范围不得越过块边界。
 - PPTX 目标仅支持单块。
+
+#### 正反对照: 块级 `formulas` 取代 vs 继承
+
+| 形态 | 代码 | 块内结果 |
+|---|---|---|
+| ✅ 正确 — 块级要加自己的聚合、又要共享 target 级 per_row | 块级 `formulas:` 同时含 `per_row` (整段携带) + `aggregates` | 两块共享 per_row + 各自的 aggregates 都生效 |
+| ✅ 正确 — 块级完全不用公式 | 块级**不写** `formulas` | 缺省继承 target 级 per_row/aggregates |
+| ❌ 错误 — 只写差异 (只写 aggregates) | 块级 `formulas: {aggregates: [...]}` 不含 per_row | **target 级 per_row 被整体取代**、块内消失 — 共享公式链漏写, 编译能通过但缺公式 |
+
+```yaml
+# ✅ 正例: 块级要加聚合、又要共享 target 级 per_row → 整段携带 per_row
+blocks:
+  - rows: {source: <家用>}
+    formulas:
+      per_row: {O: "IFERROR(ROUND(J{r}-K{r}-L{r}-M{r}-N{r},2),0)", U: "IFERROR(IF(S{r}=0,0,T{r}/S{r}),0)"}
+      aggregates: [{col: V, rows: "1:{n}", formula: "SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2})", style: anchor}]
+
+# ✅ 正例: 块级不用公式 → 不写 formulas, 自动继承 target 级 per_row
+blocks:
+  - rows: {source: <家用>}          # 无 formulas → 继承 target 级 per_row
+
+# ❌ 反例: 块级只写聚合、漏写共享 per_row → target 级 per_row 被取代、块内消失
+blocks:
+  - rows: {source: <家用>}
+    formulas:
+      aggregates: [{col: V, rows: "1:{n}", formula: "SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2})", style: anchor}]
+      # 没有 per_row → 块的每行只有聚合, 没有 O/U 公式 (不被"缺省继承"补回)
+```
+
+#### 反例警示 (blocks 段)
+
+1. **block 顶层 `aggregates:` / `merges:` / `per_row:` / `group_aggregates:` →
+   `BLOCK_KEY_STRUCTURE_INVALID` (exit 3, 不再静默)** — 聚合/公式类声明必须写
+   在 `formulas:` 之下 (`formulas.aggregates` / `formulas.per_row` /
+   `formulas.group_aggregates`)。旧行为把这些错位键**静默丢弃** (编译通过、plan
+   无对应操作 — 只有读 mapping.md 才发现), 现编译期拒绝并点名正确嵌套。
+2. **块级 `formulas` 整体取代, 不是合并** — 见上方取代契约: 块级声明 formulas
+   即整段使用, target 级 per_row 不再继承 ("只写差异" 对 formulas 不成立)。
+3. **`group_by` 对稀疏源列不建组** — 连续同值段才成组; 若目标列某组**仅组首行
+   有值** (源列稀疏: 首行写值、其余行空), 物化的值序列是 `[V, "", "", ...]`,
+   空不连续 → 该组**不建立**连续同值段、不建合并/不落组聚合。需让映射列每行
+   物化出连续同值 (先填充组值或用列映射逐行物化) 才可分组。
 
 ### rows: 单源与多源合并
 
@@ -200,7 +249,35 @@ required_coverage 按源分别声明 (source 填展平 name 或 csv 名)。
 **已映射列无需再进 `nulls`**: 列映射逐行写值 (含空源值写空串), 已覆盖残留;
 `nulls` 只用于**没有列映射但克隆携带旧值**的列 (如连接管 "/" 占位)。
 
-transforms 支持 `regex_replace` (pattern/replacement) 与 `strip`; 另有内置数值舍入 `round2`/`round4` (消除 15 位成本值的执行期溢出)。列映射可设 `precision: keep` 显式接受长精度值。
+transforms 说明: **内建数值变换仅 `round2` / `round4`** (消除 15 位成本值的
+执行期溢出) — 直接写 `transform: round2` / `transform: round4` 即可用 (也支持
+链式 `transforms: [round4, ...]` 组合)。`strip` / `regex_replace` **不是内建**,
+必须先定义在 `mapping.transforms` 才可在列映射里按名引用; 直接写
+`transform: strip` 属命名态、未定义 → `TRANSFORM_UNKNOWN` (corrective_action:
+Define it in mapping.transforms)。最小定义示例:
+
+```yaml
+mapping:
+  transforms:                      # 先定义命名 transform, 列映射才可按名引用
+    - name: strip_sku
+      function: strip
+    - name: norm_model
+      function: regex_replace
+      pattern: "[-_ ]+"
+      replacement: ""
+  targets:
+    - sheet: 11_FRESH本土
+      base_last_row: 21
+      columns:
+        - source: B
+          target: A
+          transform: strip_sku        # 引用 mapping.transforms 里定义的 strip
+        - source: F
+          target: C
+          transforms: [norm_model, round4]   # 链式: 先 regex 再内置 round4
+```
+
+列映射可设 `precision: keep` 显式接受长精度值 (需列宽实测背书, 见 Q7)。
 
 ### lookups
 
@@ -226,6 +303,14 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
   **ROUND 精准原则**: 只加在减法/乘法/除法/SUM 聚合 (O/S/T 用 ROUND(...,2),
   比率 U/V/W 用 ROUND(...,4)); 纯加法 (R=P+Q) 不加 — 加法加 ROUND 会截断
   结算价精度, 放大毛利 (实测 168.7151→168.72, 毛利漂移 18.37)。
+- **ROUND 优先序 (比 officecli-xlsx 复刻视角优先)**: 新增数据块 (含块级
+  aggregates / per_row) 的**派生数值公式**一律按 table-fill ROUND 精准原则写
+  (减法/乘法/除法 ROUND2、比率 ROUND4、纯加法不加), **即使模板既有公式没有
+  ROUND、即使 officecli-xlsx「preserve existing templates」建议精确复刻**
+  — table-fill 的 ROUND 精准原则优先 (办公套件复制旧公式不产生 ROUND, 但
+  table-fill 的目标是防浮点残值 text overflow)。`text_overflow` 属 REPAIR
+  预期路径 (FAILURE_CLASSES standard_fix 已覆盖): 命中时按 ROUND 精准原则
+  修, 不是未知能力探测。
 
 ### validation 三件套
 
@@ -238,6 +323,10 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
   fail-closed, 无显式复用语法; 见 Q17)。
 - `key_outputs`: Gate/readback 的采样格。必须是 plan 实际写入的格
   (值/公式/空皆可) — 指向未写入的格 → 编译失败 (KEY_OUTPUT_UNWRITTEN)。
+  **行号不用手工重推**: 直接取上次 compile 产出的 `execution_plan.json`
+  `blocks[].data_start` (每块数据首行) 及聚合/合并锚点格 (聚合元数据的
+  `rows` 映射、group 锚点 = 各组首行、1:{n} 合并锚点 = 块首行) — 模板行号
+  由 Compiler 顺序推进, 手工推导必然漂移 (Case 06 E4 的教训)。
 - `required_empty`: 额外 EMPTY 断言 (rarely needed — nulls 已覆盖大多数)。
 
 ## 组合行为契约 (问题组织式)
@@ -734,7 +823,7 @@ digest, 不要 unzip sheet XML 考古。
 | CLONE_RESIDUE_UNHANDLED | template_row 携带某列值但未覆盖 | 加 columns mapping 或 nulls |
 | DUPLICATE_TARGET_WRITE | 同一格被写两次 | 检查 columns/nulls/formulas/group/sets 重叠 |
 | MERGE_RANGE_INVALID / AGG_RANGE_INVALID | 范围越过数据块 | 用 `1:{n}` (聚合); group_aggregates 的组范围由数据派生, 越块是编译器内部不变量守卫 (观测契约: 公式范围恒在块内, 埃及等价用例断言) |
-| KEY_OUTPUT_UNWRITTEN | key_outputs 指向未写格 | 换成被写的格 |
+| KEY_OUTPUT_UNWRITTEN | key_outputs 指向未写格 | 换成被写的格 — 行号直接取 last compile 的 `execution_plan.json` `blocks[].data_start` 及聚合/合并锚点格 (模板行号由 Compiler 推进, 不手工重推; 见 validation 三件套 / combination_patterns 骨架的 key_output 落点) |
 | NUMERIC_OVERFLOW_RISK | 直接值 >4 位小数 / >12 位有效数字 (成本 15 位精度) | 加 `transform: round4` 或 `precision: keep` |
 | PRECISION_KEEP_NARROW_COLUMN | `precision: keep` 列最宽渲染值超出 prepare 实测列宽 (meta.column_width) | 改用 `transform: round4` (或加宽列) — keep 需要列宽实测背书 |
 | PRECISION_KEEP_WIDTH_UNVERIFIED | `precision: keep` 但 meta 无列宽 (旧 prepare 产物, 警告不阻断) | 重跑 prepare_run --flatten 采集列宽, 或改用 round4 |

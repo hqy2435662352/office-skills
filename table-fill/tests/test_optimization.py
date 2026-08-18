@@ -4522,6 +4522,96 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("formulas", row)
         self.assertIn("不再静默", row)
 
+    # ── issue 02: 文档契约硬化 (blocks 继承/取代 + transforms + key_outputs ──
+    #    + 机器证据终止 + ROUND 优先序 + 结构缺陷预算) ──
+
+    def test_fillspec_blocks_formulas_replace_contract_word(self):
+        """FILLSPEC blocks 段: 块级声明 `formulas` 即整体取代而非合并 target 级
+        per_row — "取代" 措辞 + "必须整段携带" 继承契约必须在 (ID-4)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^### blocks:.*?(?=^### )", text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "FILLSPEC 缺 blocks 小节")
+        section = re.sub(r"\s+", "", m.group(0))  # 跨行折行不破坏断言
+        for word in ("取代", "整段携带", "每行物化"):
+            self.assertIn(word, section, f"blocks 段缺 {word!r}")
+
+    def test_fillspec_blocks_counterexample_warnings(self):
+        """FILLSPEC blocks 段反例警示: 反例警示标题 + 静默丢弃回退措辞 +
+        BLOCK_KEY_STRUCTURE_INVALID / group_by 稀疏源列不建组 (ID-4 反例)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^### blocks:.*?(?=^### )", text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "FILLSPEC 缺 blocks 小节")
+        section = m.group(0)
+        self.assertIn("反例警示", section)
+        self.assertIn("静默丢弃", section)
+        self.assertIn("BLOCK_KEY_STRUCTURE_INVALID", section)
+        self.assertIn("稀疏源列", section)
+
+    def test_fillspec_transforms_builtin_only_round(self):
+        """FILLSPEC transforms 修正: 内建数值变换仅 round2/round4, strip/regex
+        需在 mapping.transforms 定义 (ID-9 — 防"transforms 支持 strip"诱导向
+        回退)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^transforms 说明:.*?(?=^### )", text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "找不到 transforms 说明段")
+        section = re.sub(r"\s+", "", m.group(0))  # 内嵌代码反引号/折行无关
+        for word in ("内建数值变换仅", "round2", "round4", "不是内建",
+                     "mapping.transforms", "regex_replace", "strip_sku"):
+            self.assertIn(word, section, f"transforms 说明缺 {word!r}")
+
+    def test_fillspec_key_outputs_data_start_word(self):
+        """FILLSPEC key_outputs 说明: 行号可直接取 plan blocks[].data_start,
+        不手工重推 (ID-8 — 防回归到手工行号推导)."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        self.assertIn("blocks[].data_start", text)
+        self.assertIn("不手工重推", text)
+        table = self._error_code_table()
+        m = re.search(r"^\|\s*KEY_OUTPUT_UNWRITTEN.*$", table, re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 KEY_OUTPUT_UNWRITTEN 行")
+        self.assertIn("data_start", m.group(0))
+
+    def test_skill_md_machine_evidence_termination(self):
+        """SKILL.md 机器证据终止条件: execute 已返回机器证据后禁止 officecli
+        issues / 读 execution_plan.json 人工复核; 唯一例外 = 异常驱动的定向
+        officecli get ≤2 (ID-5, 防 E5/E6 冗余复核回退)."""
+        text = self._skill_md_text()
+        self.assertIn("机器证据终止条件", text)
+        self.assertIn("officecli", text)
+        self.assertIn("issues", text)
+        self.assertIn("execution_plan.json", text)
+        self.assertIn("异常驱动的定向检查", text)
+        self.assertIn("禁止", text)
+
+    def test_skill_md_structure_defect_budget(self):
+        """SKILL.md 结构/层级缺陷预算: Compile 结构类缺陷 (KEY_OUTPUT_UNWRITTEN /
+        CLONE_RESIDUE_* / block 结构) 默认第一轮先查 combination_patterns 找
+        模式, 而非自由改 spec 重编译 (ID-6, 压缩 E4 3次→1次)."""
+        text = self._skill_md_text()
+        self.assertIn("结构/层级缺陷预算", text)
+        self.assertIn("KEY_OUTPUT_UNWRITTEN", text)
+        self.assertIn("CLONE_RESIDUE", text)
+        self.assertIn("combination_patterns.yaml", text)
+
+    def test_skill_and_fillspec_round_precedence(self):
+        """SKILL.md 与 FILLSPEC 公式约定: ROUND 优先序 — 即使模板既有公式无
+        ROUND、即使 officecli-xlsx preserve 建议复刻, table-fill ROUND 精准原则
+        优先 (ID-7); text_overflow 属 REPAIR 预期路径."""
+        skill = self._skill_md_text()
+        self.assertIn("ROUND 优先序", skill)
+        self.assertIn("preserve existing", skill)
+        self.assertIn("REPAIR", skill)
+        fillspec = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        self.assertIn("ROUND 优先序", fillspec)
+        self.assertIn("preserve existing", fillspec)
+
     def test_known_traps_row_gap_auto_resync(self):
         """KNOWN_TRAPS 沉淀行洞修复机械事实: 行洞修复 = staged 文件修改 =
         指纹必然变化; repair 脚本自动重算, Agent 不再手工同步."""

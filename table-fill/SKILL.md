@@ -245,6 +245,12 @@ Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_templa
 SUM 聚合 (如 O/S/T 用 ROUND(...,2), 比率 U/V/W 用 ROUND(...,4)); 无残值的
 纯加法 (如 R 结算价=P+Q) 保持原式 — 给加法加 ROUND 会把 168.7151 截成
 168.72, 毛利 (O−R)×数量 被放大 (实测漂移 18.37)。
+**ROUND 优先序 (比 officecli-xlsx 复刻视角优先)**: 新增数据块 (含块级
+aggregates/per_row) 的**派生数值公式**一律按上面 table-fill ROUND 精准原则写,
+**即使模板既有公式无 ROUND、即使 officecli-xlsx「preserve existing
+templates」建议精确复刻** — table-fill 的 ROUND 精准原则优先。`text_overflow`
+属 REPAIR 预期路径 (FAILURE_CLASSES standard_fix), 命中按 ROUND 精准原则修,
+不是未知能力探测。
 
 **精度约定**: 直接写入的数值若 >4 位小数或 >12 位有效数字 (如源面价
 `168.715100569657`), Compiler 在**编译期**报 `NUMERIC_OVERFLOW_RISK` —
@@ -340,6 +346,14 @@ python scripts/compile_fill.py --spec fill_spec.yaml --workdir <dir>
 - required gaps 已显式记录 (spec.gaps)
 - 目标路径来自结构摘要 — base_last_row / 列字母不得超出 digest 维度
 - FillSpec fingerprint 与当前输入匹配 (stale spec → 拒绝)
+
+**结构/层级缺陷预算 (硬性)**: Compile 返回的缺陷属**结构/层级类** —
+`KEY_OUTPUT_UNWRITTEN`、`CLONE_RESIDUE_*`、`BLOCK_KEY_STRUCTURE_INVALID`、
+block/继承/合并结构、静默丢弃候选 — 时, **默认第一轮先查
+`combination_patterns.yaml` / FILLSPEC「组合行为契约」对应 Q, 找可复制的
+模式/骨架** (改列名即用), 而不是自由改 spec 再 compile 碰运气 (Case 05 E4:
+3 次编译反推 → 1 次定向修)。查到匹配模式照抄; 查不到再按 corrective_action
+定向修。
 
 ### 5. Draft Execution — `execute_batch.py` (唯一一次填充)
 
@@ -460,6 +474,15 @@ vMerge、unmerge 多步、`merge.down=N` 总跨度 N+1、validate 对合并残�
 不得重新推导。验证即证据: plan 派生 readback 通过即视为已验证 — 手动
 `officecli get` 全流程 ≤2 次, 仅用于异常驱动的定向检查。失败优先读
 `_draft_failure.json` 的 defect_class, 禁止自由实验。
+
+**机器证据终止条件 (硬性)**: `execute_batch.py` 已返回 `issues_new` /
+`validate` / readback (含结构 readback) / render 后, **禁止**再用 `officecli
+issues` 或读 `execution_plan.json` 人工复核机器已证明的事实 — 坐标、列宽无
+overflow、readback 全过、组边界都已被机器证据证明, 人工复核是冗余探索
+(Case 05 E5/E6: 627/627 + issues 0 后仍手翻 700+ 行 plan / 重跑 officecli
+issues)。唯一例外 = **异常驱动的定向检查**: 仅当失败记录/缺陷驱动 (如 render
+失败、readback 出现意外差异) 时, 才允许 `officecli get` ≤2 次定位具体格, 且
+`get` 与 `issues` 是两回事 — 机器证据已证明时 `officecli issues` 一律禁止。
 
 ## 失败处置表 (每次失败先分类, 再行动)
 
