@@ -607,6 +607,23 @@ formulas:
   探针矩阵 `pptx_*` 行 + 真实 PPTX E2E (`tests/test_pptx_e2e.py`, 缺模板/
   officecli 时显式 skip)。
 
+### Q19: `aggregates` / `group_aggregates` 会自动创建合并区吗? 聚合列非锚点残留怎么覆盖?
+
+**不自动创建合并区** (issue 03 固化, 组合空缺 U4)。`aggregates` 只把公式写到
+锚点行 (显式范围的首行 / 组首行), `group_aggregates` 只把公式写到各组的组首行 —
+两者都**不**为聚合列建合并区; 克隆 data 行携带到聚合列**非锚点格**的旧值/公式会
+残留 (聚合只写锚点, 不逐行覆盖, 见 Q4b)。
+
+- **非锚点残留必须显式 `merges` 覆盖**: 聚合列的同范围显式 `merges`
+  (`{col: V, rows: "1:{n}", style: label}`) 把聚合锚点=合并锚点, 非锚点格并入
+  合并区 → 残留被覆盖。聚合锚点恰好落在合并锚点格的 `merges 1:{n} + aggregates
+  1:{n}` 同列组合是合法形态 (Q12), 本契约保证非锚点残留由此闭合。
+- 聚合列**不进 `nulls`** (进了 → 锚点双写 DUPLICATE_TARGET_WRITE, "first as empty", Q1/Q13)。
+- **每源分组一条 V 的显式范围 merges+aggregates + 总盈亏 W 一条 1:{n}** 的完整
+  可复制骨架见 `combination_patterns.yaml` → `multiproduct_block_append` (家用/
+  商用双数据块, 克隆残留 + 分组系列盈亏 + 块总盈亏 + 合并, key_outputs 取
+  blocks[].data_start 与聚合/合并锚点格)。
+
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威

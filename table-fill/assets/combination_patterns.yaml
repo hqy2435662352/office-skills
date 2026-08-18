@@ -275,3 +275,172 @@ patterns:
       行移位搬移) → 代表列 numberformat → key_outputs/readback 指针。替换后编译失败
       = 结构事实与 digest 不符, 以 compile 缺陷码为准修正。Pattern 是推荐构造路径,
       不是能力白名单, 不声明 cross-Run support; 同类组合未逐一验证, 不做支持承诺。
+
+  # ── 完整 Canonical Pattern: 多产品组块 (家用/商用双数据块追加, issue 03) ──
+  - id: multiproduct_block_append
+    question: "家用/商用等多产品组块追加 (每个源 sheet 一块: 克隆残留 + 分组系列盈亏 + 块总盈亏 + 合并) 怎么写?"
+    answer: "完整 skeleton 一次实例化 — 每个源 sheet 一块 clone_roles [spacer, title,
+      header, data]; 类别列 group_merges (含 label-only 列); 克隆残留列 nulls;
+      每源分组一条 V 的显式范围 merges+aggregates (系列盈亏); 总盈亏 W 一条 1:{n}
+      的 merges+aggregates; key_outputs 取「块首数据行映射/公式格 + 各聚合组锚点格」
+      (行号取自 plan blocks[].data_start, 不手工重推)。注意 (U4): group_aggregates /
+      aggregates **不自动创建合并区**, 聚合列非锚点残留必须显式 merges 覆盖 —
+      本骨架的每源分组 V 与总盈亏 W 已各配一条显式范围 merges"
+    fragment: |
+      # ── 参数替换表 (一次实例化: 把下面的占位标记换成 digest/业务映射事实, 即得合法 FillSpec) ──
+      # <TARGET_SHEET>     目标 sheet 名 (来自 outline/digest)
+      # <BASE_LAST_ROW>    模板数据末行 (digest 行数)
+      # <SOURCE_HOUSE>/<SOURCE_COMMERCIAL>  家用/商用展平源名 (manifest flattened name)
+      # <TITLE_HOUSE>/<TITLE_COMMERCIAL>    两块标题文本
+      # <GROUP_SRC>→<GROUP_COL> 类别/系列列 (group_by 分组键)
+      # <MODEL_SRC>→<MODEL_COL> / <MODEL2_SRC>→<MODEL2_COL> 型号/规格列
+      # <LABEL_COL>        label-only 分组合并列 (无列映射, label 必填; "" = 清空锚点)
+      # <NULL_COL_1>/<NULL_COL_2>/<NULL_COL_3> 克隆残留列 (模板行携带但未映射 → 逐行清空)
+      # <AGG_COL_V>        系列盈亏聚合列 (每源分组一条显式范围; 聚合锚点=组首=合并锚点)
+      # <V_ROWS_H1>/<V_ROWS_H2> 家用块各组相对数据行范围 (块内组 1 / 组 2)
+      # <V_ROWS_C1>        商用块组范围 (块内仅一组)
+      # <TOTAL_COL_W>      块总盈亏聚合列 (一条 1:{n}; 聚合锚点=块首=合并锚点)
+      # <KO1..KO7>         key_outputs: 块首数据行 / 各聚合组锚点格 / 块总盈亏锚点格
+      mapping:
+        targets:
+          - sheet: <TARGET_SHEET>
+            base_last_row: <BASE_LAST_ROW>
+            blocks:
+              - clone_roles:
+                  - role: spacer
+                  - role: title
+                    template_row: 1
+                    value: "<TITLE_HOUSE>"
+                  - role: header
+                    template_row: 2
+                  - role: data
+                    template_row: 3        # 非合并锚点数据行 (避免克隆锚点公式残留)
+                rows:
+                  source: <SOURCE_HOUSE>
+                columns:
+                  - source: <GROUP_SRC>
+                    target: <GROUP_COL>   # 类别列: 列映射 + group_merges (一等支持)
+                  - source: <MODEL_SRC>
+                    target: <MODEL_COL>
+                  - source: <MODEL2_SRC>
+                    target: <MODEL2_COL>
+                group_merges:
+                  - col: <GROUP_COL>
+                    group_by: <GROUP_COL>
+                    style: label
+                  - col: <LABEL_COL>
+                    group_by: <GROUP_COL>
+                    label: ""             # 无映射列 anchor 文本 ("" = 清空锚点)
+                nulls:                    # 克隆残留列: 逐行清空
+                  - col: <NULL_COL_1>
+                    rows: all
+                  - col: <NULL_COL_2>
+                    rows: all
+                  - col: <NULL_COL_3>
+                    rows: all
+                merges:                   # 聚合列非锚点残留由显式 merges 覆盖 (U4)
+                  - col: <AGG_COL_V>
+                    rows: "<V_ROWS_H1>"   # 每源分组一条 V 的显式范围 merges+aggregates
+                    style: label
+                  - col: <AGG_COL_V>
+                    rows: "<V_ROWS_H2>"
+                    style: label
+                  - col: <TOTAL_COL_W>
+                    rows: "1:{n}"         # 总盈亏 W 一条 1:{n}
+                    style: label
+                formulas:                 # 块级 formulas = 整段使用 (取代 target 级, 不合并)
+                  aggregates:
+                    - col: <AGG_COL_V>
+                      rows: "<V_ROWS_H1>"
+                      formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+                      style: anchor
+                    - col: <AGG_COL_V>
+                      rows: "<V_ROWS_H2>"
+                      formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+                      style: anchor
+                    - col: <TOTAL_COL_W>
+                      rows: "1:{n}"
+                      formula: "IFERROR(ROUND(SUM(U{r1}:U{r2}),2),0)"
+                      style: anchor
+              - clone_roles:
+                  - role: spacer
+                  - role: title
+                    template_row: 1
+                    value: "<TITLE_COMMERCIAL>"
+                  - role: header
+                    template_row: 2
+                  - role: data
+                    template_row: 3
+                rows:
+                  source: <SOURCE_COMMERCIAL>
+                columns:
+                  - source: <GROUP_SRC>
+                    target: <GROUP_COL>
+                  - source: <MODEL_SRC>
+                    target: <MODEL_COL>
+                  - source: <MODEL2_SRC>
+                    target: <MODEL2_COL>
+                group_merges:
+                  - col: <GROUP_COL>
+                    group_by: <GROUP_COL>
+                    style: label
+                  - col: <LABEL_COL>
+                    group_by: <GROUP_COL>
+                    label: ""
+                nulls:
+                  - col: <NULL_COL_1>
+                    rows: all
+                  - col: <NULL_COL_2>
+                    rows: all
+                  - col: <NULL_COL_3>
+                    rows: all
+                merges:
+                  - col: <AGG_COL_V>
+                    rows: "<V_ROWS_C1>"
+                    style: label
+                  - col: <TOTAL_COL_W>
+                    rows: "1:{n}"
+                    style: label
+                formulas:
+                  aggregates:
+                    - col: <AGG_COL_V>
+                      rows: "<V_ROWS_C1>"
+                      formula: "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)"
+                      style: anchor
+                    - col: <TOTAL_COL_W>
+                      rows: "1:{n}"
+                      formula: "IFERROR(ROUND(SUM(U{r1}:U{r2}),2),0)"
+                      style: anchor
+      validation:
+        required_coverage: []
+        required_empty: []
+        key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>, <KO5>, <KO6>, <KO7>]
+    note: |
+      完整 Canonical Pattern (准入见本文件头部说明): 真实任务 Case 05/06 (毛利表 →
+      报价汇总 11_FRESH本土 追加家用/商用双数据块) 的 Validated Draft 同形骨架
+      (2026-08-19 入库)。真实执行证据 (compile 一次过 → execute readback 627/627)
+      见 docs/test-cases/case-005 与 case-006 复盘 — 本骨架复用其 V/W 显式范围
+      merges+aggregates 与双块几何; 仓库内机械背书 = 实例化契约测试 (compile 级
+      plan 形态断言, tests/test_optimization.py → MultiproductBlockPatternContractTests),
+      数据中立 — 用下方占位标记替换列名/行数/公式即得合法 FillSpec。
+      结构与语义锁定:
+      ① 每个源 sheet 一块, clone_roles [spacer, title, header, data], data 的
+      template_row 必须非合并锚点 (CLONE_SOURCE_IS_ANCHOR);
+      ② 类别列 group_merges (映射列锚点写物化值) + 一个 label-only 列 (label 必填,
+      ""=清空锚点); ③ 克隆残留列 (模板行携带但未映射) 一律 nulls: rows: all —
+      聚合列例外: ④ **每源分组一条 V 的显式范围 merges+aggregates** (系列盈亏;
+      聚合锚点=组首=合并锚点, 锚点=组首行的"merges 1:{n} + aggregates 1:{n} 同列"合法
+      组合, Q12); **总盈亏 W 一条 1:{n} 的 merges+aggregates** (聚合锚点=块首=
+      合并锚点); ⑤ **U4 机械事实: group_aggregates / aggregates 不自动创建合并区**
+      — 聚合公式只写锚点行, 聚合列非锚点残留必须显式 merges 覆盖 (本骨架已配);
+      V/W 不进 nulls (进了 → 锚点双写 DUPLICATE_TARGET_WRITE); ⑥ 块级 formulas
+      整体取代 target 级 (FILLSPEC「blocks: 多数据块」取代契约) — 若块还需要共享
+      per_row, 必须每块整段携带 (不写块级 formulas 则继承); ⑦ 派生数值公式按
+      ROUND 精准原则 (V 比率 ROUND4, W 金额 ROUND2, 纯加法不加), 先于
+      officecli-xlsx preserve 复刻视角; ⑧ key_outputs 行号取自 plan
+      blocks[].data_start 与聚合/合并锚点格, 不手工重推 (含数据行数驱动的布局)。
+      块内多组时 V 按「组 1:范围, 组 2:范围...」写多条 (见
+      per_group_total_explicit_ranges); 组边界由数据驱动且范围不可静态枚举时, 换用
+      group_aggregates 一等能力 (动态组边界, 仍须显式 merges 覆盖非锚点残留)。
+      Pattern 是推荐构造路径, 不是能力白名单, 不声明 cross-Run support; 同类组合
+      未逐一验证, 不做支持承诺。

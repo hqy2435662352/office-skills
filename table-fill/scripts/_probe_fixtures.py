@@ -270,6 +270,101 @@ def make_preformatted_quotation_workdir(tmp) -> dict:
     return {"manifest": manifest}
 
 
+MULTIPRODUCT_HOUSE_ROWS = [
+    ["家用悦风", "12K", "Z001", "F-1", "C-1", "1", "2", "3", "4", "5", "6"],
+    ["家用悦风", "18K", "Z002", "F-2", "C-2", "7", "8", "9", "10", "11", "12"],
+    ["家用清爽星", "24K", "Z003", "F-3", "C-3", "13", "14", "15", "16", "17", "18"],
+    ["家用清爽星", "28K", "Z004", "F-4", "C-4", "19", "20", "21", "22", "23", "24"],
+    ["家用清爽星", "32K", "Z005", "F-5", "C-5", "25", "26", "27", "28", "29", "30"],
+]
+MULTIPRODUCT_COMMERCIAL_ROWS = [
+    ["商用", "36K", "Z006", "F-6", "C-6", "31", "32", "33", "34", "35", "36"],
+    ["商用", "40K", "Z007", "F-7", "C-7", "37", "38", "39", "40", "41", "42"],
+    ["商用", "48K", "Z008", "F-8", "C-8", "43", "44", "45", "46", "47", "48"],
+]
+
+
+def make_multiproduct_block_workdir(tmp) -> dict:
+    """家用/商用双数据块 canonical-pattern fixture (issue 03): TWO source
+    sheets (家用 `source_house` ×5, 商用 `source_commercial` ×3) and a 24-col
+    target (col X within width) shaped like 11_FRESH本土.
+
+    Deterministic contract-test geometry: base_last_row 4 → block 1 (家用)
+    spacer5/title6/header7/data8-12 with V groups `1:2` (家用悦风) + `3:5`
+    (家用清爽星) and W `1:{n}`; block 2 (商用) spacer13/title14/header15/
+    data16-18 with V `1:3` (single group) and W `1:{n}`. Template data row 3
+    carries clone residue in D/F/X (cols 4/6/24) → nulls D/F/X."""
+    with open(tmp / "source_house_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(MULTIPRODUCT_HOUSE_ROWS):
+            csv.writer(f).writerow(row + [101 + i])
+    with open(tmp / "source_commercial_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(MULTIPRODUCT_COMMERCIAL_ROWS):
+            csv.writer(f).writerow(row + [201 + i])
+
+    target_meta = {
+        "sheet": "S",
+        "dimensions": {"rows": 12, "cols": 24, "data_rows": 2},
+        "header_band": {"header_rows": [2], "data_start_row": 3},
+        "merged_ranges": ["A5:A6"],
+        "merge_anchors": [{"range": "A5:A6", "anchor": "A5", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 2}, {"col": "D", "nonempty": 1}],
+        "formulas": {"D3": "B3-C3"},
+        "column_numfmt": {"D": "0.00"},
+        "column_width": {"E": 20},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+
+    def _row(*_, cols: dict, orig: int) -> list:
+        cells = [""] * 24
+        for ci_1, val in cols.items():   # ci_1: 1-based column letter index
+            cells[ci_1 - 1] = val
+        return cells + [str(orig)]
+
+    with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(_row(cols={1: "标题"}, orig=1))
+        w.writerow(_row(cols={1: "类别", 2: "型号", 3: "规格", 4: "D", 6: "F", 24: "X"},
+                        orig=2))
+        w.writerow(_row(cols={1: "家用悦风", 2: "12K", 3: "Z001", 4: "F-1",
+                              6: "C-1", 24: "X-1"}, orig=3))
+        w.writerow(_row(cols={1: "家用悦风", 2: "18K", 3: "Z002", 4: "F-2",
+                              6: "C-2", 24: "X-2"}, orig=4))
+        for r in range(5, 13):
+            w.writerow(_row(cols={}, orig=r))
+
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [
+            {"staged": "source_maoli.xlsx", "source": "x", "sha256": "a"},
+            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
+        ],
+        "flattened": [
+            {"file": "source_maoli.xlsx", "sheet": "FRESH订家用机型毛利情况",
+             "name": "source_house", "csv": "source_house_flat.csv",
+             "meta": "m.json", "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "source_maoli.xlsx", "sheet": "商用机型毛利情况",
+             "name": "source_commercial", "csv": "source_commercial_flat.csv",
+             "meta": "m.json", "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "target.xlsx", "sheet": "S", "name": "target",
+             "csv": "target_flat.csv", "meta": "target_meta.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+        ],
+        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
+                   "csv": "target_flat.csv", "meta": "target_meta.json",
+                   "digest": "d.md", "candidates": "c.yaml"},
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    return {"manifest": manifest}
+
+
 def make_empty_lookup_workdir(tmp) -> dict:
     """Broken index: entries present but field_consensus dropped (hand-rewritten
     JSON) → normalization produces an EMPTY table → LOOKUP_TABLE_EMPTY."""
@@ -778,6 +873,63 @@ def _block_no_formulas_inherits_target_per_row(spec, wd):
     return spec
 
 
+def _mp_block(source: str, title: str, v_ranges: list,
+              w_rows: str = "1:{n}") -> dict:
+    """One source block of the multiproduct canonical pattern: clone_roles
+    [spacer, title, header, data], 类别列 group_merges (含 label-only 列),
+    克隆残留列 D/F/X 的 nulls, 每源分组一条 V 的显式范围 merges+aggregates,
+    总盈亏 W 一条 1:{n} 的 merges+aggregates."""
+    return {
+        "clone_roles": [
+            {"role": "spacer"},
+            {"role": "title", "template_row": 1, "value": title},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": 3},
+        ],
+        "rows": {"source": source},
+        "columns": [
+            {"source": "A", "target": "A"},
+            {"source": "B", "target": "B"},
+            {"source": "C", "target": "C"},
+        ],
+        "group_merges": [
+            {"col": "A", "group_by": "A", "style": "label"},
+            {"col": "E", "group_by": "A", "label": ""},
+        ],
+        "nulls": [
+            {"col": "D", "rows": "all"},
+            {"col": "F", "rows": "all"},
+            {"col": "X", "rows": "all"},
+        ],
+        "merges": (
+            [{"col": "V", "rows": r, "style": "label"} for r in v_ranges]
+            + [{"col": "W", "rows": w_rows, "style": "label"}]
+        ),
+        "formulas": {"aggregates": (
+            [{"col": "V", "rows": r,
+              "formula": "IFERROR(ROUND(SUM(T{r1}:T{r2})/SUM(S{r1}:S{r2}),4),0)",
+              "style": "anchor"} for r in v_ranges]
+            + [{"col": "W", "rows": w_rows,
+                "formula": "IFERROR(ROUND(SUM(U{r1}:U{r2}),2),0)",
+                "style": "anchor"}]
+        )},
+    }
+
+
+def _multiproduct_block_append(spec, wd):
+    """多产品组块完整骨架实例化 (家用/商用双数据块) — 沿用
+    combination_patterns.yaml `multiproduct_block_append` 的结构: 家用块
+    (2 组: V `1:2` + `3:5`) 与商用块 (1 组: V `1:3`), 各块 W `1:{n}`;
+    key_outputs 取块首数据行 / 各聚合组锚点格 (可取自 plan data_start)."""
+    _set(spec, "mapping.targets.0.blocks", [
+        _mp_block("source_house", "家用块标题", ["1:2", "3:5"]),
+        _mp_block("source_commercial", "商用块标题", ["1:3"]),
+    ])
+    _set(spec, "validation.key_outputs",
+         ["A8", "V8", "V10", "W8", "A16", "V16", "W16"])
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -874,4 +1026,8 @@ PROBE_CASES = [
      "build": _block_formulas_replaces_target_per_row},
     {"id": "block_no_formulas_inherits_target_per_row", "expect": "accept",
      "build": _block_no_formulas_inherits_target_per_row},
+    # ── issue 03: 多产品组块完整 Canonical Pattern 实例化 (accept) ──
+    {"id": "multiproduct_block_append", "expect": "accept",
+     "build": _multiproduct_block_append,
+     "workdir_factory": make_multiproduct_block_workdir},
 ]

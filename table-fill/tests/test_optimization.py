@@ -23,6 +23,7 @@ from _probe_fixtures import (  # noqa: E402
     make_all_missing_lookup_workdir,
     make_empty_lookup_workdir,
     make_egypt_workdir,
+    make_multiproduct_block_workdir,
     make_preformatted_quotation_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
@@ -3734,6 +3735,176 @@ class PreformattedQuotationPatternContractTests(unittest.TestCase):
             self.assertEqual(plan["warnings"], [])               # 无 static defects
 
 
+class MultiproductBlockPatternContractTests(unittest.TestCase):
+    """issue 03 — 完整 Canonical Pattern `multiproduct_block_append` 的机械契约
+    测试: 从 catalog entry 本身 (文本参数替换, 而非测试里手写一份等价 skeleton)
+    实例化 spec, 并走 PUBLIC Compiler CLI (MxpEndToEndTests 同款 seam) 编译出
+    家用/商用双块 append 的同形 plan:
+
+    base_last_row 4 → 家用块 (5 行数据, 悦风 1:2 + 清爽星 3:5 两组) data 8-12 →
+    商用块 (3 行数据, 单组) data 16-18; 每源分组 V 显式范围 merges+aggregates
+    (V8/V10 + V16); 总盈亏 W 一条 1:{n} merges+aggregates (W8/W16); 类别列
+    group_merges (A) + label-only 列 (E); 克隆残留 D/F/X nulls (每块逐行清空);
+    key_outputs (块首 + 聚合组锚点 + 总盈亏锚点) 全 written; 零 static defects。"""
+
+    PATTERN_ID = "multiproduct_block_append"
+
+    # One explicit instantiation: catalog fragment placeholders → concrete
+    # neutral values (the roles are documented inside the fragment itself).
+    SUBSTITUTIONS = {
+        "<TARGET_SHEET>": "S", "<BASE_LAST_ROW>": "4",
+        "<SOURCE_HOUSE>": "source_house",
+        "<SOURCE_COMMERCIAL>": "source_commercial",
+        "<TITLE_HOUSE>": "家用块标题", "<TITLE_COMMERCIAL>": "商用块标题",
+        "<GROUP_SRC>": "A", "<GROUP_COL>": "A",
+        "<MODEL_SRC>": "B", "<MODEL_COL>": "B",
+        "<MODEL2_SRC>": "C", "<MODEL2_COL>": "C",
+        "<LABEL_COL>": "E",
+        "<NULL_COL_1>": "D", "<NULL_COL_2>": "F", "<NULL_COL_3>": "X",
+        "<AGG_COL_V>": "V", "<TOTAL_COL_W>": "W",
+        "<V_ROWS_H1>": "1:2", "<V_ROWS_H2>": "3:5", "<V_ROWS_C1>": "1:3",
+        "<KO1>": "A8", "<KO2>": "V8", "<KO3>": "V10", "<KO4>": "W8",
+        "<KO5>": "A16", "<KO6>": "V16", "<KO7>": "W16",
+    }
+
+    def _pattern_entry(self) -> dict:
+        import yaml
+        text = (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(
+            encoding="utf-8")
+        entry = next(p for p in yaml.safe_load(text)["patterns"]
+                     if p["id"] == self.PATTERN_ID)
+        for key in ("question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"catalog entry 缺字段 {key!r}")
+        return entry
+
+    def _instantiate(self, entry: dict) -> dict:
+        """Textual substitution on the catalog fragment (comments included);
+        leftover placeholders fail loudly instead of silently passing."""
+        import yaml
+        frag = entry["fragment"]
+        for token, value in self.SUBSTITUTIONS.items():
+            self.assertIn(token, frag, f"fragment 缺占位符 {token}")
+            frag = frag.replace(token, value)
+        leftovers = re.findall(r"<[A-Z0-9_]+>", frag)
+        self.assertEqual(leftovers, [],
+                         f"fragment 存在未替换占位符: {leftovers}")
+        return yaml.safe_load(frag)
+
+    def _spec(self, wd: dict, instantiated: dict) -> dict:
+        return {
+            "task": {"intent": "家用+商用双数据块追加 (pattern contract)",
+                     "selected_mod": "NONE", "selected_mod_revision": None},
+            "inputs": {"sources": ["source_maoli.xlsx"], "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_maoli.xlsx",
+                                          "sheets": ["FRESH订家用机型毛利情况",
+                                                     "商用机型毛利情况"]}],
+                       "target_sheet": "S"},
+            "fingerprints": {
+                "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+                "target_structure": wd["manifest"]["fingerprints"]["target_structure"],
+            },
+            **instantiated,
+            "decisions": ["双数据块按家用/商用各一块追加; 每块总盈亏 W 一条 1:{n}"],
+            "gaps": [],
+            "lineage": [{"source": "source_house_flat.csv", "role": "primary",
+                         "note": ""},
+                        {"source": "source_commercial_flat.csv", "role": "primary",
+                         "note": ""}],
+        }
+
+    def _compile_cli(self, tmp: Path) -> dict:
+        """The public Compiler CLI seam (the same one MxpEndToEndTests uses)."""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8",
+             str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+             "--spec", "fill_spec.yaml", "--workdir", "."],
+            cwd=str(tmp), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        return json.loads((tmp / "execution_plan.json").read_text(encoding="utf-8"))
+
+    def _agg_paths(self, plan) -> list[str]:
+        return [op["path"] for op in plan["operations"]
+                if "formula" in op.get("props", {})
+                and "SUM" in op["props"]["formula"]]
+
+    def _merge_ranges(self, plan) -> list[str]:
+        return [op["props"]["merge"] for op in plan["operations"]
+                if isinstance(op.get("props", {}).get("merge"), str)]
+
+    def test_pattern_instantiation_compiles_to_homomorphic_plan(self):
+        """catalog entry 本身 → 参数替换 → 合法 FillSpec YAML → 公开 CLI 编译:
+        两块布局 (家用 data 8-12 / 商用 data 16-18) + 每源分组 V 的
+        merges+aggregates (V8/V10/V16) + 总盈亏 W 1:{n} (W8/W16) + 类别列
+        group_merges (A) + label-only (E) + 克隆残留 D/F/X nulls 逐行清空 +
+        key_outputs 全 written; 零 defects。"""
+        import yaml
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            wd = make_multiproduct_block_workdir(tmp)
+            entry = self._pattern_entry()
+            instantiated = self._instantiate(entry)
+            spec = self._spec(wd, instantiated)
+            (tmp / "fill_spec.yaml").write_text(
+                yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
+                encoding="utf-8")
+            plan = self._compile_cli(tmp)
+            self.assertEqual(plan["schema_version"], "2.5")
+
+            # ── 两块布局: 家用 5 行 (两组) data 8-12, 商用 3 行 data 16-18 ──
+            data_blocks = [b for b in plan["blocks"] if b.get("data_start")]
+            self.assertEqual(len(data_blocks), 2)
+            self.assertEqual([(b["data_start"], b["data_end"]) for b in data_blocks],
+                             [(8, 12), (16, 18)])
+
+            # ── 每源分组 V 的 merges+aggregates + 总盈亏 W 1:{n} ──
+            self.assertEqual(self._agg_paths(plan),
+                             ["/S/V8", "/S/V10", "/S/W8", "/S/V16", "/S/W16"],
+                             "家用两组 V + 总盈亏 W + 商用一组 V")
+            merges = set(self._merge_ranges(plan))
+            self.assertEqual(merges, {
+                # 类别列 group_merges (A) + label-only 列 (E)
+                "A8:A9", "A10:A12", "A16:A18",
+                "E8:E9", "E10:E12", "E16:E18",
+                # 每源分组 V 显式范围 merges
+                "V8:V9", "V10:V12", "V16:V18",
+                # 总盈亏 W 一条 1:{n}
+                "W8:W12", "W16:W18",
+            }, "块合并形态: 类别/label-only/每源分组 V/总盈亏 W")
+            self.assertNotIn("V8:V10", merges)  # V 按组范围, 不整块
+
+            # ── group_boundaries 记录类别列 (A) 与 label-only 列 (E) ──
+            g_a_house = next(g for g in plan["group_boundaries"]
+                             if g["col"] == "A" and g["region_start"] == 8)
+            self.assertEqual((g_a_house["region_start"], g_a_house["region_end"]),
+                             (8, 12), "家用块类别列 group boundary 8-12")
+            self.assertEqual(g_a_house["expected_merges"], ["A8:A9", "A10:A12"])
+            self.assertEqual(
+                sorted({g["col"] for g in plan["group_boundaries"]}), ["A", "E"],
+                "group_boundaries 覆盖类别列 A 与 label-only 列 E")
+
+            # ── 克隆残留 D/F/X: 每块每数据行 explicit empty readback ──
+            empty = {rb["path"] for rb in plan["readback"] if rb["kind"] == "empty"}
+            for col in ("D", "F", "X"):
+                self.assertEqual(
+                    {p for p in empty if re.fullmatch(rf"/S/{col}\d+", p)},
+                    {f"/S/{col}{r}" for r in (8, 9, 10, 11, 12, 16, 17, 18)},
+                    f"nulls {col} 应逐行清空 (家用 5 + 商用 3)")
+
+            # ── key_outputs 全 written: 块首 + 聚合组锚点 + 总盈亏锚点 ──
+            self.assertEqual(plan["key_outputs"], [
+                {"path": "/S/A8", "kind": "value"},
+                {"path": "/S/V8", "kind": "nonempty"},
+                {"path": "/S/V10", "kind": "nonempty"},
+                {"path": "/S/W8", "kind": "nonempty"},
+                {"path": "/S/A16", "kind": "value"},
+                {"path": "/S/V16", "kind": "nonempty"},
+                {"path": "/S/W16", "kind": "nonempty"},
+            ])
+            self.assertEqual(plan["warnings"], [])  # 无 static defects
+
+
 class ProbeTests(unittest.TestCase):
     """compile_fill.py --probe: compile-only verification, zero side effects.
 
@@ -3868,7 +4039,8 @@ class CapabilitiesTests(unittest.TestCase):
                     "lookup_column_all_missing", "block_top_aggregates_rejected",
                     "block_top_unknown_key_rejected",
                     "block_formulas_replaces_target_per_row",
-                    "block_no_formulas_inherits_target_per_row"):
+                    "block_no_formulas_inherits_target_per_row",
+                    "multiproduct_block_append"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
 
 
@@ -4351,6 +4523,90 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertFalse(any("candidate" in i.lower() or "provisional" in i.lower()
                              for i in ids),
                          "不得新增 Candidate/Provisional Pattern 层级")
+
+    # ── issue 03: 完整 Canonical Pattern (multiproduct_block_append) ──
+
+    def _multiproduct_entry(self) -> dict:
+        import yaml
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        entries = yaml.safe_load(p.read_text(encoding="utf-8"))["patterns"]
+        hits = [e for e in entries if e["id"] == "multiproduct_block_append"]
+        self.assertEqual(len(hits), 1, "pattern id 必须唯一")
+        return hits[0]
+
+    def test_combination_patterns_multiproduct_block_entry(self):
+        """Catalog 含唯一 multiproduct_block_append entry, 问题描述可定位家用/商用
+        双数据块追加场景; 同一 fragment 携带全部结构职责词 (clone_roles /
+        group_merges / nulls / merges / aggregates / key_outputs), note 明确
+        U4 机械事实 (不自动建合并区 / 显式 merges 覆盖非锚点残留)."""
+        entry = self._multiproduct_entry()
+        for key in ("id", "question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"entry 缺字段 {key!r}")
+        for word in ("家用", "商用", "多产品"):
+            self.assertIn(word, entry["question"] + entry["answer"],
+                          f"问题描述缺定位词 {word!r}")
+        for word in ("clone_roles", "group_merges", "nulls", "merges",
+                     "aggregates", "key_outputs", "1:{n}"):
+            self.assertIn(word, entry["fragment"],
+                          f"fragment 缺结构职责词 {word!r}")
+        self.assertIn("label", entry["fragment"])
+        # U4 机械事实必须同时落在 answer 与 note (供 Agent 定位与契约固化)
+        for sect in (entry["answer"], entry["note"]):
+            self.assertIn("不自动创建合并区", sect,
+                          f"{sect} 缺「不自动创建合并区」词")
+            self.assertIn("显式 merges", sect,
+                          f"{sect} 缺「显式 merges」词")
+        # note 指明 deviating 变体指向既有局部片段 (块内多组显式范围)
+        self.assertIn("per_group_total_explicit_ranges", entry["note"])
+
+    def test_combination_patterns_multiproduct_block_data_neutral(self):
+        """真实任务业务事实 (客户/sheet/型号/价格/行号) 不泄漏进 fragment:
+        全部参数化为占位标记; 组范围/总盈亏范围用占位符 + 1:{n}, 不写死行数."""
+        entry = self._multiproduct_entry()
+        frag = entry["fragment"]
+        for leaked in ("家用悦风", "清爽星", "Z001", "11_FRESH", "毛利表",
+                       "105000", "ATLAS", "埃及"):
+            self.assertNotIn(leaked, frag, f"fragment 泄漏业务事实 {leaked!r}")
+        for token in ("<TARGET_SHEET>", "<BASE_LAST_ROW>", "<SOURCE_HOUSE>",
+                      "<SOURCE_COMMERCIAL>", "<TITLE_HOUSE>", "<GROUP_COL>",
+                      "<LABEL_COL>", "<NULL_COL_1>", "<AGG_COL_V>",
+                      "<TOTAL_COL_W>", "<V_ROWS_H1>", "<V_ROWS_C1>", "<KO1>"):
+            self.assertIn(token, frag, f"fragment 缺参数占位符 {token}")
+        # 每源分组 V 显式范围 + 总盈亏 W 1:{n} 的可复制声明在 answer/note
+        for phrase in ("每源分组一条 V", "总盈亏 W 一条 1:{n}"):
+            self.assertIn(phrase, entry["answer"] + entry["note"],
+                          f"缺 {phrase}")
+        # 明确是推荐构造路径, 不是 whitelist / cross-Run support claim
+        self.assertIn("构造路径", entry["note"])
+
+    def test_fillspec_q19_aggregate_merge_region_word(self):
+        """契约章节含 Q19: aggregates/group_aggregates 不自动创建合并区,
+        聚合列非锚点残留需显式 merges 覆盖 (U4 组合空缺, issue 03)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q19:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q19 小节")
+        q19 = section[m.end():]
+        for word in ("不自动创建合并区", "显式", "merges", "非锚点残留",
+                     "multiproduct_block_append", "DUPLICATE_TARGET_WRITE",
+                     "1:{n}"):
+            self.assertIn(word, q19, f"Q19 缺词 {word!r}")
+
+    def test_known_traps_aggregate_merge_region_fact(self):
+        """KNOWN_TRAPS 沉淀 U4 机械事实双件: ① block 顶层聚合键静默丢弃 → 编译期
+        拒绝 (issue 01); ② group_aggregates/aggregates 不自动建合并区, 聚合列
+        非锚点残留需显式 merges 覆盖 + 指向 multiproduct_block_append 骨架."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^\|\s*\*\*block 顶层聚合键静默丢弃.*$", text, re.MULTILINE)
+        self.assertIsNotNone(m, "KNOWN_TRAPS 缺 block 顶层聚合键静默丢弃 行")
+        self.assertIn("BLOCK_KEY_STRUCTURE_INVALID", m.group(0))
+        m2 = re.search(r"^\|\s*\*\*aggregates/group_aggregates 不自动建合并区.*$",
+                       text, re.MULTILINE)
+        self.assertIsNotNone(m2, "KNOWN_TRAPS 缺 aggregates 不自动建合并区 行")
+        row = m2.group(0)
+        for word in ("非锚点残留", "显式", "merges", "multiproduct_block_append",
+                     "DUPLICATE_TARGET_WRITE"):
+            self.assertIn(word, row, f"U4 机械事实行缺 {word!r}")
 
     def test_known_traps_spike_facts(self):
         """KNOWN_TRAPS 沉淀已 spike 机械事实 (克隆携带合并 / merges×aggregates)."""

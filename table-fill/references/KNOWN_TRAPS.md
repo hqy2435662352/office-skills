@@ -97,6 +97,7 @@
 | **lookup 索引完整性 (2026-08-13)** | 索引归一化后为空 (0 entries — 手改 JSON 丢 field_consensus) → 编译器 LOOKUP_TABLE_EMPTY (exit 3) 拒绝, **不再静默全空**; 索引非空但声明 lookup 列全部未命中 → LOOKUP_COLUMN_ALL_MISSING 警告 (可继续编译, Gate 呈现) — 索引清洗一律用 build_inheritance_index.py 重建, **禁止手改 JSON** (见 FILLSPEC Q15) |
 | **lookup 索引输入排除目标 sheet (2026-08-13)** | 索引输入含本次填充的目标 sheet → 目标 sheet 既有块是历史输出 (非字段权威源), 与独立数据 sheet 同 SKU 多值 → 共识 conflict → 按缺失处理 (静默, 表现同"整列未命中") — 埃及 FRESH 坑 2: 拖多12K factory_model 两候选 → 静默留空, 重建 (仅 01_埃及机型 + 09_Fresh拖多) 后解决 |
 | **group_aggregates lowering (2026-08-13)** | 组锚点行落公式: 组由 group_by 物化值连续同值段 (compute_groups) 派生, {r1}:{r2} 按组起止展开且必须留块内 (AGG_RANGE_INVALID 为数据派生恒真不变量); 各锚点自动登记 nonempty readback; 与 group_merges/per_row 同列或组聚合列进 nulls → DUPLICATE_TARGET_WRITE (一格一 owner)。**whole_run 跨块总计落点语义 (末块尾部 vs 独立行) 未 spike — 声明 → CAPABILITY_NOT_ROLLED_OUT**, 免重复 spike |
+| **aggregates/group_aggregates 不自动建合并区 (2026-08-19, U4 组合空缺)** | 聚合公式只写锚点行 (显式范围首行 / 组首行), 克隆 data 行携带到聚合列**非锚点格**的旧值/公式残留 (聚合不逐行覆盖, 见 FILLSPEC Q4b) — 曾误以为"聚合落锚点=合并覆盖整组"而丢残留 | 聚合列非锚点残留必须显式 `merges` 覆盖 (聚合锚点=合并锚点, 同范围 merges 1:{n}): 每源分组一条 V 的显式范围 merges+aggregates + 总盈亏 W 一条 1:{n} 的完整骨架见 combination_patterns.yaml `multiproduct_block_append`, 改列名即可; 聚合列不进 nulls (进了 → 锚点双写 DUPLICATE_TARGET_WRITE) |
 
 ## 占位行样式粒度决策事实 (2026-08-13 埃及复盘)
 
