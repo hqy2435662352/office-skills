@@ -39,18 +39,20 @@ plan 并**保留**结果为 `validated_draft.<ext>`; Execution Gate 批准后
      单格合并 (A19:A19) 与陈旧合并都在集合差里显形 — `officecli validate`
      对合并残留视而不见, 组边界是唯一闭环检查 → 不匹配 =
      GROUP_BOUNDARY_MISMATCH。
-8. **Render QA**: `--render png|html|none`。
+8. **Render QA**: `--render png|html|none`, **默认 `html`** (issue 03 / Case 07
+   改进 4 — 省略 `--render` 时按 html 执行, Agent 无需再自补 `view html`)。
    - png (多模态模型): `view screenshot --range <region>` → 视觉检查。
-   - html (纯文本模型): `view html --range <region>` → 结构渲染检查,
+   - html (纯文本模型, 默认): `view html --range <region>` → 结构渲染检查,
      **不得声称视觉验证**。
    - 只渲染受影响区域 (plan.render_qa.region), 单次终局, 消耗 repair budget;
      产物生成失败 → RENDER_QA_FAILED (png 失败可降级 html — 属 budget 内
-     一次 ADAPT)。
+     一次 ADAPT)。`--render none` 仍显式可选。
 9. **Receipt** (`draft_receipt.json`): source/template 哈希是**执行时重算值**
    (不再抄 manifest 的 outline 期 files[].sha256), 另记 `input_hash_check`
    = {bound, actual, drifted} (与 plan.input_hashes 编译期绑定的比对结果);
    另有 spec/plan/draft 哈希、op 计数、source coverage、readback 通过数、
-   structural、render_qa、issue delta、validate 结果、key_outputs。
+   structural、`render_qa` (含默认 html 的执行结果, 计入机器证据)、issue delta、
+   validate 结果、key_outputs。
 
 失败 → exit 3 + `_draft_failure.json` (defect_class/standard_fix)。
 

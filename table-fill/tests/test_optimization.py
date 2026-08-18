@@ -3057,6 +3057,109 @@ class HeaderRowGuardContractTests(unittest.TestCase):
             self.assertNotIn("HEADER_ROW_CONSIDERED_DATA", codes)
 
 
+class MergeModeConflictContractTests(unittest.TestCase):
+    """issue 03 / Case 07 改进 1/3 (E3 删除) — MERGE_MODE_CONFLICT corrective_action
+    指向「正确组合」而非只写「每列一种合并模式」:
+
+    - 该列承载聚合 (聚合锚点 / 合并覆盖残留) → 删除其 group_merges 条目, 改用
+      同范围 merges + aggregates 对 (聚合锚点=合并锚点);
+    - 普通标签列 → 每列保留一种合并模式 (group_merges 或 merges 二选一)。
+
+    不绑定 pattern 名、不绑定任务 (通用层指引)。"""
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _conflict_spec(self, aggregate: bool) -> dict:
+        """复用 PROBE_CASES 的构建器 (单一真实来源, probe-first): 聚合列 /
+        普通标签列 两个 MERGE_MODE_CONFLICT 触发形态."""
+        import _probe_fixtures as pf
+        spec = spec_with(self.wd)
+        builder = (pf._merge_conflict_aggregate_col if aggregate
+                   else pf._merge_conflict_label_col)
+        builder(spec, self.wd)
+        return spec
+
+    def _conflict_defect(self, spec) -> dict:
+        r = compile_fill.probe_spec(spec, self.wd["manifest"], self.wd["workdir"])
+        self.assertFalse(r["accepted"], "同列混用 merges + group_merges 应被拒绝")
+        self.assertEqual(r["exit_code"], 3,
+                         "MERGE_MODE_CONFLICT 是编译拒绝 (exit 3)")
+        codes = [d.get("code") for d in r["defects"]]
+        self.assertIn("MERGE_MODE_CONFLICT", codes)
+        return next(d for d in r["defects"] if d.get("code") == "MERGE_MODE_CONFLICT")
+
+    def test_aggregate_column_in_group_merges_conflict(self):
+        """聚合列误进 group_merges → exit 3 + code=MERGE_MODE_CONFLICT."""
+        d = self._conflict_defect(self._conflict_spec(aggregate=True))
+        self.assertEqual(d["col"], "G")
+
+    def test_aggregate_column_corrective_action_wording(self):
+        """聚合列冲突 corrective_action 含「merges+aggregates」「聚合锚点=合并锚点」
+        「group_merges」措辞."""
+        d = self._conflict_defect(self._conflict_spec(aggregate=True))
+        text = d["message"] + d["corrective_action"]
+        for word in ("group_merges", "merges + aggregates", "聚合锚点=合并锚点",
+                     "聚合", "删除其 group_merges 条目"):
+            self.assertIn(word, text, f"聚合列冲突指引缺词 {word!r}")
+
+    def test_label_column_corrective_action_single_mode(self):
+        """普通标签列冲突 corrective_action 指向「保留一种合并模式」, 不误导向
+        聚合组合."""
+        d = self._conflict_defect(self._conflict_spec(aggregate=False))
+        for word in ("普通标签列", "保留一种"):
+            self.assertIn(word, d["corrective_action"],
+                          f"标签列冲突指引缺词 {word!r}")
+        self.assertNotIn("merges + aggregates", d["corrective_action"],
+                         "普通标签列不应被导向聚合组合")
+
+    def test_corrective_action_not_bound_to_pattern_or_task(self):
+        """指引是通用层: 不引用 pattern 名、不绑定任务 (用户裁决)."""
+        for aggregate in (True, False):
+            d = self._conflict_defect(self._conflict_spec(aggregate))
+            for banned in ("multiproduct", "single_quotation", "MXP", "Case 08"):
+                self.assertNotIn(banned, d["message"] + d["corrective_action"],
+                                 f"指引泄漏 pattern/任务词 {banned!r}")
+
+
+class ExecutorRenderDefaultContractTests(unittest.TestCase):
+    """issue 03 / Case 07 改进 4 — execute_batch.py `--render` 默认 none → html:
+
+    - 省略 `--render` 时按 html 执行 (纯文本模型结构渲染检查, 不宣称视觉验证);
+    - 产物 (render_qa) 计入 execute 返回的机器证据 (receipt.render_qa);
+    - 显式 `--render none` 仍可用 (跳过).
+    """
+
+    def test_render_mode_default_is_html(self):
+        self.assertEqual(execute_batch.RENDER_MODE_DEFAULT, "html",
+                         "execute 省略 --render 时应默认 html (Case 07 改进 4)")
+
+    def test_render_qa_none_skips_in_machine_evidence_shape(self):
+        """--render none 的 render_qa 结果仍是机器证据一部分 (mode/status), 但跳过
+        渲染产物."""
+        r = execute_batch.render_qa(Path("."), Path("x.xlsx"), "", "none")
+        self.assertEqual(r["mode"], "none")
+        self.assertEqual(r["status"], "skipped")
+        self.assertIn("status", r)
+
+    def test_render_arg_parses_html_default_without_flag(self):
+        """真实 CLI 契约: 省略 --render 时 argparse 默认 = html (进出接口契约: 文档
+        与执行器默认值一致, 无法漂移)."""
+        ns = execute_batch.build_arg_parser().parse_args(
+            ["--plan", "p.json", "--template", "t.xlsx", "--workdir", "."])
+        self.assertEqual(ns.render, "html")
+        ns2 = execute_batch.build_arg_parser().parse_args(
+            ["--plan", "p.json", "--template", "t.xlsx", "--workdir", ".",
+             "--render", "none"])
+        self.assertEqual(ns2.render, "none", "显式 --render none 仍可用")
+
+
 class ExecutionOrderContractTests(unittest.TestCase):
     """「执行顺序保证」契约 (FILLSPEC 章节) 的编译用例背书 — 文档声称与编译器
     行为 lockstep: op 全局顺序不变量 (E1) / remove 目标身份 (E2) / 自底向上
@@ -5036,6 +5139,101 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("克隆携带合并", text)
         self.assertIn("mergeCell", text)
         self.assertIn("A41:F41", text)
+
+    # ── issue 03: MERGE_MODE_CONFLICT 指引 + [1] 外部引用 + 探索终止硬化 ──
+
+    def test_fillspec_q19_aggregate_column_not_in_group_merges(self):
+        """Q19 补「聚合列不进 group_merges」单一 owner 不变量 + MERGE_MODE_CONFLICT
+        正确修复 (删 group_merges、用同范围 merges+aggregates 对, 聚合锚点=合并锚点)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q19:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q19 小节")
+        q19 = section[m.end():]
+        for word in ("不进 group_merges", "MERGE_MODE_CONFLICT", "merges + aggregates",
+                     "聚合锚点=合并锚点", "不绑定 pattern 名"):
+            self.assertIn(word, q19, f"Q19 缺聚合列×group_merges 指引词 {word!r}")
+
+    def test_fillspec_q1_aggregate_single_owner_extension(self):
+        """Q1 规则补「聚合列不进 group_merges」— 与「聚合列不进 nulls」并列的单一
+        owner 不变量 (MERGE_MODE_CONFLICT 属同列双写)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q1:", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q1 小节")
+        q1 = section[m.end():]
+        for word in ("聚合列不进", "group_merges", "MERGE_MODE_CONFLICT", "不进 nulls"):
+            self.assertIn(word, q1, f"Q1 规则缺聚合列不进 group_merges 词 {word!r}")
+
+    def test_error_code_table_merge_mode_conflict_wording(self):
+        """MERGE_MODE_CONFLICT 速查表行 corrective_action 指向正确组合: 聚合列 →
+        删 group_merges + 同范围 merges+aggregates 对; 普通标签列 → 保留一种模式
+        (防指引回退到「每列只用一种合并模式」)."""
+        table = self._error_code_table()
+        m = re.search(r"^\|\s*MERGE_MODE_CONFLICT.*$", table, re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 MERGE_MODE_CONFLICT 行")
+        row = m.group(0)
+        for word in ("group_merges", "merges + aggregates", "聚合锚点=合并锚点",
+                     "普通标签列", "保留一种", "聚合"):
+            self.assertIn(word, row, f"MERGE_MODE_CONFLICT 行缺 {word!r}")
+
+    def test_known_traps_external_workbook_reference(self):
+        """KNOWN_TRAPS 沉淀 `[1]` 前缀 = 外部工作簿引用机械事实: 新写公式未重建外部
+        链接不可求值 (formula_not_evaluated), 该列直接 null 而非常规复制公式."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^\|\s*\*\*.*\[\d+\].*前缀 = 外部工作簿引用.*$", text, re.MULTILINE)
+        self.assertIsNotNone(m, "KNOWN_TRAPS 缺 [1] 外部工作簿引用 行")
+        row = m.group(0)
+        for word in ("[1]", "外部工作簿引用", "formula_not_evaluated", "直接",
+                     "null", "外部工作簿", "XLOOKUP"):
+            self.assertIn(word, row, f"[1] 外部引用行缺 {word!r}")
+
+    def test_layer4_failure_classes_render_default_html(self):
+        """LAYER4 与 FAILURE_CLASSES 同步 render 默认值: 省略 --render 时按 html
+        执行 (进出接口契约一致)."""
+        layer4 = (SKILL_ROOT / "references" / "LAYER4_EXECUTE_LOOP.md").read_text(
+            encoding="utf-8")
+        self.assertIn("默认 `html`", layer4,
+                      "LAYER4 缺 render 默认 html 措辞")
+        classes = (SKILL_ROOT / "references" / "FAILURE_CLASSES.md").read_text(
+            encoding="utf-8")
+        self.assertIn("默认 `--render html`", classes,
+                      "FAILURE_CLASSES 缺 render 默认 html 措辞")
+
+    def test_skill_md_machine_evidence_termination_extended(self):
+        """机器证据终止条件扩展: execute 已返回机器证据后禁止 officecli get 逐格
+        复核 + 禁止读 case 复盘/测试病历作证据; 唯一例外 = 异常驱动定向 get ≤2."""
+        text = self._skill_md_text()
+        for word in ("机器证据终止条件", "逐格复核", "officecli get", "case 复盘",
+                     "测试病历", "异常驱动的定向检查", "禁止"):
+            self.assertIn(word, text, f"SKILL.md 机器证据终止条件缺词 {word!r}")
+
+    def test_skill_md_canonical_pattern_instantiate_stop(self):
+        """结构/层级缺陷预算补 canonical→STOP: 命中 combination_patterns 的
+        canonical pattern → 直接实例化, 不再读 case 复盘重推组合."""
+        text = self._skill_md_text()
+        for word in ("结构/层级缺陷预算", "直接实例化", "不再读 case 复盘",
+                     "canonical pattern", "重推组合"):
+            self.assertIn(word, text, f"SKILL.md canonical→STOP 缺词 {word!r}")
+
+    def test_skill_md_mod_conflict_no_full_content_recheck(self):
+        """MOD Resolution 补: MOD conflict 且排除信号命中 → 不再读 MOD 全文核对
+        排除信号是否误报, 直接 fail-closed ASK (领域判断不改变裁决机制)."""
+        text = self._skill_md_text()
+        m = re.search(r"^### 2\. MOD Resolution.*?(?=^### 3\.)",
+                      text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "SKILL.md 缺 MOD Resolution 段")
+        section = m.group(0)
+        for word in ("不再读 MOD 全文", "排除信号", "fail-closed ASK", "误报"):
+            self.assertIn(word, section,
+                          f"MOD Resolution 缺不读全文词 {word!r}")
+
+    def test_skill_md_mod_ask_checklist_templated(self):
+        """MOD ASK 必问清单模板化: 成本口径 / 面价 vs 散件 / 缺失稳定属性 / 费用
+        组成 / 含管口径 / 输出文件形态 一次性枚举 (防第二轮补问)."""
+        text = self._skill_md_text()
+        for word in ("必问清单", "成本口径", "面价 vs 散件", "缺失稳定属性",
+                     "费用组成", "含管口径", "输出文件形态", "一轮问全"):
+            self.assertIn(word, text, f"SKILL.md MOD ASK 清单缺词 {word!r}")
 
     def test_fillspec_execution_order_section(self):
         """「执行顺序保证」章节存在且覆盖全部四条锁定声明: op 顺序不变量 /

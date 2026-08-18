@@ -74,4 +74,4 @@ repair 预算内的验证次数)。
 | empty_cell / formula_residue | data template_row 选非锚点行; 未填列进 `nulls` |
 | FINAL_ROW_COUNT_MISMATCH | capacity/start_row 照 digest 声明; selectors 精确表达业务过滤 |
 | GROUP_BOUNDARY_MISMATCH | group_by 用目标列映射; 每列只用一种合并模式 |
-| RENDER_QA_FAILED | 纯文本模型默认 `--render html`; region 走 plan.render_qa.region |
+| RENDER_QA_FAILED | **默认 `--render html`** (case 07 改进 4 / issue 03 — 纯文本结构渲染检查, 不得声称视觉验证); region 走 plan.render_qa.region; 无渲染后端才显式 `--render none` |

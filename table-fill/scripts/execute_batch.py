@@ -369,19 +369,34 @@ def render_qa(workdir: Path, draft: Path, region: str, mode: str) -> dict:
             "artifact": str(out)}
 
 
-def main() -> None:
-    ensure_utf8_stdio()
+# Default Render QA mode when --render is omitted (Case 07 改进 4 / issue 03):
+# html instead of none — a pure-text model structural render check that never
+# claims visual verification; the produced artifact joins the machine evidence
+# (receipt.render_qa). Explicit --render none stays available.
+RENDER_MODE_DEFAULT = "html"
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """CLI contract (issue 03): --render default is RENDER_MODE_DEFAULT (html) —
+    introspectable at runtime so the executor's default and the docs/contract
+    tests can never drift."""
     parser = argparse.ArgumentParser(description="Draft execution: plan → validated draft")
     parser.add_argument("--plan", type=Path, required=True, help="execution_plan.json")
     parser.add_argument("--template", type=Path, required=True,
                         help="staged target template (copied, never modified)")
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--round", type=int, default=1, help="repair round (tracking)")
-    parser.add_argument("--render", choices=("png", "html", "none"), default="none",
+    parser.add_argument("--render", choices=("png", "html", "none"),
+                        default=RENDER_MODE_DEFAULT,
                         help="Render QA: png (multimodal models inspect visually) / "
                              "html (text-only models: structural render check only — "
-                             "never claim visual verification) / none (skip)")
-    args = parser.parse_args()
+                             "never claim visual verification; default) / none (skip)")
+    return parser
+
+
+def main() -> None:
+    ensure_utf8_stdio()
+    args = build_arg_parser().parse_args()
 
     workdir = args.workdir
     workdir.mkdir(parents=True, exist_ok=True)

@@ -362,7 +362,11 @@ Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` �
 | **nulls × aggregates 同列** | ❌ `DUPLICATE_TARGET_WRITE` — nulls 逐行清空 (含锚点格), 聚合再写锚点公式, 锚点双写 (特征: "first as empty") | 聚合列不要进 nulls |
 
 规则: **同列只能有一个"值所有者"** (mapping / per_row formula / aggregate /
-nulls / group lowering 五选一); merge 属性与值写入不冲突。
+nulls / group lowering 五选一); merge 属性与值写入不冲突。**聚合列不进
+`group_merges`** — 聚合列同列再声明 group_merges 会命中 `MERGE_MODE_CONFLICT`
+(与「聚合列不进 nulls」并列的单一 owner 不变量); 聚合列的正确形态是「同范围
+merges + aggregates 对」(聚合锚点=合并锚点, 见 Q12/Q19), 普通标签列才保留
+一种合并模式 (group_merges 或 merges 二选一)。
 
 > 注: 早期撰写期文档假设"merges × per_row 同列 → DUPLICATE_TARGET_WRITE";
 > 实测 merges 只写 merge 属性、不注册值写入, 同列共存**编译通过**
@@ -634,6 +638,10 @@ formulas:
   合并区 → 残留被覆盖。聚合锚点恰好落在合并锚点格的 `merges 1:{n} + aggregates
   1:{n}` 同列组合是合法形态 (Q12), 本契约保证非锚点残留由此闭合。
 - 聚合列**不进 `nulls`** (进了 → 锚点双写 DUPLICATE_TARGET_WRITE, "first as empty", Q1/Q13)。
+- 聚合列**不进 group_merges**（与「聚合列不进 nulls」并列的单一 owner 不变量）: 聚合锚点
+  格与组锚点格重合 → 双写; 命中 `MERGE_MODE_CONFLICT` 的正确修复 = **删除该列的
+  `group_merges` 条目、改用同范围 merges + aggregates 对** (聚合锚点=合并锚点,
+  适用于任何块布局, 不绑定 pattern 名)。
 - **每源分组一条 V 的显式范围 merges+aggregates + 总盈亏 W 一条 1:{n}** 的完整
   可复制骨架见 `combination_patterns.yaml` → `multiproduct_block_append` (家用/
   商用双数据块, 克隆残留 + 分组系列盈亏 + 块总盈亏 + 合并, key_outputs 取
@@ -885,7 +893,7 @@ digest, 不要 unzip sheet XML 考古。
 | GROUP_BY_COLUMN_UNMAPPED | group_by 列无列映射 (group_merges / group_aggregates) | 加 columns 映射 |
 | GROUP_AGGREGATES_INVALID | group_aggregates 声明形态非法 (条目非 mapping / per_group 非列表) | 按 Q14 schema 写条目列表 (或 {per_group, whole_run} dict) |
 | BLOCK_KEY_STRUCTURE_INVALID | block 顶层错位键/未知键 — `aggregates`/`per_row`/`group_aggregates` 应写于 `formulas:` 之下, typo (如单数 `formula`) 或任何非合法顶层键; 曾静默丢弃 (不再静默), 现编译期拒绝 (exit 3) | 块级只在 `formulas` 下写聚合类声明 (`formulas: {aggregates: [...]}` / `formulas: {per_row: ...}`); 合法顶层键 = clone_roles/rows/columns/formulas/merges/group_merges/nulls/remove_rows/styles |
-| MERGE_MODE_CONFLICT | 同列混用 merges + group_merges | 每列只用一种合并模式 |
+| MERGE_MODE_CONFLICT | 同列混用 merges + group_merges | 若该列承载聚合（聚合锚点 / 合并覆盖残留）→ 删除其 `group_merges` 条目，改用同范围 merges + aggregates 对（聚合锚点=合并锚点，见 Q12/Q19）；若为普通标签列 → 每列保留一种合并模式（group_merges 或 merges 二选一） |
 | SET_OUT_OF_BOUNDS | sets.path 超出 digest 维度 / 格式非法 | 用模板坐标裸格或完整 DOM 路径 |
 | PROPS_WHITELIST_VIOLATION | props 超出 {numberformat} | 只用白名单键 |
 | CAPABILITY_NOT_ROLLED_OUT | 声明 spike 未解锁的能力 (如 group_aggregates.whole_run 跨块总计, 落点语义待 spike) | 用已解锁表达 (每组合一块 + 块级 aggregates), 或等 spike 结论落地 |

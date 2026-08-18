@@ -206,6 +206,22 @@ MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.p
 「拟变更规则 + 理由 + 逐条 diff」, 用户明确确认后才允许写入。MOD 内容禁止
 承载单次运行事实数字与裁决方式 (见 MOD_TEMPLATE.md「规则变更治理」)。
 
+**MOD conflict 且排除信号命中 → 不再读 MOD 全文核对排除信号是否误报** (Case
+09 P1 第 1 项): 排除信号已命中的裁决结局是 **fail-closed ASK (降级/替换/覆盖)** —
+领域判断不改变裁决机制, 再读 MOD 全文只会做结局不变的确认动作。直接把
+「冲突信号 + 候选 + 裁决选项」呈现给用户。
+
+**MOD ASK 必问清单 (硬性, 一次性枚举)**: 因 MOD 冲突/歧义询问用户时, 必须
+**一轮问全**以下关键映射, 禁止靠第二轮补问 (Case 09 P1 第 2 项):
+- **成本口径**: 原型机成本源列 / 面价 vs 散件 (含管口径 — 原型机成本是否含
+  管理费/运费/关税);
+- **缺失稳定属性**: 源缺角色/无数值的费用列 (财务费用/OA 信保/返点/其他费用)
+  → 数值 0 还是留空、记入 gaps;
+- **费用组成**: 净价公式链 (如 J-K-L-M-N) 引用哪些费用列及其来源角色;
+- **输出文件形态**: 单块 append vs 多块、写入目标 sheet/最终文件路径、是否
+  保留模板既有数据块。
+以上条目只是模板 — 按任务实际增删, 但不得在已知缺关键映射时省略。
+
 ### 3. FillSpec — `fill_spec.yaml` (LLM 撰写)
 
 **规则优先于数据**: 不逐行复制源数据; Compiler 从 flattened CSV 物化行值。
@@ -363,7 +379,9 @@ block/继承/合并结构、静默丢弃候选 — 时, **默认第一轮先查
 `combination_patterns.yaml` / FILLSPEC「组合行为契约」对应 Q, 找可复制的
 模式/骨架** (改列名即用), 而不是自由改 spec 再 compile 碰运气 (Case 05 E4:
 3 次编译反推 → 1 次定向修)。查到匹配模式照抄; 查不到再按 corrective_action
-定向修。
+定向修。**命中 canonical pattern → 直接实例化** (改替换表占位列名即可),
+**不再读 case 复盘 / 测试病历重推组合** (Case 07 改进 2: E3/E4 类重复推导
+压缩为一次实例化)。
 
 ### 5. Draft Execution — `execute_batch.py` (唯一一次填充)
 
@@ -386,8 +404,9 @@ python scripts/execute_batch.py --plan execution_plan.json \
    Readback 用单次范围 get 批量读取 (179 格 ≈ 1s, 而非逐格 ~90s)。
 7. **结构 readback (v2.5)**: 最终行数断言 (FINAL_ROW_COUNT_MISMATCH) + group_merges
    边界断言 (GROUP_BOUNDARY_MISMATCH — validate 对合并残留视而不见)。
-8. **Render QA (v2.5)**: `--render png|html|none` — 只渲染受影响区域
-   (plan.render_qa.region), 单次终局。纯文本模型用 html 结构检查,
+8. **Render QA (v2.5)**: `--render png|html|none` (默认 `html`, issue 03 /
+   Case 07 改进 4 — 省略时按 html 执行, 不必自补 `view html`) — 只渲染受影响
+   区域 (plan.render_qa.region), 单次终局。纯文本模型用 html 结构检查,
    **不得声称视觉验证**; 失败 → RENDER_QA_FAILED。
 9. 写 `draft_receipt.json` (source/template 哈希为**执行时重算值** +
    `input_hash_check` 绑定比对, spec/plan/draft 哈希, op 计数,
@@ -487,12 +506,14 @@ vMerge、unmerge 多步、`merge.down=N` 总跨度 N+1、validate 对合并残�
 
 **机器证据终止条件 (硬性)**: `execute_batch.py` 已返回 `issues_new` /
 `validate` / readback (含结构 readback) / render 后, **禁止**再用 `officecli
-issues` 或读 `execution_plan.json` 人工复核机器已证明的事实 — 坐标、列宽无
-overflow、readback 全过、组边界都已被机器证据证明, 人工复核是冗余探索
-(Case 05 E5/E6: 627/627 + issues 0 后仍手翻 700+ 行 plan / 重跑 officecli
-issues)。唯一例外 = **异常驱动的定向检查**: 仅当失败记录/缺陷驱动 (如 render
-失败、readback 出现意外差异) 时, 才允许 `officecli get` ≤2 次定位具体格, 且
-`get` 与 `issues` 是两回事 — 机器证据已证明时 `officecli issues` 一律禁止。
+issues`、读 `execution_plan.json`、`officecli get` **逐格复核**, 也**禁止读
+case 复盘 / 测试病历作证据** (Case 07 改进 5 / Case 08 R1/R2 扩展: readback
+全绿后仍逐格 get 或读复盘找证据 = 冗余探索) — 坐标、列宽无 overflow、readback
+全过、组边界都已被机器证据证明, 人工复核是冗余探索 (Case 05 E5/E6: 627/627 +
+issues 0 后仍手翻 700+ 行 plan / 重跑 officecli issues)。唯一例外 = **异常驱动
+的定向检查**: 仅当失败记录/缺陷驱动 (如 render 失败、readback 出现意外差异)
+时, 才允许 `officecli get` ≤2 次定位具体格, 且 `get` 与 `issues` 是两回事 —
+机器证据已证明时 `officecli issues` 一律禁止。
 
 ## 失败处置表 (每次失败先分类, 再行动)
 

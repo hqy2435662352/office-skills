@@ -1528,9 +1528,13 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
     group_cols = set(gm_by_col)
     ga_entries, _ = split_group_aggregates(
         cfg.get("formulas", {}).get("group_aggregates"))
+    # Columns that carry an aggregation anchor — the canonical correct shape
+    # when such a column is wrongly put in group_merges is the same-scope
+    # merges + aggregates pair (aggregation anchor = merge anchor, Q12).
+    agg_anchor_cols = ({a.get("col") for a in cfg.get("formulas", {}).get("aggregates", [])}
+                       | {g.get("col") for g in ga_entries})
     merge_cols = sorted({m.get("col") for m in cfg.get("merges", [])}
-                        | {a.get("col") for a in cfg.get("formulas", {}).get("aggregates", [])}
-                        | {g.get("col") for g in ga_entries}
+                        | agg_anchor_cols
                         | group_cols)
 
     # 1. merge-clears on every data row (per-block merge/group/agg columns) —
@@ -1570,11 +1574,18 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
                                                  "group_by column"})
             continue
         if col in v2_merge_cols:
+            if col in agg_anchor_cols:
+                corrective = ("该列承载聚合（聚合锚点 / 合并覆盖残留）: 删除其 "
+                              "group_merges 条目, 改用同范围 merges + aggregates 对"
+                              "（聚合锚点=合并锚点）")
+            else:
+                corrective = ("该列是普通标签列: 每列只保留一种合并模式 — 删除 "
+                              "group_merges 或 merges 之一")
             defects.append({"code": "MERGE_MODE_CONFLICT", "col": col,
                             "message": f"column {col} appears in both merges and "
                                        "group_merges — the merge modes are mutually "
                                        "exclusive per column",
-                            "corrective_action": "Use exactly one merge mode per column"})
+                            "corrective_action": corrective})
             continue
         groups = compute_groups([dr.get("values", {}).get(gcol, "")
                                  for dr in blk_rows])

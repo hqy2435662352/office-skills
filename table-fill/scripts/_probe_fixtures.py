@@ -1107,6 +1107,31 @@ def _header_row_excluded(spec, wd):
     return spec
 
 
+def _merge_conflict_aggregate_col(spec, wd):
+    """聚合列误进 group_merges (issue 03): 该列已带同范围 merges+aggregates 对
+    (聚合锚点=合并锚点, 合法形态 Q12), 再声明 group_merges → MERGE_MODE_CONFLICT,
+    corrective_action 应指向「删 group_merges、改用同范围 merges+aggregates 对」."""
+    _set(spec, "mapping.targets.0.group_merges",
+         [{"col": "G", "group_by": "A", "label": ""}])
+    _set(spec, "mapping.targets.0.merges",
+         [{"col": "G", "rows": "1:{n}", "style": "label"}])
+    _set(spec, "mapping.targets.0.formulas",
+         {"aggregates": [{"col": "G", "rows": "1:{n}",
+                          "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]})
+    return spec
+
+
+def _merge_conflict_label_col(spec, wd):
+    """普通标签列 (映射列 A) 混用 merges+group_merges (issue 03):
+    MERGE_MODE_CONFLICT, corrective_action 应指向「保留一种合并模式」,
+    不误导向聚合组合."""
+    _set(spec, "mapping.targets.0.group_merges",
+         [{"col": "A", "group_by": "A", "style": "label"}])
+    _set(spec, "mapping.targets.0.merges",
+         [{"col": "A", "rows": "1:{n}"}])
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -1215,4 +1240,9 @@ PROBE_CASES = [
     {"id": "single_quotation_block_append", "expect": "accept",
      "build": _single_quotation_block_append,
      "workdir_factory": make_single_block_workdir},
+    # ── issue 03: 聚合列进 group_merges → MERGE_MODE_CONFLICT (正确组合指引) ──
+    {"id": "merge_conflict_aggregate_column", "expect": "MERGE_MODE_CONFLICT",
+     "build": _merge_conflict_aggregate_col},
+    {"id": "merge_conflict_label_column", "expect": "MERGE_MODE_CONFLICT",
+     "build": _merge_conflict_label_col},
 ]
