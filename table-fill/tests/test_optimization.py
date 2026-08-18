@@ -2841,6 +2841,103 @@ class FillSpecContractTests(unittest.TestCase):
             self.assertNotIn("REMOVE_TARGETS_APPEND_ZONE", codes)
             compile_fill.compile_spec(spec, wd["manifest"], tmp)  # 编译通过
 
+    # ── ID-1/ID-2: block 顶层键静态校验 + 块级 formulas 取代契约 ──
+
+    def test_block_top_level_aggregates_rejected(self):
+        """block 顶层 `aggregates:` 曾静默丢弃 (resolve_blocks 透传 +
+        _emit_block_ops 只读 formulas) — 现编译期 BLOCK_KEY_STRUCTURE_INVALID
+        拒绝 (exit 3), corrective_action 点名应写 formulas: {aggregates: [...]}."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli"},
+             "aggregates": [{"col": "G", "rows": "1:{n}",
+                             "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]},
+        ]
+        payload = self._fail_payload(spec)
+        d = next(x for x in payload["defects"]
+                 if x["code"] == "BLOCK_KEY_STRUCTURE_INVALID")
+        self.assertEqual(d["block"], "block[0]")
+        self.assertEqual(d["key"], "aggregates")
+        self.assertIn("formulas.aggregates", d["corrective_action"])
+        self.assertIn("静默忽略", d["message"])
+
+    def test_block_top_level_per_row_and_group_aggregates_rejected(self):
+        """block 顶层其它错位键 (per_row / group_aggregates) 同码拒绝, 各自
+        点名正确嵌套 (黑名单内明确点名)."""
+        for key, nesting in (("per_row", "formulas.per_row"),
+                             ("group_aggregates", "formulas.group_aggregates")):
+            spec = spec_with(self.wd)
+            spec["mapping"]["targets"][0]["blocks"] = [
+                {"clone_roles": [{"role": "data", "template_row": 3}],
+                 "rows": {"source": "source_maoli"},
+                 key: {"G": "A{r}*2"}},
+            ]
+            payload = self._fail_payload(spec)
+            d = next(x for x in payload["defects"]
+                     if x["code"] == "BLOCK_KEY_STRUCTURE_INVALID")
+            self.assertEqual(d["key"], key, f"block 顶层 {key} 应被点名")
+            self.assertIn(nesting, d["corrective_action"], f"{key} → {nesting}")
+
+    def test_block_top_level_unknown_key_rejected(self):
+        """block 顶层未知键 (typo 如单数 `formula`) → 同一缺陷码
+        BLOCK_KEY_STRUCTURE_INVALID, corrective_action 点名合法顶层键."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli"},
+             "formula": {"per_row": {"G": "A{r}*2"}}},
+        ]
+        payload = self._fail_payload(spec)
+        d = next(x for x in payload["defects"]
+                 if x["code"] == "BLOCK_KEY_STRUCTURE_INVALID")
+        self.assertEqual(d["key"], "formula")
+        self.assertIn("clone_roles", d["corrective_action"])
+        self.assertIn("rows", d["corrective_action"])
+
+    def test_block_formulas_replaces_target_per_row(self):
+        """块级声明 `formulas` 即整体取代 target 级 per_row (不合并): 块声明
+        aggregates 而不含 per_row → 块内无任何 target 级 per_row 公式."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {"per_row": {"G": "A{r}*2"}}
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli"},
+             "formulas": {"aggregates": [{"col": "H", "rows": "1:{n}",
+                                          "formula": "SUM(A{r1}:A{r2})",
+                                          "style": "anchor"}]}},
+        ]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        g_ops = [op for op in plan["operations"]
+                 if op["command"] == "set" and op["path"].startswith("/S/G")]
+        self.assertEqual(g_ops, [],
+                         "块级 formulas 取代 target 级 per_row: 块内不得出现 "
+                         "target 级 G 公式 (不合并)")
+        agg = [op for op in plan["operations"]
+               if "formula" in op.get("props", {})
+               and "SUM" in op["props"]["formula"]]
+        self.assertEqual([op["path"] for op in agg], ["/S/H5"],
+                         "块声明自身的 aggregates 仍生效")
+
+    def test_block_no_formulas_inherits_target_per_row(self):
+        """块级不声明 `formulas` → 缺省继承 target 级 per_row: 块数据行出现
+        target 级 per_row 公式 (只写差异 = 继承)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["formulas"] = {"per_row": {"G": "A{r}*2"}}
+        spec["mapping"]["targets"][0]["blocks"] = [
+            {"clone_roles": [{"role": "data", "template_row": 3}],
+             "rows": {"source": "source_maoli"}},
+        ]
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        formulas = {op["path"]: op["props"]["formula"] for op in plan["operations"]
+                    if op["command"] == "set" and op["path"].startswith("/S/G")
+                    and "formula" in op.get("props", {})}
+        self.assertEqual(formulas, {
+            "/S/G5": "A5*2", "/S/G6": "A6*2", "/S/G7": "A7*2"},
+            "块级不声明 formulas → 继承 target 级 per_row (数据行 5-7)")
+
 
 class ExecutionOrderContractTests(unittest.TestCase):
     """「执行顺序保证」契约 (FILLSPEC 章节) 的编译用例背书 — 文档声称与编译器
@@ -3768,7 +3865,10 @@ class CapabilitiesTests(unittest.TestCase):
                     "pptx_nulls", "pptx_remove_rows", "pptx_rows_out_of_bounds",
                     "pptx_basic_fill", "group_aggregates_egypt_3_groups",
                     "group_aggregates_whole_run_gate", "lookup_table_empty",
-                    "lookup_column_all_missing"):
+                    "lookup_column_all_missing", "block_top_aggregates_rejected",
+                    "block_top_unknown_key_rejected",
+                    "block_formulas_replaces_target_per_row",
+                    "block_no_formulas_inherits_target_per_row"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
 
 
@@ -4408,6 +4508,19 @@ class DocCoverageGuardTests(unittest.TestCase):
         table = self._error_code_table()
         self.assertIn("TEMPLATE_ROW_GAP", table)
         self.assertIn("repair_row_gaps.py", table)
+
+    def test_error_code_table_has_block_key_structure_invalid(self):
+        """BLOCK_KEY_STRUCTURE_INVALID 在「常见编译错误速查」表内, 行内修复指引
+        点名"块级错位键"与"应写 formulas 嵌套" (ID-1: 不再静默忽略)."""
+        table = self._error_code_table()
+        self.assertIn("BLOCK_KEY_STRUCTURE_INVALID", table)
+        m = re.search(r"^\|\s*BLOCK_KEY_STRUCTURE_INVALID.*$", table,
+                      re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 BLOCK_KEY_STRUCTURE_INVALID 行")
+        row = m.group(0)
+        self.assertIn("块级", row)
+        self.assertIn("formulas", row)
+        self.assertIn("不再静默", row)
 
     def test_known_traps_row_gap_auto_resync(self):
         """KNOWN_TRAPS 沉淀行洞修复机械事实: 行洞修复 = staged 文件修改 =

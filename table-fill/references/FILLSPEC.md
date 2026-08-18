@@ -759,6 +759,7 @@ digest, 不要 unzip sheet XML 考古。
 | GROUP_MERGE_ANCHOR_UNCOVERED | 无映射 group 列缺 label | 声明 label ("" = 清空) |
 | GROUP_BY_COLUMN_UNMAPPED | group_by 列无列映射 (group_merges / group_aggregates) | 加 columns 映射 |
 | GROUP_AGGREGATES_INVALID | group_aggregates 声明形态非法 (条目非 mapping / per_group 非列表) | 按 Q14 schema 写条目列表 (或 {per_group, whole_run} dict) |
+| BLOCK_KEY_STRUCTURE_INVALID | block 顶层错位键/未知键 — `aggregates`/`per_row`/`group_aggregates` 应写于 `formulas:` 之下, typo (如单数 `formula`) 或任何非合法顶层键; 曾静默丢弃 (不再静默), 现编译期拒绝 (exit 3) | 块级只在 `formulas` 下写聚合类声明 (`formulas: {aggregates: [...]}` / `formulas: {per_row: ...}`); 合法顶层键 = clone_roles/rows/columns/formulas/merges/group_merges/nulls/remove_rows/styles |
 | MERGE_MODE_CONFLICT | 同列混用 merges + group_merges | 每列只用一种合并模式 |
 | SET_OUT_OF_BOUNDS | sets.path 超出 digest 维度 / 格式非法 | 用模板坐标裸格或完整 DOM 路径 |
 | PROPS_WHITELIST_VIOLATION | props 超出 {numberformat} | 只用白名单键 |

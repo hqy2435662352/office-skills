@@ -328,6 +328,74 @@ def validate_nulls_rows(cfg: dict, defects: list) -> None:
                 "corrective_action": "Use rows: all, rows: [1, 3], or rows: \"2:4\""})
 
 
+# Block top-level key allowlist (ID-1). `resolve_blocks` passes through every
+# key the author wrote, and `_emit_block_ops` only reads specific nested keys —
+# a misplaced `aggregates:`/`per_row:`/`group_aggregates:` (which belong under
+# `formulas:`) or a typo (singular `formula`, `column`) at the block top level
+# used to be silently dropped (Case 05 U4/E4, 3 compile round-trips to reverse
+# engineer). Legal keys match the FILLSPEC「blocks: 多数据块」declared surface
+# (含位置模型的 mode 相关声明所属键 — clone_roles 条目内)。
+BLOCK_TOP_LEVEL_KEYS = ("clone_roles", "rows", "columns", "formulas", "merges",
+                        "group_merges", "nulls", "remove_rows", "styles")
+
+# Known-but-misplaced keys → corrective_action names the correct nesting.
+BLOCK_MISPLACED_KEY_NESTING = {
+    "aggregates": "formulas.aggregates",
+    "per_row": "formulas.per_row",
+    "group_aggregates": "formulas.group_aggregates",
+}
+
+# Per-key copy-paste form for the corrective example (agg entries are lists,
+# per_row is a {col: template} map — one generic shorthand would mislead).
+BLOCK_MISPLACED_KEY_EXAMPLE = {
+    "aggregates": "formulas: {aggregates: [{col, rows, formula, style}]}",
+    "per_row": 'formulas: {per_row: {"G": "A{r}-B{r}"}}',
+    "group_aggregates": "formulas: {group_aggregates: [{group_by, col, formula, style}]}",
+}
+
+
+def validate_block_top_level_keys(blocks: list) -> list:
+    """Static allowlist check for every block's top-level keys.
+
+    Runs on the resolved block configs (after `resolve_blocks`), before any
+    layout/op work: a misplaced or unknown key = `BLOCK_KEY_STRUCTURE_INVALID`
+    (compile-time defect, carried on stderr with a corrective_action pointing
+    at the correct nesting) — never a silent ignore again. Returns defects;
+    the caller fails compilation (exit 3) when non-empty."""
+    defects: list = []
+    legal = list(BLOCK_TOP_LEVEL_KEYS)
+    for bi, b in enumerate(blocks):
+        for key in b:
+            if key.startswith("_"):
+                continue  # internal keys (e.g. `_rows`)
+            if key in BLOCK_TOP_LEVEL_KEYS:
+                continue
+            label = f"block[{bi}]"
+            if key in BLOCK_MISPLACED_KEY_NESTING:
+                target = BLOCK_MISPLACED_KEY_NESTING[key]
+                example = BLOCK_MISPLACED_KEY_EXAMPLE[key]
+                defects.append({
+                    "code": "BLOCK_KEY_STRUCTURE_INVALID", "block": label,
+                    "key": key,
+                    "message": f"{label}: 顶层键 {key!r} 位置错误 — 它属于 {target} "
+                               "(嵌套在 `formulas` 之下); 写在 block 顶层会被 "
+                               "静默忽略, 不再通过",
+                    "corrective_action": f"把 {key} 移到 {target} 下 — 写为 "
+                                         f"`{example}`",
+                })
+            else:
+                defects.append({
+                    "code": "BLOCK_KEY_STRUCTURE_INVALID", "block": label,
+                    "key": key,
+                    "message": f"{label}: 顶层键 {key!r} 不在合法键列表 "
+                               f"{legal} 内 — 拼写错误或错位键会被静默忽略, "
+                               "不再通过",
+                    "corrective_action": f"检查 {key!r} 的拼写/层级; 合法顶层键 = "
+                                         f"{', '.join(legal)}",
+                })
+    return defects
+
+
 def resolve_blocks(target: dict) -> list[dict]:
     """Target block list with single-block backward compatibility.
 
@@ -2176,6 +2244,15 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
 
     # Blocks — one implicit block (target-level config) or explicit blocks[].
     blocks_cfg = resolve_blocks(target_cfg)
+
+    # Block top-level key allowlist (ID-1): misplaced/unknown keys
+    # (aggregates/per_row/group_aggregates at the block top level, typos) used
+    # to pass through resolve_blocks and get silently dropped by _emit_block_ops
+    # (Case 05 U4/E4) — now a compile-time BLOCK_KEY_STRUCTURE_INVALID.
+    defects += validate_block_top_level_keys(blocks_cfg)
+    if defects:
+        fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+             "Fix the spec and re-run compile_fill.py", defects)
 
     # Inplace declaration invariants (fail before layout: a
     # malformed region must never reach coordinate arithmetic).

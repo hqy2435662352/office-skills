@@ -729,6 +729,55 @@ def _group_aggregates_malformed_shape(spec, wd):
     return spec
 
 
+def _block_top_aggregates(spec, wd):
+    """错位键: block 顶层写 `aggregates:` (应为 `formulas.aggregates:`) —
+    曾静默丢弃 (resolve_blocks 透传 + _emit_block_ops 只读 formulas),
+    现编译期 BLOCK_KEY_STRUCTURE_INVALID 拒绝."""
+    _set(spec, "mapping.targets.0.blocks", [
+        {"clone_roles": [{"role": "data", "template_row": 3}],
+         "rows": {"source": "source_maoli"},
+         "aggregates": [{"col": "G", "rows": "1:{n}",
+                         "formula": "SUM(A{r1}:A{r2})", "style": "anchor"}]},
+    ])
+    return spec
+
+
+def _block_top_unknown_key(spec, wd):
+    """未知/typo 键: block 顶层写单数 `formula:` → BLOCK_KEY_STRUCTURE_INVALID
+    (与 `aggregates` 同一缺陷码, corrective_action 点名合法顶层键)."""
+    _set(spec, "mapping.targets.0.blocks", [
+        {"clone_roles": [{"role": "data", "template_row": 3}],
+         "rows": {"source": "source_maoli"},
+         "formula": {"per_row": {"G": "A{r}*2"}}},
+    ])
+    return spec
+
+
+def _block_formulas_replaces_target_per_row(spec, wd):
+    """块级声明 `formulas` 即整体取代 target 级 formulas: 这个块声明了
+    aggregates 但不含 per_row → 块内不继承 target 级 per_row (不合并)."""
+    _set(spec, "mapping.targets.0.formulas", {"per_row": {"G": "A{r}*2"}})
+    _set(spec, "mapping.targets.0.blocks", [
+        {"clone_roles": [{"role": "data", "template_row": 3}],
+         "rows": {"source": "source_maoli"},
+         "formulas": {"aggregates": [{"col": "H", "rows": "1:{n}",
+                                      "formula": "SUM(A{r1}:A{r2})",
+                                      "style": "anchor"}]}},
+    ])
+    return spec
+
+
+def _block_no_formulas_inherits_target_per_row(spec, wd):
+    """块级不声明 `formulas` → 缺省继承 target 级 formulas (含 per_row):
+    块内出现 target 级 per_row 公式 (不写差异 = 继承)."""
+    _set(spec, "mapping.targets.0.formulas", {"per_row": {"G": "A{r}*2"}})
+    _set(spec, "mapping.targets.0.blocks", [
+        {"clone_roles": [{"role": "data", "template_row": 3}],
+         "rows": {"source": "source_maoli"}},
+    ])
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -816,4 +865,13 @@ PROBE_CASES = [
      "build": _group_aggregates_group_by_unmapped},
     {"id": "group_aggregates_malformed_shape", "expect": "GROUP_AGGREGATES_INVALID",
      "build": _group_aggregates_malformed_shape},
+    # ── ID-1/ID-2: block 顶层键静态校验 + 块级 formulas 取代契约 ──
+    {"id": "block_top_aggregates_rejected", "expect": "BLOCK_KEY_STRUCTURE_INVALID",
+     "build": _block_top_aggregates},
+    {"id": "block_top_unknown_key_rejected", "expect": "BLOCK_KEY_STRUCTURE_INVALID",
+     "build": _block_top_unknown_key},
+    {"id": "block_formulas_replaces_target_per_row", "expect": "accept",
+     "build": _block_formulas_replaces_target_per_row},
+    {"id": "block_no_formulas_inherits_target_per_row", "expect": "accept",
+     "build": _block_no_formulas_inherits_target_per_row},
 ]
