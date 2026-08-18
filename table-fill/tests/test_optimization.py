@@ -2644,6 +2644,56 @@ class FillSpecContractTests(unittest.TestCase):
         g_op = next(op for op in plan["operations"] if op.get("path") == "/S/G7")
         self.assertEqual(g_op["props"]["value"], "0")
 
+    def test_formula_referenced_column_missing_writes_zero(self):
+        """0-口径二分 (issue 01): **入公式链列缺失 → 数值 0** (常量
+        value: "0"), readback 期待数值 "0" — 空串会令公式求值链按非空文本
+        判错 → #VALUE! → IFERROR 兜底 0 (Case 07 §8)."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["columns"] = [
+            {"source": "A", "target": "A"},
+            {"source": "B", "target": "B"},
+            {"source": "C", "target": "C"},
+            {"target": "F", "value": "0"},      # 被 H 公式引用
+        ]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"H": "IFERROR(F{r}-A{r},0)"}}
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        f7 = next(op for op in plan["operations"] if op.get("path") == "/S/F7")
+        self.assertEqual(f7["props"]["value"], "0")
+        rb = next(rb for rb in plan["readback"] if rb["path"] == "/S/F7")
+        self.assertEqual(rb["kind"], "value")
+        self.assertEqual(rb["expect"], "0")
+
+    def test_standalone_display_column_blank_still_accepted(self):
+        """0-口径二分 (issue 01): **独立展示、不入任何公式链的字段缺失 →
+        才可留空** (空串 readback) — 与「入公式链列 → 数值 0」二分判据是
+        公式是否引用, 独立列留空仍被接受."""
+        with open(self.tmp / "source_maoli_flat.csv", "w", newline="",
+                  encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(["家用", "12K", "Z001", "", "C-1", "1", "2", "3", "101"])
+            csv.writer(f).writerow(["家用", "18K", "Z002", "", "C-2", "4", "5", "6", "102"])
+            csv.writer(f).writerow(["商用", "24K", "Z003", "", "C-3", "7", "8", "9", "103"])
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["columns"] = [
+            {"source": "A", "target": "A"},
+            {"source": "B", "target": "B"},
+            {"source": "C", "target": "C"},
+            {"source": "D", "target": "E"},     # 独立展示列 (源 D 空)
+            {"target": "F", "value": "0"},      # 入公式链列 (H 公式引用)
+        ]
+        spec["mapping"]["targets"][0]["nulls"] = [{"col": "D", "rows": "all"}]
+        spec["mapping"]["targets"][0]["formulas"] = {
+            "per_row": {"H": "IFERROR(F{r}-A{r},0)"}}
+        self.assertEqual(self._fail_codes(spec), [])
+        plan = compile_spec_with(self.wd, spec)
+        e7 = next(op for op in plan["operations"] if op.get("path") == "/S/E7")
+        self.assertEqual(e7["props"]["value"], "")
+        rb = {r["path"]: r for r in plan["readback"]}
+        self.assertEqual(rb["/S/E7"]["kind"], "value")
+        self.assertEqual(rb["/S/E7"]["expect"], "")
+        self.assertEqual(rb["/S/F7"]["expect"], "0")
+
     # ── Q6: lookup missing 语义 ──
     def test_lookup_missing_empty_leaves_blank_cell(self):
         """missing: empty → 缺失 key 的格留空 (空串 readback); 命中行正常取值."""
@@ -4162,6 +4212,44 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("减法", section)
         self.assertIn("per_row", section)
         self.assertIn("ROUND", section)
+
+    def test_fillspec_q5_zero_policy_duality_words(self):
+        """FILLSPEC Q5 含 0-口径二分契约词 (issue 01): 入公式链字段 → 数值 0;
+        独立展示、不入公式链字段才可留空 — Case 07 §8 教训 (空串进公式链 →
+        #VALUE! → IFERROR 兜底 0)."""
+        section = self._fillspec_section("组合行为契约")
+        m = re.search(r"^### Q5:.*\n", section, re.MULTILINE)
+        self.assertIsNotNone(m, "契约章节缺 Q5 小节")
+        q5 = section[m.end():]
+        for word in ("入公式链", "数值 0", "value: \"0\"", "独立展示",
+                     "IFERROR", "兜底"):
+            self.assertIn(word, q5, f"FILLSPEC Q5 缺 0-口径契约词 {word!r}")
+
+    def test_combination_patterns_zero_policy_duality(self):
+        """combination_patterns.yaml zero_policy 同步 0-口径二分 (issue 01):
+        入公式链 → value "0"; 独立展示才可留空; 含反例警示 (空串 → IFERROR 兜底)."""
+        text = (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(
+            encoding="utf-8")
+        m = re.search(r"- id: zero_policy", text)
+        self.assertIsNotNone(m, "缺 zero_policy pattern")
+        entry = text[m.start():m.start() + 800]
+        for word in ("入公式链", "数值 0", "独立展示", "IFERROR", "兜底"):
+            self.assertIn(word, entry, f"zero_policy 缺 0-口径二分词 {word!r}")
+
+    def test_skill_md_formula_zero_policy_duality(self):
+        """SKILL「公式约定」0-口径段含二分词 (issue 01): 入公式链 → 数值 0,
+        独立展示才可留空."""
+        text = self._skill_md_text()
+        for word in ("入公式链", "数值 0", "独立展示", "IFERROR", "兜底"):
+            self.assertIn(word, text, f"SKILL.md 缺 0-口径二分词 {word!r}")
+
+    def test_known_traps_zero_policy_formula_chain(self):
+        """KNOWN_TRAPS 含「费用列空串进公式链 → 净价兜底 0」机械事实
+        (issue 01, Case 07 §8): 空串被公式链按非空文本判错 → IFERROR 兜底 0."""
+        text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+            encoding="utf-8")
+        for word in ("费用列空串进公式链", "兜底", "IFERROR", "0-口径二分"):
+            self.assertIn(word, text, f"KNOWN_TRAPS 缺 0-口径机械事实词 {word!r}")
 
     def test_fillspec_precision_recommendation_order(self):
         """round4 推荐次序在契约章节中: Q7 小节正文内 round4 必须先于 keep

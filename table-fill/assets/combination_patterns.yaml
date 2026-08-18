@@ -88,13 +88,22 @@ patterns:
           label: ""      # 无映射列的锚点文本 ("" = 清空)
 
   # ── Q5: 0-口径 ──
+  # 二分 (FILLSPEC Q5, Case 07 §8): 入公式链字段 → 数值 0; 独立展示字段才可
+  # 留空. 判定标准 = 该目标列是否被本块任一公式 (per_row/aggregates/
+  # group_aggregates) 引用. 反例警示: 被净价等公式引用的费用列写成空串 → 空串
+  # 被公式求值链按非空文本判错误 → #VALUE! → IFERROR 兜底成 0 (净价列全 0).
   - id: zero_policy
     question: 报价缺失行 (0-口径) 怎么写?
-    answer: 常量 "0" + 缺失源留空; 数值 0 不是缺失, 原样写入
+    answer: |
+      二分: 被本块任一公式引用的纯数据列缺失 → 常量 `value: "0"` (非空串);
+      独立展示、不入任何公式链的字段缺失 → 才可留空。空串进公式链会被按
+      非空文本判错误 → #VALUE! → IFERROR 兜底成 0 (Case 07 §8 教训)。
     fragment: |
       columns:
         - target: J
-          value: "0"              # 常量 (0-口径)
+          value: "0"              # 入公式链字段 (如被净价公式引用的报价/费用列) 缺失 → 数值 0
+        - target: X
+          value: ""               # 独立展示、不入公式链的字段才可留空
         - source: [P, Q]
           target: N               # 多列求和, 缺失/空/"-" 按 0
 
