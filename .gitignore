@@ -43,5 +43,5 @@ test_fixtures/
 /.scratch/
 
 # table-fill 本地私有物 (不随版本控制/发布推送)
-.agents/skills/table-fill/references/MOD_tcl_*
-.agents/skills/table-fill/evals/
+table-fill/references/MOD_tcl_*
+table-fill/evals/
