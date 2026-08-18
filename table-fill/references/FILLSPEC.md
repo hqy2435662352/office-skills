@@ -137,6 +137,13 @@ template_row 的**格式 + 值** — 因此:
 - 无 selectors = 全部源行。多个 selector AND 组合。
 - `pattern` / `not_pattern` 用 fnmatch (支持 `Z*`、`拖多*`); `not_value` 精确排除。
 - 匹配 0 行 → 编译失败 (NO_MATCHED_ROWS); required_coverage 行未消费 → 编译失败。
+- **表头行守卫 (issue 02, Case 08 U1)**: **展平 CSV 首行（表头）是候选数据行** —
+  源表首行的表头文本行 (类别/型号/…) 也是被匹配的源行。**源列含表头文本行时,
+  无 selector 会把表头映射进数据区**, 必须在 selectors 用 pattern/not_pattern 排除
+  (如 `{column: A, pattern: "<业务类别>*"}` 或 `{column: A, not_value: "类别"}`)。
+  Compiler 在「rows 无 selector 或 selector 未排除首行、且首行是表头文本行」时给出
+  编译警告 `HEADER_ROW_CONSIDERED_DATA` (不改失败语义, 记 warnings) — 机械事实:
+  表头文本行 = >= 2 个非空 cell 且全部非数值的连续文本标签行。
 
 ### columns
 
@@ -630,7 +637,10 @@ formulas:
 - **每源分组一条 V 的显式范围 merges+aggregates + 总盈亏 W 一条 1:{n}** 的完整
   可复制骨架见 `combination_patterns.yaml` → `multiproduct_block_append` (家用/
   商用双数据块, 克隆残留 + 分组系列盈亏 + 块总盈亏 + 合并, key_outputs 取
-  blocks[].data_start 与聚合/合并锚点格)。
+  blocks[].data_start 与聚合/合并锚点格); **单块报价/核价块 (一个源一块, 无分组)
+  用同一机制的 `single_quotation_block_append`** (净价公式链 + 总盈亏一条 1:{n}
+  merges+aggregates + 0-口径费用列 + 克隆残留/外部引用 nulls, rows.selectors 必须
+  排除表头行)。
 
 ## 执行顺序保证 (Execution Order Contract)
 
@@ -855,6 +865,7 @@ digest, 不要 unzip sheet XML 考古。
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
 | LOOKUP_TABLE_EMPTY | 索引归一化后为空 (field_consensus 丢失 / 文件被手工改写) | 检查索引结构, 用 build_inheritance_index.py 重建 — 禁止手改 JSON |
 | LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建); 重建前检查索引输入是否误含目标 sheet (自引用 → 共识 conflict → 缺失) |
+| HEADER_ROW_CONSIDERED_DATA | 展平 CSV 首行（表头文本行）被当作候选数据行 — rows 无 selector（或 selector 未排除首行）会把表头映射进数据区 (警告, 不阻断; issue 02 / Case 08 U1) | 在 rows.selectors 加 pattern/not_pattern 排除表头行 (如 `column A pattern 业务类别*` 或 `column A not_value 类别`) |
 | REQUIRED_COVERAGE_UNMATCHED | 必需源行未消费 | 修 selectors 或记入 gaps |
 | SPEC_TARGETS_TOO_MANY | 声明了多个目标 | 每次运行只编译一个目标 |
 | SPEC_NON_STRING_ITEM | `decisions`/`gaps` 条目被 YAML 解析成 mapping (裸标量含 `: `) | **整行双引号包裹** (含冒号): `- "追加新历史块: 源文件 ..."` — corrective_action 给正确写法, 照抄即可 |

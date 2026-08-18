@@ -234,6 +234,12 @@ Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_templa
 - **布局决策先查决策树**: inplace vs clone-append vs 收缩 三选一以 digest
   样式粒度事实为第一判定条件 (带样式→inplace, 裸行→clone-append, 占位行
   自然下沉), 不凭占位块存在性猜 — 见 FILLSPEC「布局决策树」。
+- **本场景最小文献面 (单块核价块/报价块 append)**: 不要全文通读 FILLSPEC
+  (Case 08 R3 收敛) — 只读 FILLSPEC「布局决策树」+「组合行为契约」
+  Q5 (0-口径) / Q8 (克隆源) / Q12 (merges×aggregates) / Q19 (聚合不自动建合并区)
+  + 本文件「公式约定」ROUND 精准原则 + `combination_patterns.yaml` →
+  `single_quotation_block_append` (单块骨架, rows.selectors 必须排除表头行)。
+  `selectors` 段另含表头行守卫警告 `HEADER_ROW_CONSIDERED_DATA` 的机械事实。
 - `decisions` / `gaps` / `lineage` 必填 — 追溯事实
 - `validation`: `required_coverage` (源行必须被消费) + `key_outputs`
   (readback 采样格, 必须是被写入的格) + `required_empty`

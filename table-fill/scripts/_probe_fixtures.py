@@ -365,6 +365,115 @@ def make_multiproduct_block_workdir(tmp) -> dict:
     return {"manifest": manifest}
 
 
+HEADER_FIRST_ROWS = [
+    ["类别", "产品类别", "型号", "规格", "数量"],
+    ["家用", "分体机", "T3ACMAX12XA51", "12K", "500"],
+    ["家用", "分体机", "T3ACMAX18XA51", "18K", "450"],
+    ["商用", "柜机", "T3ACMAX48XA51", "48K", "200"],
+]
+
+
+def make_header_row_workdir(tmp) -> dict:
+    """Source whose flattened CSV FIRST row is the source sheet's header text
+    row (类别/产品类别/型号/… — 全部文本标签, 无数值 cell).
+
+    Mechanical fact for HEADER_ROW_CONSIDERED_DATA (issue 02, Case 08 U1): a
+    flattened sheet's top row is the source table's title/header, and it is a
+    *candidate data row* — a rows config without selectors maps that header
+    text into the data region. This workdir pins the guard: no selector →
+    HEADER_ROW_CONSIDERED_DATA warning; a selector that excludes the header
+    (e.g. `column A pattern 家用*`) → no warning."""
+    return make_probe_workdir(tmp, src_rows=HEADER_FIRST_ROWS,
+                              n_source_rows=len(HEADER_FIRST_ROWS), n_cols=10)
+
+
+SINGLE_BLOCK_SRC_ROWS = [
+    # 首行 = 表头文本行 (类别/产品类别/型号/成本) — selector 必须排除 (U1)
+    ["类别", "产品类别", "型号", "成本"],
+    ["核心款", "T3ACMAX12XA51", "12K", "168.715100569657"],
+    ["核心款", "T3ACMAX18XA51", "18K", "175.400000000001"],
+    ["核心款", "T3ACMAX12XA82", "12K", "182.52"],
+    ["核心款", "柜机", "T3ACMAX48XA82", "48K", "300.5"],
+    ["核心款", "柜机", "T3ACMAX60XA82", "60K", "355.1"],
+]
+
+
+def make_single_block_workdir(tmp) -> dict:
+    """单块报价/核价 canonical-pattern fixture (issue 02): ONE source sheet
+    `source_quote` (5 数据行, 首行表头文本) and a 26-col target (col Z in
+    width) shaped like the MXP 17_MXP 单块 append 目标.
+
+    Deterministic contract-test geometry: base_last_row 4 → 单块
+    spacer5/title6/header7/data8-12; 模板数据行 4 携带克隆残留 H/X/Z
+    (→ nulls) + Y (总盈亏 merges+aggregates); 源成本 D (15 位长精度) →
+    R round4; S = 0-口径常量。selector `column A pattern 核心*` 排除表头行
+    (U1: 不排除表头会进数据区)."""
+    with open(tmp / "source_quote_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(SINGLE_BLOCK_SRC_ROWS):
+            csv.writer(f).writerow(row + [101 + i])
+
+    target_meta = {
+        "sheet": "S",
+        "dimensions": {"rows": 14, "cols": 26, "data_rows": 5},
+        "header_band": {"header_rows": [2], "data_start_row": 3},
+        "merged_ranges": ["A5:A6"],
+        "merge_anchors": [{"range": "A5:A6", "anchor": "A5", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 2}, {"col": "B", "nonempty": 2}],
+        "formulas": {},
+        "column_numfmt": {},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+
+    def _row(*_, cols: dict, orig: int) -> list:
+        cells = [""] * 26
+        for ci_1, val in cols.items():   # ci_1: 1-based column letter index
+            cells[ci_1 - 1] = val
+        return cells + [str(orig)]
+
+    # 模板数据行 (orig=4) 携带克隆残留 H/X/Z、总盈亏列 Y 与映射列 A/B/R/S —
+    # 全部被 skeleton 的 columns/nulls/merges 覆盖 (无 CLONE_RESIDUE);
+    # 净价公式输入槽 L-P/数量 G 不载入模板 (由用户映射源列, 避免未覆盖残留)。
+    with open(tmp / "target_flat.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(_row(cols={1: "标题"}, orig=1))
+        w.writerow(_row(cols={1: "类别", 2: "产品类别", 3: "型号"}, orig=2))
+        w.writerow(_row(cols={1: "模板数据样式行"}, orig=3))
+        w.writerow(_row(cols={1: "核心款", 2: "T3ACMAX12XA51", 8: "H-1",
+                              18: "R-1", 19: "S-1", 24: "X-1", 25: "Y-1", 26: "Z-1"},
+                              orig=4))
+        for r in range(5, 15):
+            w.writerow(_row(cols={}, orig=r))
+
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [
+            {"staged": "source_quote.xlsx", "source": "x", "sha256": "a"},
+            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
+        ],
+        "flattened": [
+            {"file": "source_quote.xlsx", "sheet": "核价", "name": "source_quote",
+             "csv": "source_quote_flat.csv", "meta": "m.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "target.xlsx", "sheet": "S", "name": "target",
+             "csv": "target_flat.csv", "meta": "target_meta.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+        ],
+        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
+                   "csv": "target_flat.csv", "meta": "target_meta.json",
+                   "digest": "d.md", "candidates": "c.yaml"},
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    return {"manifest": manifest}
+
+
 def make_empty_lookup_workdir(tmp) -> dict:
     """Broken index: entries present but field_consensus dropped (hand-rewritten
     JSON) → normalization produces an EMPTY table → LOOKUP_TABLE_EMPTY."""
@@ -930,6 +1039,74 @@ def _multiproduct_block_append(spec, wd):
     return spec
 
 
+def _single_quotation_block_append(spec, wd):
+    """单块报价/核价 canonical pattern 结构 — 与 combination_patterns.yaml
+    `single_quotation_block_append` 同构 (程序化构造, 供 probe/capabilities):
+    spacer/title/header/data 单块, selector 排除表头行 (U1), 商业/费用列
+    0-口径常量 (S), ROUND 精准 per_row (Q/T/U/V/W: 减/乘/除 ROUND2、
+    纯加法 T 不加、比率 W ROUND4), 总盈亏 Y merges+aggregates (比率 ROUND4),
+    克隆残留/外部引用 H/X/Z nulls。"""
+    spec["inputs"]["sources"] = ["source_quote.xlsx"]
+    spec["inputs"]["source_sheets"] = [{"source": "source_quote.xlsx",
+                                        "sheets": ["核价"]}]
+    spec["lineage"] = [{"source": "source_quote_flat.csv", "role": "primary",
+                        "note": ""}]
+    _set(spec, "mapping.targets.0.base_last_row", 4)
+    _set(spec, "mapping.targets.0.clone_roles", [
+        {"role": "spacer"},
+        {"role": "title", "template_row": 1, "value": "单块报价标题"},
+        {"role": "header", "template_row": 2},
+        {"role": "data", "template_row": 4},
+    ])
+    _set(spec, "mapping.targets.0.rows",
+         {"source": "source_quote",
+          "selectors": [{"column": "A", "pattern": "核心*"}]})
+    _set(spec, "mapping.targets.0.columns", [
+        {"source": "A", "target": "A"},
+        {"source": "B", "target": "B"},
+        {"source": "D", "target": "R", "transform": "round4"},
+        {"target": "S", "value": "0"},
+    ])
+    _set(spec, "mapping.targets.0.formulas", {
+        "per_row": {
+            "Q": "IFERROR(ROUND(L{r}-M{r}-N{r}-O{r}-P{r},2),0)",
+            "T": "IFERROR(S{r}+R{r},0)",
+            "U": "IFERROR(ROUND(Q{r}*G{r},2),0)",
+            "V": "IFERROR(ROUND((Q{r}-T{r})*G{r},2),0)",
+            "W": "IFERROR(IF(U{r}=0,0,ROUND(V{r}/U{r},4)),0)",
+        },
+        "aggregates": [
+            {"col": "Y", "rows": "1:{n}",
+             "formula": "IFERROR(ROUND(SUM(V{r1}:V{r2})/SUM(U{r1}:U{r2}),4),0)",
+             "style": "anchor"},
+        ],
+    })
+    _set(spec, "mapping.targets.0.merges",
+         [{"col": "Y", "rows": "1:{n}", "style": "label"}])
+    _set(spec, "mapping.targets.0.nulls", [
+        {"col": "X", "rows": "all"},
+        {"col": "Z", "rows": "all"},
+        {"col": "H", "rows": "all"},
+    ])
+    _set(spec, "validation.key_outputs", ["A8", "Q8", "W8", "Y8"])
+    return spec
+
+
+def _header_row_no_selector(spec, wd):
+    """表头行是候选数据行且 rows 无 selector → HEADER_ROW_CONSIDERED_DATA
+    (compile 仍 accept, 记 warnings)."""
+    return spec  # base spec: rows {source: source_maoli} 无 selectors
+
+
+def _header_row_excluded(spec, wd):
+    """selector 排除表头行 → 无 HEADER_ROW_CONSIDERED_DATA 警告."""
+    _set(spec, "mapping.targets.0.rows", {
+        "source": "source_maoli",
+        "selectors": [{"column": "A", "pattern": "家用*"}],
+    })
+    return spec
+
+
 PROBE_CASES = [
     # ── 组合行为契约 Q1: group_merges × formulas/aggregates ──
     {"id": "group_merges_aggregate_same_col", "expect": "DUPLICATE_TARGET_WRITE",
@@ -1030,4 +1207,12 @@ PROBE_CASES = [
     {"id": "multiproduct_block_append", "expect": "accept",
      "build": _multiproduct_block_append,
      "workdir_factory": make_multiproduct_block_workdir},
+    # ── issue 02: 表头行守卫 (HEADER_ROW_CONSIDERED_DATA) + 单块骨架 ──
+    {"id": "header_row_considered_data", "expect": "accept",
+     "build": _header_row_no_selector, "workdir_factory": make_header_row_workdir},
+    {"id": "header_row_excluded_by_selector", "expect": "accept",
+     "build": _header_row_excluded, "workdir_factory": make_header_row_workdir},
+    {"id": "single_quotation_block_append", "expect": "accept",
+     "build": _single_quotation_block_append,
+     "workdir_factory": make_single_block_workdir},
 ]

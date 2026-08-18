@@ -712,6 +712,27 @@ def apply_selectors(rows: list[tuple[list[str], int]], rows_cfg: dict,
     return result
 
 
+def is_header_text_row(cells: list) -> bool:
+    """Is a flattened source row a header/title TEXT row (vs a data row)?
+
+    Mechanical fact for HEADER_ROW_CONSIDERED_DATA (issue 02, Case 08 U1): a
+    flattened sheet's top row is the source table's title/header — e.g.
+    类别/产品类别/型号/... — and it is a *candidate data row*. When the
+    fill's rows config has no selector (or the selector lets the first row
+    through) that header row gets mapped into the data region.
+
+    Detection is data-only and deterministic so the guard never needs the
+    source meta: a header row is a run of text labels — >= 2 non-empty cells
+    and NONE of them parses as a number. Real data rows of a fill almost
+    always carry a quantity/money/SKU number; probe fixtures' first rows
+    (家用/12K/Z001/1/2/3) therefore never trip it.
+    """
+    nonempty = [str(c).strip() for c in cells if str(c) and str(c).strip()]
+    if len(nonempty) < 2:
+        return False
+    return all(_parse_number(c) is None for c in nonempty)
+
+
 # ── Value materialization ──────────────────────────────────────────────
 
 def _resolve_transform(tname: str, transforms: dict):
@@ -2295,6 +2316,26 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             if not matched:
                 fail("NO_MATCHED_ROWS", f"{label}: selectors matched zero rows in {src_name}",
                      "Fix selectors or check the source flatten")
+            # issue 02 / Case 08 U1: 展平 CSV 首行（表头）是候选数据行 — rows
+            # 无 selector（或 selector 未排除）且首行是表头文本行时, 表头会被
+            # 映射进数据区 (失败语义不变, 记 warnings)。corrective_action 指向
+            # pattern/not_pattern 排除表头行。
+            if src_rows and is_header_text_row(src_rows[0][0]):
+                first_orig = src_rows[0][1]
+                if any(o == first_orig for _, o in matched):
+                    first_label = next((str(c) for c in src_rows[0][0]
+                                        if str(c).strip()), "")
+                    warnings.append({
+                        "code": "HEADER_ROW_CONSIDERED_DATA",
+                        "source": src_name,
+                        "message": f"{label}: source {src_name!r} 的展平 CSV 首行"
+                                   f"（表头文本 {first_label!r}）被当作候选数据行 — "
+                                   "rows 无 selector（或 selector 未排除首行）时表头会被"
+                                   "映射进数据区",
+                        "corrective_action": "在 rows.selectors 加 pattern/not_pattern "
+                                             "排除表头行 (如 `column A pattern 业务类别*` "
+                                             "或 `column A not_value 类别`)",
+                    })
             out.append({"name": src_name, "csv": src_entry["csv"], "rows": src_rows,
                         "matched": matched})
         return out
@@ -2764,10 +2805,12 @@ def run_probe_cases(workdir: Path) -> list[dict]:
         }
         r = probe_spec(spec, wd["manifest"], workdir)
         codes = [d.get("code") for d in r.get("defects", [])]
+        warn_codes = sorted({w.get("code") for w in r.get("warnings", [])})
         out.append({
             "id": case["id"],
             "accepted": r["accepted"],
             "code": codes[0] if codes else r.get("code"),
+            "warnings": warn_codes,
             "expect": case["expect"],
         })
     return out

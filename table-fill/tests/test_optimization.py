@@ -23,10 +23,12 @@ from _probe_fixtures import (  # noqa: E402
     make_all_missing_lookup_workdir,
     make_empty_lookup_workdir,
     make_egypt_workdir,
+    make_header_row_workdir,
     make_multiproduct_block_workdir,
     make_preformatted_quotation_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
+    make_single_block_workdir,
 )
 
 
@@ -2990,6 +2992,71 @@ class FillSpecContractTests(unittest.TestCase):
             "块级不声明 formulas → 继承 target 级 per_row (数据行 5-7)")
 
 
+class HeaderRowGuardContractTests(unittest.TestCase):
+    """issue 02 / Case 08 U1 — HEADER_ROW_CONSIDERED_DATA 表头行守卫契约:
+
+    展平 CSV 首行（表头文本行）是候选数据行; rows 无 selector 或 selector
+    未排除首行且首行是表头文本行 → 编译警告 HEADER_ROW_CONSIDERED_DATA
+    (失败语义不变, 记 warnings); 加 pattern/not_pattern 排除表头行 → 无警告。
+    探测第一个触发条件 (机械事实以 probe 固化): 首行 = 全文本标签 (>= 2 个
+    非空 cell 且无数值 cell) 才判定为表头文本行 — 真实数据行几乎必带数值, 因此
+    普通 fill (首行是数据行) 不误报。
+    """
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_header_row_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _warn_codes(self, spec) -> list[str]:
+        plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.wd["workdir"])
+        return [w["code"] for w in plan["warnings"]]
+
+    def test_header_row_considered_data_without_selector(self):
+        """rows 无 selector + 源 flat 首行为表头文本行 → HEADER_ROW_CONSIDERED_DATA
+        警告 (compile 仍 accept, 失败语义不变)."""
+        spec = spec_with(self.wd)
+        self.assertEqual(self._warn_codes(spec), ["HEADER_ROW_CONSIDERED_DATA"])
+        codes = compile_fail_codes(self.wd, spec)
+        self.assertEqual(codes, [], "警告不改变失败语义 (不 exit 3)")
+
+    def test_header_row_guard_message_and_corrective_action(self):
+        """警告携带 source 与 corrective_action: 「加 pattern/not_pattern 排除
+        表头行」并给出 `column A pattern 业务类别*` 示例词."""
+        spec = spec_with(self.wd)
+        plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.wd["workdir"])
+        guard = next(w for w in plan["warnings"]
+                     if w["code"] == "HEADER_ROW_CONSIDERED_DATA")
+        self.assertEqual(guard["source"], "source_maoli")
+        for word in ("pattern", "not_pattern", "排除表头行", "候选数据行"):
+            self.assertIn(word, guard["message"] + guard["corrective_action"],
+                          f"守卫缺词 {word!r}")
+        self.assertIn("业务类别", guard["corrective_action"])
+
+    def test_header_row_excluded_by_selector_no_warning(self):
+        """加 pattern 排除表头行 (行 A=类别 不匹配 家用*) → 无
+        HEADER_ROW_CONSIDERED_DATA 警告."""
+        spec = spec_with(self.wd)
+        spec["mapping"]["targets"][0]["rows"]["selectors"] = [
+            {"column": "A", "pattern": "家用*"}]
+        self.assertEqual(self._warn_codes(spec), [],
+                         "selector 排除表头行后不应再警告")
+
+    def test_data_first_source_no_warning(self):
+        """首行是普通数据行 (含数值 cell) → 不误报 (既有 fixture 全绿的前提)."""
+        with tempfile.TemporaryDirectory() as td:
+            wd = make_workdir(Path(td))
+            wd["workdir"] = Path(td)
+            spec = spec_with(wd)
+            plan = compile_fill.compile_spec(spec, wd["manifest"], Path(td))
+            codes = [w["code"] for w in plan["warnings"]]
+            self.assertNotIn("HEADER_ROW_CONSIDERED_DATA", codes)
+
+
 class ExecutionOrderContractTests(unittest.TestCase):
     """「执行顺序保证」契约 (FILLSPEC 章节) 的编译用例背书 — 文档声称与编译器
     行为 lockstep: op 全局顺序不变量 (E1) / remove 目标身份 (E2) / 自底向上
@@ -3955,6 +4022,166 @@ class MultiproductBlockPatternContractTests(unittest.TestCase):
             self.assertEqual(plan["warnings"], [])  # 无 static defects
 
 
+class SingleBlockQuotationPatternContractTests(unittest.TestCase):
+    """issue 02 — 完整 Canonical Pattern `single_quotation_block_append` 的机械
+    契约测试: 从 catalog entry 本身 (文本参数替换, 而非测试里手写一份等价 skeleton)
+    实例化 spec, 并走 PUBLIC Compiler CLI (MxpEndToEndTests 同款 seam) 编译出
+    MXP 17_MXP 单块 append 的同形 plan:
+
+    base_last_row 4 → 单块 spacer5/title6/header7/data8-12 (5 数据行);
+    净价 per_row Q/T/U/V/W (ROUND 精准: 减/乘/除 ROUND2、纯加法 T 不加、
+    比率 W ROUND4); 总盈亏 Y 一条 1:{n} merges+aggregates (聚合锚点=块首行=
+    合并锚点); 商业/费用列 S 0-口径常量; 克隆残留 + [1] 外部引用列 nulls
+    (X/Z/H 逐行清空); key_outputs (块首 + 公式格 + 总盈亏锚点) 全 written;
+    零 static defects, 且因 selector 排除表头行 → 无 HEADER_ROW_CONSIDERED_DATA。
+    """
+
+    PATTERN_ID = "single_quotation_block_append"
+
+    # One explicit instantiation: catalog fragment placeholders → concrete
+    # neutral values (the roles are documented inside the fragment itself).
+    SUBSTITUTIONS = {
+        "<TARGET_SHEET>": "S", "<BASE_LAST_ROW>": "4", "<TITLE>": "单块报价标题",
+        "<SOURCE_NAME>": "source_quote",
+        "<GROUP_SRC>": "A", "<GROUP_COL>": "A",
+        "<MODEL_SRC>": "B", "<MODEL_COL>": "B",
+        "<COST_SRC>": "D", "<COST_COL>": "R", "<CMD_COL>": "S",
+        "<SELECTOR_COL>": "A", "<SELECTOR_PATTERN>": "核心*",
+        "<TOTAL_COL>": "Y",
+        "<NULL_COL_1>": "X", "<NULL_COL_2>": "Z", "<NULL_COL_3>": "H",
+        "<KO1>": "A8", "<KO2>": "Q8", "<KO3>": "W8", "<KO4>": "Y8",
+    }
+
+    def _pattern_entry(self) -> dict:
+        import yaml
+        text = (SKILL_ROOT / "assets" / "combination_patterns.yaml").read_text(
+            encoding="utf-8")
+        entry = next(p for p in yaml.safe_load(text)["patterns"]
+                     if p["id"] == self.PATTERN_ID)
+        for key in ("question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"catalog entry 缺字段 {key!r}")
+        return entry
+
+    def _instantiate(self, entry: dict) -> dict:
+        """Textual substitution on the catalog fragment (comments included);
+        leftover placeholders fail loudly instead of silently passing."""
+        import yaml
+        frag = entry["fragment"]
+        for token, value in self.SUBSTITUTIONS.items():
+            self.assertIn(token, frag, f"fragment 缺占位符 {token}")
+            frag = frag.replace(token, value)
+        leftovers = re.findall(r"<[A-Z0-9_]+>", frag)
+        self.assertEqual(leftovers, [],
+                         f"fragment 存在未替换占位符: {leftovers}")
+        return yaml.safe_load(frag)
+
+    def _spec(self, wd: dict, instantiated: dict) -> dict:
+        return {
+            "task": {"intent": "核价邮件 → 报价汇总单块追加 (pattern contract)",
+                     "selected_mod": "NONE", "selected_mod_revision": None},
+            "inputs": {"sources": ["source_quote.xlsx"], "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_quote.xlsx",
+                                          "sheets": ["核价"]}],
+                       "target_sheet": "S"},
+            "fingerprints": {
+                "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+                "target_structure": wd["manifest"]["fingerprints"]["target_structure"],
+            },
+            **instantiated,
+            "decisions": ["单块 append: 净价公式链按 ROUND 精准 (减/乘/除 2、比率 4、"
+                          "纯加法不加)"],
+            "gaps": [],
+            "lineage": [{"source": "source_quote_flat.csv", "role": "primary",
+                         "note": "每个匹配源行恰好写入一个数据行"}],
+        }
+
+    def _compile_cli(self, tmp: Path) -> dict:
+        """The public Compiler CLI seam (the same one MxpEndToEndTests uses)."""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8",
+             str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+             "--spec", "fill_spec.yaml", "--workdir", "."],
+            cwd=str(tmp), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        return json.loads((tmp / "execution_plan.json").read_text(encoding="utf-8"))
+
+    def _per_row_formulas(self, plan) -> dict:
+        return {op["path"]: op["props"]["formula"] for op in plan["operations"]
+                if op["command"] == "set" and "formula" in op.get("props", {})
+                and "SUM" not in op["props"]["formula"]}
+
+    def test_pattern_instantiation_compiles_to_homomorphic_plan(self):
+        """catalog entry 本身 → 参数替换 → 合法 FillSpec YAML → 公开 CLI 编译:
+        单块布局 (data 8-12) + 净价 per_row Q/T/U/V/W 的 ROUND 精准公式 + 总盈亏
+        Y 1:{n} merges+aggregates + 0-口径常量 S + 克隆残留/外部引用 X/Z/H nulls
+        逐行清空 + key_outputs 全 written; 零 defects; selector 排除表头行 →
+        无 HEADER_ROW_CONSIDERED_DATA 警告."""
+        import yaml
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            wd = make_single_block_workdir(tmp)
+            entry = self._pattern_entry()
+            instantiated = self._instantiate(entry)
+            spec = self._spec(wd, instantiated)
+            (tmp / "fill_spec.yaml").write_text(
+                yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
+                encoding="utf-8")
+            plan = self._compile_cli(tmp)
+            self.assertEqual(plan["schema_version"], "2.5")
+
+            # ── 单块布局: 5 数据行 data 8-12 ──
+            data_blocks = [b for b in plan["blocks"] if b.get("data_start")]
+            self.assertEqual(len(data_blocks), 1)
+            self.assertEqual([(b["data_start"], b["data_end"]) for b in data_blocks],
+                             [(8, 12)])
+
+            # ── 净价 per_row ROUND 精准: 减/乘/除 ROUND2, 纯加法 T 不加, 比率 W ROUND4 ──
+            formulas = {p[len("/S/"):]: f for p, f in
+                        self._per_row_formulas(plan).items()}
+            row8 = {f"{col}8": formulas.get(f"{col}8") for col in "QTUVW"}
+            self.assertEqual(list(row8), ["Q8", "T8", "U8", "V8", "W8"])
+            q, t = row8["Q8"], row8["T8"]
+            self.assertIn("ROUND(", q)
+            self.assertLess(q.index("ROUND"), q.index(",2)"))
+            self.assertNotIn("ROUND", t)          # 纯加法 T = S+R 不加 ROUND
+            for col in ("U8", "V8"):
+                self.assertIn("ROUND(", row8[col])
+            self.assertIn("ROUND(V8/U8,4)", row8["W8"])  # 比率 ROUND4
+
+            # ── 总盈亏 Y: 一条 1:{n} merges+aggregates (聚合锚点=块首行=合并锚点) ──
+            agg_paths = [op["path"] for op in plan["operations"]
+                         if "formula" in op.get("props", {})
+                         and "SUM" in op["props"]["formula"]]
+            self.assertEqual(agg_paths, ["/S/Y8"])
+            merges = [op["props"]["merge"] for op in plan["operations"]
+                      if isinstance(op.get("props", {}).get("merge"), str)]
+            self.assertIn("Y8:Y12", merges, "总盈亏 Y 一条 1:{n} merge")
+
+            # ── 0-口径常量 S 每行写出数值 0 (入公式链费用列无数值 → 0) ──
+            s_writes = [w for w in plan["writes"] if w["col"] == "S"]
+            self.assertEqual([w["value"] for w in s_writes], ["0"] * 5)
+
+            # ── 克隆残留 + [1] 外部引用列 X/Z/H nulls 逐行清空 ──
+            empty = {rb["path"] for rb in plan["readback"] if rb["kind"] == "empty"}
+            for col in ("H", "X", "Z"):
+                self.assertEqual(
+                    {p for p in empty if re.fullmatch(rf"/S/{col}\d+", p)},
+                    {f"/S/{col}{r}" for r in range(8, 13)},
+                    f"nulls {col} 应逐行清空 (数据行 8-12)")
+
+            # ── key_outputs 全 written: 块首 + 净价公式格 + 比率公式格 + 总盈亏锚点 ──
+            self.assertEqual(plan["key_outputs"], [
+                {"path": "/S/A8", "kind": "value"},
+                {"path": "/S/Q8", "kind": "nonempty"},
+                {"path": "/S/W8", "kind": "nonempty"},
+                {"path": "/S/Y8", "kind": "nonempty"},
+            ])
+            # selector 排除表头行 → 无 HEADER_ROW_CONSIDERED_DATA; 零 static defects
+            self.assertEqual(plan["warnings"], [])
+
+
 class ProbeTests(unittest.TestCase):
     """compile_fill.py --probe: compile-only verification, zero side effects.
 
@@ -4090,8 +4317,21 @@ class CapabilitiesTests(unittest.TestCase):
                     "block_top_unknown_key_rejected",
                     "block_formulas_replaces_target_per_row",
                     "block_no_formulas_inherits_target_per_row",
-                    "multiproduct_block_append"):
+                    "multiproduct_block_append",
+                    "header_row_considered_data", "header_row_excluded_by_selector",
+                    "single_quotation_block_append"):
             self.assertIn(cid, by_id, f"capabilities 缺契约探针 {cid}")
+
+    def test_capabilities_header_row_guard_warning_surface(self):
+        """表头行守卫探针在 capabilities 报告呈现代码: 无 selector → 警告代码
+        出现, 排除表头 → 无警告 (矩阵与契约测试同源, 不会漂移)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            results = compile_fill.run_probe_cases(Path(tmp))
+        by_id = {r["id"]: r for r in results}
+        self.assertIn("HEADER_ROW_CONSIDERED_DATA",
+                      by_id["header_row_considered_data"]["warnings"])
+        self.assertNotIn("HEADER_ROW_CONSIDERED_DATA",
+                         by_id["header_row_excluded_by_selector"]["warnings"])
 
 
 class ProbeScaffoldTests(unittest.TestCase):
@@ -4666,6 +4906,100 @@ class DocCoverageGuardTests(unittest.TestCase):
                           f"缺 {phrase}")
         # 明确是推荐构造路径, 不是 whitelist / cross-Run support claim
         self.assertIn("构造路径", entry["note"])
+
+    # ── issue 02: 完整 Canonical Pattern (single_quotation_block_append) ──
+
+    def _single_block_entry(self) -> dict:
+        import yaml
+        p = SKILL_ROOT / "assets" / "combination_patterns.yaml"
+        entries = yaml.safe_load(p.read_text(encoding="utf-8"))["patterns"]
+        hits = [e for e in entries if e["id"] == "single_quotation_block_append"]
+        self.assertEqual(len(hits), 1, "pattern id 必须唯一")
+        return hits[0]
+
+    def test_combination_patterns_single_quotation_block_entry(self):
+        """Catalog 含唯一 single_quotation_block_append entry, 问题描述可定位
+        核价/报价汇总单块 append 场景; 同一 fragment 携带全部结构职责词
+        (clone_roles / selectors / 0-口径 / nulls / merges / aggregates /
+        key_outputs), note 锁定 U1 表头行契约与单块同构、聚合列不进
+        nulls/group_merges、[1] 外部引用列直接 null."""
+        entry = self._single_block_entry()
+        for key in ("id", "question", "answer", "fragment", "note"):
+            self.assertIn(key, entry, f"entry 缺字段 {key!r}")
+        for word in ("核价", "报价汇总", "单块"):
+            self.assertIn(word, entry["question"] + entry["answer"],
+                          f"问题描述缺定位词 {word!r}")
+        for word in ("clone_roles", "selectors", "columns", "formulas",
+                     "per_row", "aggregates", "merges", "nulls", "key_outputs"):
+            self.assertIn(word, entry["fragment"],
+                          f"fragment 缺结构职责词 {word!r}")
+        # 完整骨架必须显式 selectors 排除表头 (U1) — 词落在 fragment 与 note
+        for sect in (entry["answer"], entry["note"]):
+            self.assertIn("排除表头行", sect, f"{sect} 缺「排除表头行」词")
+        self.assertIn("HEADER_ROW_CONSIDERED_DATA", entry["note"],
+                      "note 缺表头行守卫缺陷码词")
+        # 单块同构 + 聚合列不变量 + [1] 外部引用机械事实
+        for word in ("multiproduct_block_append", "单块同构"):
+            self.assertIn(word, entry["note"], f"note 缺 {word!r} 词")
+        for word in ("不进 nulls", "不进 group_merges"):
+            self.assertIn(word, entry["note"], f"note 缺「{word}」词")
+        for word in ("[1]", "外部工作簿引用", "formula_not_evaluated"):
+            self.assertIn(word, entry["note"] + entry["answer"],
+                          f"note/answer 缺 [1] 外部引用词 {word!r}")
+        self.assertIn("0-口径", entry["answer"] + entry["note"])
+        self.assertIn("ROUND", entry["answer"] + entry["note"])
+
+    def test_combination_patterns_single_quotation_block_data_neutral(self):
+        """真实任务业务事实 (客户/国家/型号/价格/行号) 不泄漏进 fragment:
+        全部参数化为占位标记; 只写一块不写死行数占位 (范围用 1:{n} / 占位符)."""
+        entry = self._single_block_entry()
+        frag = entry["fragment"]
+        for leaked in ("MXP", "ATLAS", "阿尔及利亚", "一拖多外机", "Z码",
+                       "105000", "8/", "2026-08-18"):
+            self.assertNotIn(leaked, frag, f"fragment 泄漏业务事实 {leaked!r}")
+        for token in ("<TARGET_SHEET>", "<BASE_LAST_ROW>", "<TITLE>",
+                      "<SOURCE_NAME>", "<GROUP_COL>", "<MODEL_COL>",
+                      "<COST_COL>", "<CMD_COL>", "<SELECTOR_COL>",
+                      "<SELECTOR_PATTERN>", "<TOTAL_COL>",
+                      "<NULL_COL_1>", "<NULL_COL_2>", "<NULL_COL_3>", "<KO1>"):
+            self.assertIn(token, frag, f"fragment 缺参数占位符 {token}")
+        # 明确是推荐构造路径, 不是 whitelist / cross-Run support claim
+        self.assertIn("构造路径", entry["note"])
+        self.assertIn("白名单", entry["note"])
+
+    def test_fillspec_selectors_header_row_contract_word(self):
+        """FILLSPEC selectors 段含表头行契约词 (issue 02 / Case 08 U1):
+        「展平 CSV 首行（表头）是候选数据行」+ 「无 selector 会把表头映射进数据区」+
+        pattern/not_pattern 排除示例 + HEADER_ROW_CONSIDERED_DATA 警告."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(encoding="utf-8")
+        m = re.search(r"^### selectors\n", text, re.MULTILINE)
+        self.assertIsNotNone(m, "FILLSPEC.md 缺 ### selectors 小节")
+        nxt = re.search(r"^### ", text[m.end():], re.MULTILINE)
+        section = text[m.end():m.end() + (nxt.start() if nxt else len(text))]
+        for word in ("展平 CSV 首行", "候选数据行", "表头", "pattern", "not_pattern",
+                     "HEADER_ROW_CONSIDERED_DATA"):
+            self.assertIn(word, section, f"selectors 段缺契约词 {word!r}")
+
+    def test_error_code_table_has_header_row_considered_data(self):
+        """HEADER_ROW_CONSIDERED_DATA 必须在「常见编译错误速查」表内, corrective
+        action 指向 pattern/not_pattern 排除表头行 (防章节误删/指引回退)."""
+        table = self._error_code_table()
+        self.assertIn("HEADER_ROW_CONSIDERED_DATA", table)
+        m = re.search(r"^\|\s*HEADER_ROW_CONSIDERED_DATA.*$", table, re.MULTILINE)
+        self.assertIsNotNone(m, "速查表缺 HEADER_ROW_CONSIDERED_DATA 行")
+        row = m.group(0)
+        self.assertIn("排除表头行", row)
+        self.assertIn("pattern", row)
+        self.assertIn("not_pattern", row)
+
+    def test_skill_md_single_block_minimal_literature(self):
+        """SKILL 含本场景最小文献面清单 (issue 02 / Case 08 R3 收敛): 单块核价/
+        报价块 append 只读 决策树 + Q5/Q8/Q12/Q19 + ROUND 精准 + 单块骨架,
+        不全文通读 FILLSPEC."""
+        text = self._skill_md_text()
+        for word in ("最小文献面", "单块", "布局决策树", "Q5", "Q8", "Q12", "Q19",
+                     "ROUND", "single_quotation_block_append", "全文通读"):
+            self.assertIn(word, text, f"SKILL.md 缺最小文献面词 {word!r}")
 
     def test_fillspec_q19_aggregate_merge_region_word(self):
         """契约章节含 Q19: aggregates/group_aggregates 不自动创建合并区,

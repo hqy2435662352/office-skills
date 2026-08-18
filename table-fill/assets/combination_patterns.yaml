@@ -309,6 +309,8 @@ patterns:
       # <V_ROWS_H1>/<V_ROWS_H2> 家用块各组相对数据行范围 (块内组 1 / 组 2)
       # <V_ROWS_C1>        商用块组范围 (块内仅一组)
       # <TOTAL_COL_W>      块总盈亏聚合列 (一条 1:{n}; 聚合锚点=块首=合并锚点)
+      # 成本列长精度 (15 位) → `transform: round4`, 勿用 `precision: keep` —
+      #   keep 只在列宽实测背书时豁免, 超出列宽 → 编译期 PRECISION_KEEP_NARROW_COLUMN 拒绝
       # <KO1..KO7>         key_outputs: 块首数据行 / 各聚合组锚点格 / 块总盈亏锚点格
       mapping:
         targets:
@@ -451,5 +453,116 @@ patterns:
       块内多组时 V 按「组 1:范围, 组 2:范围...」写多条 (见
       per_group_total_explicit_ranges); 组边界由数据驱动且范围不可静态枚举时, 换用
       group_aggregates 一等能力 (动态组边界, 仍须显式 merges 覆盖非锚点残留)。
+      Pattern 是推荐构造路径, 不是能力白名单, 不声明 cross-Run support; 同类组合
+      未逐一验证, 不做支持承诺。
+
+  # ── 完整 Canonical Pattern: 单块报价/核价块追加 (issue 02, MXP 17_MXP 同形) ──
+  - id: single_quotation_block_append
+    question: "核价邮件 → 报价汇总单块 append (一个源 sheet 一块: 标题+表头+数据 + 净价公式链 + 总盈亏 + 0-口径费用列) 怎么写?"
+    answer: "完整 skeleton 一次实例化 — clone_roles [spacer, title, header, data];
+      rows.selectors **必写**: 展平 CSV 首行（表头）是候选数据行, 必须用
+      pattern/not_pattern **排除表头行**, 否则表头进数据区 (U1); 商业/费用列
+      0-口径常量 (value \"0\", 非空串); 克隆残留 + `[1]` 外部引用列 nulls;
+      总盈亏 1 条 1:{n} 的 merges+aggregates; ROUND 精准公式 (减/乘/除 ROUND2、
+      比率 ROUND4、纯加法不加)"
+    fragment: |
+      # ── 参数替换表 (一次实例化: 把下面的占位标记换成 digest/业务映射事实, 即得合法 FillSpec) ──
+      # <TARGET_SHEET>:    目标 sheet 名 (来自 outline/digest)
+      # <BASE_LAST_ROW>:   模板数据末行 (digest 行数)
+      # <TITLE>:           块标题 (Gate 呈现候选)
+      # <SOURCE_NAME>:     展平源名 (manifest flattened name)
+      # <GROUP_SRC>→<GROUP_COL> / <MODEL_SRC>→<MODEL_COL>: 类别/型号列
+      # <COST_SRC>→<COST_COL>: 成本列 (15 位长精度 → transform: round4, 勿用 keep)
+      # <CMD_COL>:         商业/费用列 0-口径常量 (target value "0"; 入公式链字段缺失 → 数值 0)
+      # <SELECTOR_COL>/<SELECTOR_PATTERN>: 排除表头行的 selector (⚠️ 必写, 否则表头进数据区 U1)
+      # 净价公式输入槽 L/M/N/O/P 与数量 G: 把源 报价/费用/数量 列映射进这些目标列;
+      #   成本 R 由 <COST_SRC>→<COST_COL> round4; 源无此角色 → value: "0" 常量
+      # <TOTAL_COL>:       总盈亏聚合列 (merges+aggregates, 聚合锚点=块首行=合并锚点)
+      # <NULL_COL_1>/<NULL_COL_2>/<NULL_COL_3>: 克隆残留列 (模板行携带未映射 → 逐行清空);
+      #   `[1]` 外部工作簿引用列 (如 <NULL_COL_2>) 直接 null, 不复刻公式 (U7, 见 issue 03)
+      # <KO1>..<KO4>:      key_outputs (块首数据行 / 净价公式格 / 比率公式格 / 总盈亏锚点格)
+      mapping:
+        targets:
+          - sheet: <TARGET_SHEET>
+            base_last_row: <BASE_LAST_ROW>
+            clone_roles:
+              - role: spacer
+              - role: title
+                template_row: 1
+                value: "<TITLE>"
+              - role: header
+                template_row: 2
+              - role: data
+                template_row: 4        # 非合并锚点数据行 (CLONE_SOURCE_IS_ANCHOR)
+            rows:
+              source: <SOURCE_NAME>
+              selectors:               # ⚠️ 必写: 排除表头行, 否则表头进数据区 (U1)
+                - column: <SELECTOR_COL>
+                  pattern: "<SELECTOR_PATTERN>"
+            columns:
+              - source: <GROUP_SRC>
+                target: <GROUP_COL>
+              - source: <MODEL_SRC>
+                target: <MODEL_COL>
+              - source: <COST_SRC>
+                target: <COST_COL>
+                transform: round4
+              - target: <CMD_COL>
+                value: "0"             # 0-口径常量 (入公式链费用列无数值 → 数值 0)
+            formulas:
+              per_row:
+                Q: "IFERROR(ROUND(L{r}-M{r}-N{r}-O{r}-P{r},2),0)"   # 减法→ROUND2
+                T: "IFERROR(<CMD_COL>{r}+<COST_COL>{r},0)"          # 纯加法→不加 ROUND
+                U: "IFERROR(ROUND(Q{r}*G{r},2),0)"                  # 乘法→ROUND2
+                V: "IFERROR(ROUND((Q{r}-T{r})*G{r},2),0)"           # 减×乘→ROUND2
+                W: "IFERROR(IF(U{r}=0,0,ROUND(V{r}/U{r},4)),0)"     # 比率→ROUND4
+              aggregates:
+                - col: <TOTAL_COL>
+                  rows: "1:{n}"
+                  formula: "IFERROR(ROUND(SUM(V{r1}:V{r2})/SUM(U{r1}:U{r2}),4),0)"  # 比率→ROUND4
+                  style: anchor
+            merges:                    # 聚合列非锚点残留显式 merges 覆盖 (Q19/U4)
+              - col: <TOTAL_COL>
+                rows: "1:{n}"
+                style: label
+            nulls:                     # 克隆残留 + [1] 外部引用列 → 逐行清空
+              - col: <NULL_COL_1>
+                rows: all
+              - col: <NULL_COL_2>
+                rows: all
+              - col: <NULL_COL_3>
+                rows: all
+      validation:
+        required_coverage: []
+        required_empty: []
+        key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>]
+    note: |
+      完整 Canonical Pattern (准入见本文件头部说明): 真实任务 Case 08 (核价邮件 →
+      MXP 17_MXP 报价汇总单块追加, 一拖多外机, 2026-08-18) 的 Validated Draft
+      同形骨架, 数据中立 — 用下方参数替换表把占位标记换成 digest/业务映射事实即得
+      合法 FillSpec; 机械契约测试 = 实例化编译 (tests/test_optimization.py →
+      SingleBlockQuotationPatternContractTests)。
+      本骨架是 `multiproduct_block_append` (双数据块) 的**单块同构**: 同一套
+      [spacer, title, header, data] + 克隆残留 nulls + 总盈亏 merges+aggregates
+      (聚合锚点=块首行=合并锚点, Q12) + ROUND 精准公式; 单块不设类别分组合并,
+      需要分组时才加 group_merges (聚合列一律不进 group_merges)。结构与语义锁定:
+      ① rows.selectors **必须写** — 展平 CSV 首行（表头）是候选数据行, 无 selector
+      会把表头文本映射进数据区 (Case 08 U1); 排除表头行用 pattern / not_pattern
+      (如 `column A pattern 业务类别*` / `not_value: 类别`), Compiler 以
+      HEADER_ROW_CONSIDERED_DATA 警告背书;
+      ② 0-口径 (Case 07 F1): 商业/费用列 (财务费用/OA信保/返点/其他费用) 被净价
+      公式引用, 源无此角色 → `value: "0"` 常量, 不得写空串 (空串 → #VALUE! →
+      IFERROR 兜底 0) — 见 zero_policy pattern;
+      ③ 克隆残留列 (模板行携带未映射) nulls: rows: all; **聚合列 (<TOTAL_COL>)
+      不进 nulls (进了 → 锚点双写 DUPLICATE_TARGET_WRITE)、不进 group_merges**;
+      ④ U4: group_aggregates / aggregates 不自动创建合并区 — 聚合列非锚点残留由
+      同范围显式 merges 覆盖 (本骨架已配 merges+aggregates 对);
+      ⑤ **`[1]` 前缀 = 外部工作簿引用**: 参考行带模板缓存值可显示旧值, 但新写公式
+      未重建外部链接不可求值 (`formula_not_evaluated`) — 不含管/外部数据 → 该列
+      直接 null (置于 <NULL_COL_x>), 不复刻公式 (Case 08 U7, 机械事实见 issue 03);
+      ⑥ ROUND 精准: 减法/乘法/除法/SUM 聚合 ROUND(...,2), 比率 ROUND(...,4),
+      纯加法不加 ROUND (见 SKILL「公式约定」);
+      ⑦ key_outputs 取块首数据行 + 公式格 + 聚合/合并锚点格 (行号取自 plan
+      blocks[].data_start, 不手工重推)。
       Pattern 是推荐构造路径, 不是能力白名单, 不声明 cross-Run support; 同类组合
       未逐一验证, 不做支持承诺。
