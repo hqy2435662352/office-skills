@@ -2460,6 +2460,29 @@ class AnchorStyleInheritanceTests(unittest.TestCase):
                              "无样式元数据 → 不得注入字体, 保持默认 label 样式")
             self.assertEqual(o["props"].get("alignment.horizontal"), "center")
 
+    def test_inplace_anchor_pins_font_scheme_none(self):
+        """残余盲区 (2026-08-19): 继承字面字体 (font.name) 落到原无字体格时,
+        officecli 会注入 scheme=minor 主题引用使字体渲染回主题 minor 字体 (宋体)。
+        编译器必须以 font.scheme=none 钉住字面字体, 防注入覆盖继承字体名。"""
+        plan = compile_fill.compile_spec(self._spec(), self.wd["manifest"], self.tmp)
+        a_ops = self._merge_ops(plan, "A")
+        self.assertTrue(a_ops, "A 列应有组锚点 merge op")
+        for o in a_ops:
+            self.assertEqual(o["props"].get("font.name"), "微软雅黑")
+            self.assertEqual(o["props"].get("font.scheme"), "none",
+                             "继承字面字体必须钉 font.scheme=none, 不得漏留 "
+                             "officecli 注入的 minor (否则渲染为主题 minor 字体=宋体)")
+
+    def test_spec_explicit_font_scheme_not_overridden(self):
+        """spec 显式 font.scheme 逐键优先, pin_font_scheme 不得覆盖用户有意使用的
+        主题字体 (如 minor)。"""
+        spec = self._spec()
+        spec["mapping"]["targets"][0]["styles"] = {"label": {"font.scheme": "minor"}}
+        plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.tmp)
+        for o in self._merge_ops(plan, "A"):
+            self.assertEqual(o["props"].get("font.scheme"), "minor",
+                             "spec 显式 font.scheme 优先, pin 不覆盖")
+
 
 class FillSpecContractTests(unittest.TestCase):
     """组合行为契约 (FILLSPEC「组合行为契约」章节) 的编译用例背书.

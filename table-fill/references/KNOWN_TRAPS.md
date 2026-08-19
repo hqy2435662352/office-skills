@@ -43,6 +43,8 @@
 | **排除信号声明了但验证器未实现 → 恒 pending (2026-08-18)** | 某 MOD 的排除信号每次提名都进 `pending_exclusions` → 永远 ambiguous (fail-closed ASK), 即使 digest 证据已证明排除未触发 (MXP 提名: pricing_block 的「目标缺少客户报价六角色表头指纹」与 dimension_set::customer_quotation_six_fields HIT 逻辑互斥, 却仍 pending) | `exclusion_checks()` 只为两个排除信号写了 evaluator (24角色 / cost_reply), 其余排除信号落入 `else → pending_exclusions` — scope 验证结果与排除评估两条管道不相通 | 每个注册的排除信号必须有对应 evaluator (复用 DIMENSION_SET_FACTS/digest 事实, 多数角色命中放行); 新 MOD 带新排除信号时先检查 `exclusion_checks()` 是否有其分支 (2026-08-18 已补六角色 evaluator) |
 | **合并单元格新锚点缺字体 (Case 010 盲区, 2026-08-18)** | inplace 重建合并后, 部分组锚点 (如 TPRO/ODU 组) 文本渲染为默认字体, 与同列其它组 (微软雅黑 12pt bold) 不一致 | 模板合并区**非锚点**格只有边框无字体; 新组锚点落在旧非锚点格时: 默认 label 样式只有 alignment (字体刻意不进默认集), 写值 op 不带样式 → 缺字体 | prepare 采集锚点样式 (`meta.merge_anchor_styles`); 编译器对 inplace 组锚点/merges 锚点继承**占位区内同列既有锚点**样式 (spec 显式 `styles` 优先 > 继承 > 默认, `inherited_anchor_style`) |
 
+| **继承字面字体被 officecli 注入 scheme=minor 覆盖 (残余, 2026-08-19)** | Case 010 后字号/加粗已正确, 但 TPRO/ODU 组锚点仍渲染为宋体 (非继承的微软雅黑) | `set font.name=微软雅黑` 写到**原本无字体的格子** (默认 style 的旧非锚点格) 时, officecli 注入 `<scheme val="minor"/>` + `<color theme="1"/>`; scheme=minor 是主题 minor 字体引用, 渲染时覆盖 `<rFont>` 字面名 → 按主题 minor 字体 (宋体) 显示 | 编译器对 inplace 合并锚点 (group_merges/merges) 最终 style 做 `pin_font_scheme`: 含 `font.name` 且未显式给 `font.scheme` → 补 `font.scheme: none` (字面字体); spec 显式 `font.scheme` 逐键优先不覆盖; `font.color: dk1` 与默认文字色一致, 非缺陷 (见 FILLSPEC Q20) |
+
 ## spike 四坑 (pptx 合并 lowering)
 
 来自能力 spike (officecli 1.0.143, fixture.pptx) — **先于实现验证的机械事实**:

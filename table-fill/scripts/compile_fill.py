@@ -95,6 +95,22 @@ def inherited_anchor_style(meta: dict, col: str, region_start: int,
     if best and best[1] in styles_map:
         return dict(styles_map[best[1]])
     return {}
+
+
+def pin_font_scheme(style: dict) -> dict:
+    """若样式含显式 font.name 而未显式给定 font.scheme, 补 font.scheme: none。
+
+    officecli 在把 font.name 写到原本无字体的格子 (默认 style) 时会注入
+    <scheme val="minor"/> + <color theme="1"/> (dk1)。<scheme val="minor"/> 是
+    主题 minor 字体引用, 渲染时覆盖 <rFont> 字面名按主题 minor 字体显示 (如
+    宋体), 使继承的微软雅黑被静默改回主题字体。本归一化把字面字体钉住;
+    spec 显式声明的 font.scheme (含有意使用主题字体) 不被覆盖。
+    """
+    if "font.name" in style and "font.scheme" not in style:
+        out = dict(style)
+        out["font.scheme"] = "none"
+        return out
+    return style
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1640,6 +1656,9 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
             spec_styles = (cfg.get("styles") or {}).get(g.get("style", "label"), {})
             gstyle = {**gstyle,
                       **{k: v for k, v in inh.items() if k not in spec_styles}}
+            # 钉住字面字体: 显式 font.name 落到原无字体格时 officecli 注入
+            # scheme=minor 主题引用会把继承字体渲染成主题 minor 字体 (宋体)。
+            gstyle = pin_font_scheme(gstyle)
         g_merges = []
         for (s, e) in groups:
             anchor_row = first_row + s - 1
@@ -1708,6 +1727,8 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
             inh = (b.get("inherited_styles") or {}).get(col) or {}
             spec_styles = (cfg.get("styles") or {}).get(m.get("style", "label"), {})
             props.update({k: v for k, v in inh.items() if k not in spec_styles})
+            # 同 group_merges: 钉住字面字体, 防 officecli 注入 scheme=minor。
+            props.update(pin_font_scheme(props))
         ops.append({"command": "set", "path": cell_path(col, first_row + r1 - 1),
                     "props": props})
 

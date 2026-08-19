@@ -649,6 +649,25 @@ formulas:
   merges+aggregates + 0-口径费用列 + 克隆残留/外部引用 nulls, rows.selectors 必须
   排除表头行)。
 
+### Q20: inplace 合并锚点继承字面字体时为什么必须补 `font.scheme: none`?
+
+**否则 officecli 在「显式 `font.name` 落到原本无字体的格子 (默认 style 的旧合并
+区非锚点格)」时注入 `<scheme val="minor"/>` + `<color theme="1"/>`, 使继承的
+微软雅黑被主题 minor 字体覆盖, 视觉上仍是宋体/等线**。这是 Case 010 锚点样式
+继承 (issue `table-fill-anchor-font-scheme/01`) 被暴露后的残余盲区: 继承样式本身
+取对了 (font.name=微软雅黑), 但写入无字体格时被 officecli 的 scheme 注入破坏。
+
+- **修复契约**: Compiler 对 inplace 合并锚点 (group_merges 与 merges) 的最终
+  style 做 `pin_font_scheme`: 含 `font.name` 且未显式给定 `font.scheme` → 补
+  `font.scheme: none`, 钉住字面字体。spec 显式 `font.scheme` 逐键优先, 不被覆盖
+  (用户有意使用主题字体时保留)。
+- **既有锚点格不受影响**: 已带显式 `<rFont>` 的旧锚点格复用时不触发注入 (写入
+  无害的 scheme=none); 只有旧**非**锚点格 (新组锚点落点) 才需要本次补丁。
+- **`font.color: dk1` 旁注**: 残余的主题深色1 (dk1, 近黑) 与默认文字色一致,
+  非缺陷, 不作为清除目标 — 过度归一化反而破坏有意使用的主题配色。
+- 回归测试: `tests/test_optimization.py` AnchorStyleInheritanceTests 断言 inplace
+  锚点 `font.scheme != "minor"`。
+
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
