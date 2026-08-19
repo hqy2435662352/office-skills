@@ -82,6 +82,9 @@ SEMANTIC_KEYWORDS = {
     "cost_reply_to_quotation_summary_block": [
         "核价邮件", "核价回复", "成本回复", "最新成本", "报价汇总", "新数据块", "新批次块",
     ],
+    "pricing_block_to_customer_quotation": [
+        "报价单", "客户报价", "英文报价", "quotation", "fill quotation",
+    ],
     "margin_analysis": ["毛利", "损益", "成本", "核价"],
     "kpi_scorecard": ["kpi", "指标", "看板"],
     "sales_ledger": ["销售", "台账", "流水"],
@@ -103,6 +106,9 @@ DIGEST_SIGNALS = {
 # 可验证时给出真 hit/miss; 无 digest 或词汇未定义 → pending, 不冒充命中。
 DIMENSION_SET_FACTS = {
     "product_sku": ["z码", "sku", "货号", "型号"],
+    "customer_quotation_six_fields": [
+        "type", "model", "capacity", "connecting pipe", "unit price", "panel looking",
+    ],
 }
 
 
@@ -141,6 +147,12 @@ def parse_mod_file(mods_dir: Path, path: str) -> dict:
     if m:
         out["summary"] = [ln.strip()[2:].strip() for ln in m.group(1).splitlines()
                           if ln.strip().startswith("- ")]
+    m = re.search(r"## Metadata[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            mm = re.match(r"^\s*-\s*Display\s+Name:\s*(.+?)\s*$", line)
+            if mm:
+                out["display_name"] = mm.group(1).strip()
     out["rules"] = parse_rule_table(text)
     return out
 
@@ -201,6 +213,7 @@ def _evaluate_entry(entry: dict, mods_dir: Path, evidence: str,
         entry["exclusion"], evidence, digests, outlines)
     return ({
         "name": entry["name"],
+        "display_name": meta.get("display_name") or entry["name"],
         "revision": entry["revision"],
         "visibility": entry["visibility"],
         "hits": hits,
@@ -393,6 +406,31 @@ def exclusion_checks(exclusion: str, evidence: str, digests: list[str],
                 problems.append(f"重复历史批次块不足 (数据块 {blocks} < 2)")
             fired.append({"signal": ex, "reason": "目标结构不符: "
                           + "; ".join(problems)})
+        elif ex_name == "目标缺少客户报价六角色表头指纹":
+            # pricing_block MOD: 目标应为标准六角色英文客户报价单 (Type/Model/
+            # C&H capacity/Connecting pipe/Unit Price/Panel looking)。复用
+            # DIMENSION_SET_FACTS 六角色事实核对 digest 表头 — 多数角色命中 =
+            # 同角色变体 (与 24col 排除同语义, TGT-002), 半数以上缺失才是
+            # 结构不符。注意: 该排除的证伪证据 (六角色存在) 已由 scope 信号
+            # dimension_set::customer_quotation_six_fields 独立验证 — 本
+            # evaluator 与它同源, 消除「排除信号声明了但永远 pending」的
+            # 假阳性 (2026-08-18 MXP 提名复盘)。
+            if not digests or not _header_lines(digests):
+                fired.append({"signal": ex, "reason": "证据缺失: digest "
+                              "未喂到或表头行缺失 — 核对 --digest 参数后再"
+                              "判定, 勿以证据缺失当作结构不符"})
+                continue
+            markers = DIMENSION_SET_FACTS.get("customer_quotation_six_fields", [])
+            if not markers:
+                pending_exclusions.append(ex)
+                continue
+            lower = [h.lower() for h in _header_lines(digests)]
+            present = [m for m in markers if any(m in h for h in lower)]
+            missing = [m for m in markers if m not in present]
+            if len(present) * 2 >= len(markers):
+                continue  # 六角色指纹存在 → 排除不触发
+            fired.append({"signal": ex, "reason": "目标表头缺少客户报价角色: "
+                          + ", ".join(missing)})
         else:
             # Unknown exclusion: no evaluator — fail-closed, never silently
             # pass. Record as pending_exclusions → blocks auto-resolved
@@ -430,6 +468,21 @@ def signal_matched(kind: str, value: str, evidence: str, digests: list[str],
                 return None  # 维度词汇未定义 → pending, 不猜测
             headers = "\n".join(_header_lines(digests)).lower()
             return any(m.lower() in headers for m in markers)
+        if kind == "block_layout" and value.strip() == "customer_quote_header_data_total_terms":
+            # 客户报价单布局指纹: 六角色表头 + 合并区数据块 + 宽合并
+            # (Total/条款段 A\d+:[E-F]\d+)。证据全在 digest 结构事实
+            # (2026-08-18 MXP 提名复盘: 该信号此前恒 pending — 结构信号
+            # 只有 dimension_set 有验证器)。缺 digest → pending。
+            if not digests:
+                return None
+            text = "\n".join(digests)
+            headers = _header_lines(digests)
+            six = DIMENSION_SET_FACTS.get("customer_quotation_six_fields", [])
+            header_ok = bool(headers) and all(
+                any(m.lower() in h.lower() for h in headers) for m in six)
+            merge_ok = bool(re.search(r"合并区\(\d+\):", text))
+            wide_ok = bool(re.search(r"\bA\d+:[E-F]\d+\b", text))
+            return header_ok and merge_ok and wide_ok
         return None
     if kind == "sheet_marker":
         # 业务工作簿标记 sheet (如报价汇总的"三三三/333"铜管基准表):
@@ -487,12 +540,26 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
         evidence_missing = any(
             "证据缺失" in x["reason"]
             for c in conflicted for x in c["fired_exclusions"])
+        # conflict 分支同时呈现「无冲突但有命中」的候选 (Case 010 教训):
+        # 曾只返回 conflicted 列表, 把真正匹配的无冲突 MOD
+        # (如 pricing_block_to_customer_quotation) 从提名卡中吞掉,
+        # 用户只能对错误 MOD 做降级裁决。now 全部命中候选并列呈现,
+        # why 注明哪些触发了排除, 由用户裁决。
+        conflicted_names = {c["name"] for c in conflicted}
+        clean = [c for c in candidates if c["name"] not in conflicted_names]
+        shown = conflicted + clean
+        note = ""
+        if clean:
+            note = ("; 另有未触发排除的命中候选: " +
+                    ", ".join(c["name"] for c in clean) +
+                    " — 可一并裁决 (选无冲突 MOD 则无需降级)")
         return {"status": "conflict",
-                "candidates": conflicted,
+                "candidates": shown,
                 "why": "exclusion signal fired — " + "; ".join(reasons) +
                        (". 若为证据缺失: 补全 --digest/--outline 参数后重跑提名, "
                         "无需打断用户" if evidence_missing
-                        else ". keep/downgrade/replace must be user-adjudicated")}
+                        else ". keep/downgrade/replace must be user-adjudicated") +
+                       note}
     if explicit_mod:
         return {"status": "resolved", "candidates": candidates,
                 "why": "explicit MOD name or alias matched the catalog and no "

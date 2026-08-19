@@ -270,6 +270,47 @@ def make_preformatted_quotation_workdir(tmp) -> dict:
     return {"manifest": manifest}
 
 
+def make_styled_anchor_workdir(tmp) -> dict:
+    """preformatted_quotation 变体 (Case 010 盲区修复 fixture): 占位区含
+    多组旧合并 (A7:A10, A11:A14, A15:A18, A19:A21, A22:A24 + F 同形),
+    A 列锚点带文本样式 (merge_anchor_styles, 微软雅黑 12pt bold)、F 列锚点
+    只有 alignment — 验证 inplace 组锚点落在旧非锚点格时继承模板锚点样式。
+    merge_anchor_styles 不入结构指纹 (structure_facts 不含该键), 但
+    merged_ranges/merge_anchors 变了 → 指纹重算。"""
+    wd = make_preformatted_quotation_workdir(tmp)
+    meta_path = tmp / "target_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    ranges = ["A7:A10", "A11:A14", "A15:A18", "A19:A21", "A22:A24",
+              "F7:F10", "F11:F14", "F15:F18", "F19:F21", "F22:F24"]
+    meta["merged_ranges"] = ranges
+    meta["merge_anchors"] = [
+        {"range": r, "anchor": r.split(":")[0], "formula": ""} for r in ranges
+    ]
+    a_style = {"font.bold": True, "font.size": "12pt", "font.name": "微软雅黑",
+               "font.charset": "134", "alignment.wrapText": True,
+               "alignment.horizontal": "center", "alignment.vertical": "center"}
+    f_style = {"alignment.wrapText": True, "alignment.horizontal": "center",
+               "alignment.vertical": "center"}
+    meta["merge_anchor_styles"] = {
+        "A7": dict(a_style), "A11": dict(a_style), "A15": dict(a_style),
+        "A19": dict(a_style), "A22": dict(a_style),
+        "F7": dict(f_style), "F11": dict(f_style), "F15": dict(f_style),
+        "F19": dict(f_style), "F22": dict(f_style),
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    manifest_path = tmp / "prepare_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    facts = [structure_facts(meta)]
+    manifest["fingerprints"] = {
+        "source_structure": facts_sha256(facts),
+        "target_structure": facts_sha256(facts),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    wd["manifest"] = manifest
+    return wd
+
+
 MULTIPRODUCT_HOUSE_ROWS = [
     ["家用悦风", "12K", "Z001", "F-1", "C-1", "1", "2", "3", "4", "5", "6"],
     ["家用悦风", "18K", "Z002", "F-2", "C-2", "7", "8", "9", "10", "11", "12"],

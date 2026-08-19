@@ -50,18 +50,51 @@ PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
 
 CELL_RE = re.compile(r"^[A-Z]{1,2}$")
+# 合并/聚合锚点默认样式。⚠️ 字体属性 (font.*) 不在此默认集内 —
+# Case 010: 默认写死 Microsoft YaHei 10pt 会无条件覆盖模板单元格原有字体
+# (如模板 A 列微软雅黑 12pt bold), 而 singleton 组不建 merge 保留原字体,
+# 导致合并/未合并单元格字体不统一。字体只允许通过 spec 显式
+# `styles: {anchor|label: {font.*}}` 声明后写入。
 STYLE_DEFAULTS = {
     "anchor": {
-        "font.bold": True, "font.size": 10, "font.name": "Microsoft YaHei",
         "alignment.wrapText": True, "alignment.horizontal": "center",
         "alignment.vertical": "center", "numberformat": "0.00%",
     },
     "label": {
-        "font.bold": False, "font.size": 10, "font.name": "Microsoft YaHei",
         "alignment.wrapText": True, "alignment.horizontal": "center",
         "alignment.vertical": "center",
     },
 }
+
+
+def inherited_anchor_style(meta: dict, col: str, region_start: int,
+                           region_end: int) -> dict:
+    """占位区内同列第一个既有合并锚点的文本样式 (font/alignment)。
+
+    Case 010 盲区修复: 合并区非锚点单元格通常无字体样式; 组锚点重建时若
+    新锚点落在旧非锚点格, 将缺失模板字体。继承规则: 取 [region_start,
+    region_end] 内同列**行号最小**的既有锚点样式; 无 → {}。
+    优先级由调用方保证: spec 显式 `styles` > 继承值 > STYLE_DEFAULTS。"""
+    styles_map = meta.get("merge_anchor_styles") or {}
+    if not styles_map:
+        return {}
+    best = None  # (row, anchor)
+    for a in meta.get("merge_anchors", []):
+        rng = a.get("range", "")
+        anchor = a.get("anchor", "")
+        if not rng or not anchor:
+            continue
+        m = re.match(r"^([A-Z]+)(\d+):", rng)
+        if not m or m.group(1) != col:
+            continue
+        row = int(m.group(2))
+        if row < region_start or row > region_end:
+            continue
+        if best is None or row < best[0]:
+            best = (row, anchor)
+    if best and best[1] in styles_map:
+        return dict(styles_map[best[1]])
+    return {}
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1600,6 +1633,13 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
                                                  "label ('' = clear anchor)"})
             continue
         gstyle = style_for(cfg, g.get("style", "label"))
+        if b.get("inplace"):
+            # 锚点样式继承 (Case 010 盲区): 新组锚点落在旧非锚点格时补
+            # 模板锚点字体/对齐; spec 显式 styles 声明的键优先, 不被覆盖。
+            inh = (b.get("inherited_styles") or {}).get(col) or {}
+            spec_styles = (cfg.get("styles") or {}).get(g.get("style", "label"), {})
+            gstyle = {**gstyle,
+                      **{k: v for k, v in inh.items() if k not in spec_styles}}
         g_merges = []
         for (s, e) in groups:
             anchor_row = first_row + s - 1
@@ -1662,6 +1702,12 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
         r1, r2 = span
         props = {"merge": f"{col}{first_row + r1 - 1}:{col}{first_row + r2 - 1}"}
         props.update(b_styles.get(m.get("style", "label"), b_styles["label"]))
+        if b.get("inplace"):
+            # 锚点样式继承 (Case 010 盲区) — 同 group_merges 规则:
+            # spec 显式 styles 优先, 继承值补默认。
+            inh = (b.get("inherited_styles") or {}).get(col) or {}
+            spec_styles = (cfg.get("styles") or {}).get(m.get("style", "label"), {})
+            props.update({k: v for k, v in inh.items() if k not in spec_styles})
         ops.append({"command": "set", "path": cell_path(col, first_row + r1 - 1),
                     "props": props})
 
@@ -2404,6 +2450,16 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                 "capacity": ip_role.get("capacity"),
                 "template_row": ip_role.get("template_row"),
                 "region_end": ip_role.get("start_row") + ip_role.get("capacity") - 1,
+            }
+            # 锚点样式继承 (Case 010 盲区): inplace 组锚点可能落在旧合并区
+            # 非锚点格 (无字体样式) — 采集占位区内同列既有锚点样式, 供
+            # _emit_block_ops 合并进 merge op (spec 显式 styles 优先)。
+            region = (b["inplace"]["start_row"], b["inplace"]["region_end"])
+            merge_cols = {g.get("col") for g in b["cfg"].get("group_merges", [])}
+            merge_cols |= {m.get("col") for m in b["cfg"].get("merges", [])}
+            b["inherited_styles"] = {
+                col: inherited_anchor_style(target_meta, col, *region)
+                for col in merge_cols if col
             }
     validate_inplace_geometry(blocks_cfg, ip_ctx, roles,
                               target_cfg.get("base_last_row", 0), defects)

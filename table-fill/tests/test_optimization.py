@@ -29,6 +29,7 @@ from _probe_fixtures import (  # noqa: E402
     make_probe_inplace_workdir as make_inplace_workdir,
     make_probe_workdir as make_workdir,
     make_single_block_workdir,
+    make_styled_anchor_workdir,
 )
 
 
@@ -1685,6 +1686,101 @@ class PrepareStyleGranularityTests(unittest.TestCase):
             self.assertEqual(out["target"]["placeholder_segments"][0]["start"], 23)
 
 
+class DetectHeaderRowsContractTests(unittest.TestCase):
+    """Case 010: detect_header_rows 跨空行间隙 + 密度不降约束契约.
+
+    修复背景: ATLAS Quotation 模板 row 4 (To Messrs: ATLAS) 被识别为表头带
+    起点, row 5 空行导致 row 6 真列头 (Type/Model/...) 因"不连续"被 break,
+    header_band=[4]/data_start=5, 六角色 dimension_set 信号 missed。
+    修复: 允许表头带跨空行间隙继续, 但新行 nonempty 不得低于带内最大值
+    (列头行是表里最满的行, text-dense 数据行有空列 → 密度下降 → 不被吸入)。
+    """
+
+    def _cells(self, rows_profile):
+        """构造 fake cell 列表: {row: [(col, type, text), ...]}."""
+        cells = []
+        for r, entries in rows_profile.items():
+            for col, ctype, text in entries:
+                cells.append({
+                    "path": f"/S/{col}{r}",
+                    "format": {"type": ctype},
+                    "text": text,
+                })
+        return cells
+
+    def test_blank_gap_spanning_header_band(self):
+        """ATLAS 形态: row4 标题(2) + 空行 + row6 列头(6) → band [4,6], data 7."""
+        from flatten_table import detect_header_rows
+        profile = {
+            4: [("A", "SharedString", "To Messrs: ATLAS"),
+                ("F", "SharedString", "Date of issue")],
+            6: [("A", "SharedString", "Type"),
+                ("B", "SharedString", "Model"),
+                ("C", "SharedString", "Capacity"),
+                ("D", "SharedString", "Pipe"),
+                ("E", "SharedString", "Unit Price"),
+                ("F", "SharedString", "Panel looking")],
+            7: [("A", "SharedString", "Type text"),
+                ("B", "SharedString", "9K"),
+                ("C", "SharedString", "9000Btu"),
+                ("D", "SharedString", "/")],
+            8: [("A", "SharedString", "Type text"),
+                ("B", "SharedString", "12K"),
+                ("C", "SharedString", "12000Btu"),
+                ("D", "SharedString", "/")],
+        }
+        out = detect_header_rows(self._cells(profile), 6)
+        self.assertEqual(out, {"header_rows": [4, 6], "data_start_row": 7})
+
+    def test_text_dense_data_rows_not_absorbed(self):
+        """数据行 nonempty(4) < 带内最大值(6) → break, 不吸入."""
+        from flatten_table import detect_header_rows
+        profile = {
+            4: [("A", "SharedString", "Title"), ("B", "SharedString", "Info")],
+            6: [("A", "SharedString", "H1"), ("B", "SharedString", "H2"),
+                ("C", "SharedString", "H3"), ("D", "SharedString", "H4"),
+                ("E", "SharedString", "H5"), ("F", "SharedString", "H6")],
+            7: [("A", "SharedString", "a"), ("B", "SharedString", "b"),
+                ("C", "SharedString", "c"), ("D", "SharedString", "d")],
+            8: [("A", "SharedString", "e"), ("B", "SharedString", "f"),
+                ("C", "SharedString", "g"), ("D", "SharedString", "h")],
+        }
+        out = detect_header_rows(self._cells(profile), 6)
+        self.assertEqual(out, {"header_rows": [4, 6], "data_start_row": 7})
+
+    def test_no_gap_consecutive_band_unchanged(self):
+        """无空行间隙的连续表头带 (报价汇总 24 列形态) 行为不变: [2]/3.
+
+        数据行是 text 少数派 (2 text + 4 number → text < nonempty//2)
+        → 非 header → break, 与修复前一致."""
+        from flatten_table import detect_header_rows
+        profile = {
+            1: [("A", "SharedString", "TITLE")],
+            2: [("A", "SharedString", "类别"), ("B", "SharedString", "产品类别"),
+                ("C", "SharedString", "订单明细"), ("D", "SharedString", "工厂型号"),
+                ("E", "SharedString", "配置描述"), ("F", "SharedString", "压缩机")],
+            3: [("A", "SharedString", "Pioneer"), ("B", "SharedString", "9KCH"),
+                ("C", "Number", "500"), ("D", "Number", "236.53"),
+                ("E", "Number", "0"), ("F", "Number", "0")],
+        }
+        out = detect_header_rows(self._cells(profile), 6)
+        self.assertEqual(out, {"header_rows": [2], "data_start_row": 3})
+
+    def test_numeric_data_row_breaks_band(self):
+        """数据行 majority-numeric (text < nonempty//2) → 非 header → break."""
+        from flatten_table import detect_header_rows
+        profile = {
+            2: [("A", "SharedString", "类别"), ("B", "SharedString", "产品类别"),
+                ("C", "SharedString", "订单明细"), ("D", "SharedString", "工厂型号"),
+                ("E", "SharedString", "配置描述"), ("F", "SharedString", "压缩机")],
+            3: [("A", "SharedString", "Pioneer"), ("B", "SharedString", "9KCH"),
+                ("C", "Number", "500"), ("D", "Number", "236.53"),
+                ("E", "Number", "0"), ("F", "Number", "0")],
+        }
+        out = detect_header_rows(self._cells(profile), 6)
+        self.assertEqual(out, {"header_rows": [2], "data_start_row": 3})
+
+
 class DecisionStringTests(unittest.TestCase):
     def test_decisions_with_colon_parsed_as_dict_rejected(self):
         """decisions 条目含 ': ' 未加引号 → YAML 解析成 dict → 编译期报错."""
@@ -2253,6 +2349,116 @@ class InplacePositionModelTests(unittest.TestCase):
             [], 6, 3)
         self.assertEqual(ops[0]["props"], {"text": "x"})
         self.assertEqual(records, [("/slide[1]/table[@id=1]/tr[2]/tc[3]", "value", "x")])
+
+
+class AnchorStyleInheritanceTests(unittest.TestCase):
+    """Case 010 盲区修复契约 (2026-08-18): inplace 组锚点落在旧合并区非锚点
+    格时 (该格无字体样式), 编译器继承占位区内同列既有锚点样式 (font/alignment)。
+    优先级: spec 显式 `styles` > 继承值 > STYLE_DEFAULTS (逐键, spec 声明过的
+    键不被继承覆盖)。`meta.merge_anchor_styles` 由 prepare 采集
+    (flatten_table.collect_anchor_styles), 不入结构指纹。"""
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_styled_anchor_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _spec(self) -> dict:
+        return {
+            "task": {"intent": "锚点样式继承契约", "selected_mod": "NONE",
+                     "selected_mod_revision": None},
+            "inputs": {"sources": ["source_quotation.xlsx"], "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_quotation.xlsx",
+                                          "sheets": ["报价"]}],
+                       "target_sheet": "S"},
+            "fingerprints": {
+                "source_structure": self.wd["manifest"]["fingerprints"]["source_structure"],
+                "target_structure": self.wd["manifest"]["fingerprints"]["target_structure"],
+            },
+            "mapping": {"targets": [{
+                "sheet": "S", "base_last_row": 40,
+                "clone_roles": [{"role": "data", "mode": "inplace", "start_row": 7,
+                                 "capacity": 18, "template_row": 8}],
+                "rows": {"source": "source_quotation"},
+                "columns": [
+                    {"source": "A", "target": "A"},
+                    {"source": "B", "target": "B"},
+                    {"source": "C", "target": "C"},
+                    {"source": "D", "target": "D"},
+                    {"source": "E", "target": "E"},
+                ],
+                "group_merges": [
+                    {"col": "A", "group_by": "A", "style": "label"},
+                    {"col": "F", "group_by": "A", "label": ""},
+                ],
+                "sets": [{"path": "A4", "value": "To Messrs: MXP"}],
+            }]},
+            "validation": {"required_coverage": [], "required_empty": [],
+                           "key_outputs": ["A4", "A7"]},
+            "decisions": [], "gaps": [], "lineage": [],
+        }
+
+    def _merge_ops(self, plan: dict, col: str) -> list:
+        """真正的组/范围合并 op (merge 值为范围串) — 排除 merge-clear
+        (`{"merge": false}`) 与单格残留清理。"""
+        return [o for o in plan["operations"]
+                if o.get("command") == "set"
+                and isinstance(o.get("props", {}).get("merge"), str)
+                and o.get("path", "").startswith(f"/S/{col}")]
+
+    def test_inplace_group_merges_inherit_anchor_font(self):
+        plan = compile_fill.compile_spec(self._spec(), self.wd["manifest"], self.tmp)
+        a_ops = self._merge_ops(plan, "A")
+        self.assertTrue(a_ops, "A 列应有组锚点 merge op")
+        for o in a_ops:
+            self.assertEqual(o["props"].get("font.name"), "微软雅黑",
+                             "A 列锚点应继承模板锚点字体")
+            self.assertIs(o["props"].get("font.bold"), True)
+            self.assertEqual(o["props"].get("font.size"), "12pt")
+        f_ops = self._merge_ops(plan, "F")
+        self.assertTrue(f_ops, "F 列应有组锚点 merge op")
+        for o in f_ops:
+            self.assertNotIn("font.name", o["props"],
+                             "F 列锚点无字体样式 → 不得注入字体")
+            self.assertEqual(o["props"].get("alignment.horizontal"), "center")
+
+    def test_spec_styles_override_inherited_font(self):
+        spec = self._spec()
+        spec["mapping"]["targets"][0]["styles"] = {"label": {"font.size": "10pt"}}
+        plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.tmp)
+        for o in self._merge_ops(plan, "A"):
+            self.assertEqual(o["props"].get("font.size"), "10pt",
+                             "spec 显式 styles 优先于继承值")
+            self.assertEqual(o["props"].get("font.name"), "微软雅黑",
+                             "继承值补 spec 未声明的键")
+
+    def test_plain_merges_inplace_inherit_too(self):
+        spec = self._spec()
+        spec["mapping"]["targets"][0]["group_merges"] = [
+            {"col": "F", "group_by": "A", "label": ""}]  # F 残留仍由 label 覆盖
+        spec["mapping"]["targets"][0]["merges"] = [
+            {"col": "A", "rows": "1:{n}", "style": "label"}]
+        plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.tmp)
+        for o in self._merge_ops(plan, "A"):
+            self.assertEqual(o["props"].get("font.name"), "微软雅黑")
+
+    def test_no_anchor_styles_meta_falls_back_to_defaults(self):
+        wd = make_preformatted_quotation_workdir(self.tmp)  # 无 merge_anchor_styles
+        wd["workdir"] = self.tmp
+        spec = self._spec()
+        spec["fingerprints"] = {
+            "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+            "target_structure": wd["manifest"]["fingerprints"]["target_structure"],
+        }
+        plan = compile_fill.compile_spec(spec, wd["manifest"], self.tmp)
+        for o in self._merge_ops(plan, "A"):
+            self.assertNotIn("font.name", o["props"],
+                             "无样式元数据 → 不得注入字体, 保持默认 label 样式")
+            self.assertEqual(o["props"].get("alignment.horizontal"), "center")
 
 
 class FillSpecContractTests(unittest.TestCase):

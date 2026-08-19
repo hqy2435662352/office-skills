@@ -696,5 +696,85 @@ class TestRuleIdValidation(unittest.TestCase):
         self.assertEqual(rules[1].rule_id, "RTE-002")
 
 
+class TestDisplayNameAndNominationEvaluators(unittest.TestCase):
+    """2026-08-18 Skill Development (MXP 提名复盘): ① MOD Metadata
+    Display Name (中文展示名) 解析与候选输出回退; ② 六角色排除 evaluator
+    (此前该排除信号无验证器 → 恒 pending); ③ block_layout digest 验证器
+    (此前结构信号只有 dimension_set 可验证)。"""
+
+    def test_parse_mod_file_extracts_display_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            mods = Path(td)
+            (mods / "MOD_x.md").write_text(
+                "# MOD_x\n\n## Metadata\n\n- Scope Signals: s::1\n"
+                "- Aliases: x\n- Display Name: 测试中文名\n"
+                "- Exclusion Signals: e::1\n\n"
+                "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+                "|---------|-------|------|-------------|------------|-------|\n"
+                "| R01 | mapping | mod_gate | rule | * | |\n",
+                encoding="utf-8")
+            parsed = mod_nominate.parse_mod_file(mods, "MOD_x.md")
+            self.assertEqual(parsed["display_name"], "测试中文名")
+
+    def test_evaluate_entry_display_name_fallback_to_english_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            mods = Path(td)
+            (mods / "MOD_y.md").write_text(
+                "# MOD_y\n\n## Metadata\n\n- Scope Signals: s::1\n"
+                "- Exclusion Signals: e::1\n\n"
+                "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+                "|---------|-------|------|-------------|------------|-------|\n"
+                "| R01 | mapping | mod_gate | rule | * | |\n",
+                encoding="utf-8")
+            entry = {"name": "MOD_y", "aliases": "", "scope": "semantic_type::quotation",
+                     "exclusion": "目标缺少客户报价六角色表头指纹",
+                     "path": "MOD_y.md", "revision": 1, "visibility": "private"}
+            cand, _ = mod_nominate._evaluate_entry(
+                entry, mods, "报价单 客户报价 quotation", [], [])
+            self.assertEqual(cand["display_name"], "MOD_y",
+                             "无 Display Name → 回退英文名 (机器身份不变)")
+
+    def test_six_field_exclusion_not_fired_when_roles_present(self):
+        digests = ["- 表头: Type | Model | C&H capacity | Connecting pipe | "
+                   "Unit Price (USD/SET) | Panel looking\n- 合并区(2): A1:F1, A25:E25"]
+        fired, pending = mod_nominate.exclusion_checks(
+            "目标缺少客户报价六角色表头指纹", "ev", digests, [])
+        self.assertEqual(fired, [], "六角色齐 → 排除不得触发")
+        self.assertEqual(pending, [], "有验证器 → 不得进 pending_exclusions")
+
+    def test_six_field_exclusion_fired_when_roles_missing(self):
+        digests = ["- 表头: 类别 | 型号 | 数量 | 报价"]
+        fired, pending = mod_nominate.exclusion_checks(
+            "目标缺少客户报价六角色表头指纹", "ev", digests, [])
+        self.assertTrue(fired, "角色缺失 → 排除应触发")
+        self.assertIn("缺少客户报价角色", fired[0]["reason"])
+
+    def test_six_field_exclusion_evidence_missing_fired_with_hint(self):
+        fired, pending = mod_nominate.exclusion_checks(
+            "目标缺少客户报价六角色表头指纹", "ev", [], [])
+        self.assertTrue(fired)
+        self.assertIn("证据缺失", fired[0]["reason"],
+                      "证据缺失 → fired with hint (勿当结构不符)")
+
+    def test_block_layout_customer_quote_verified_from_digest(self):
+        digests = ["- 表头: Type | Model | C&H capacity | Connecting pipe | "
+                   "Unit Price (USD/SET) | Panel looking\n"
+                   "- 合并区(34): A1:F1, A7:A10, A25:E25, A34:F34"]
+        r = mod_nominate.signal_matched(
+            "block_layout", "customer_quote_header_data_total_terms", "ev", digests, [])
+        self.assertIs(r, True, "六角色表头 + 合并区 + 宽合并 → 布局指纹验证为 hit")
+
+    def test_block_layout_pending_without_digest(self):
+        r = mod_nominate.signal_matched(
+            "block_layout", "customer_quote_header_data_total_terms", "ev", [], [])
+        self.assertIsNone(r, "无 digest 证据 → pending (不冒充命中)")
+
+    def test_block_layout_miss_when_header_roles_missing(self):
+        digests = ["- 表头: 类别 | 型号\n- 合并区(1): A1:F1"]
+        r = mod_nominate.signal_matched(
+            "block_layout", "customer_quote_header_data_total_terms", "ev", digests, [])
+        self.assertIs(r, False, "表头角色缺失 → miss")
+
+
 if __name__ == "__main__":
     unittest.main()

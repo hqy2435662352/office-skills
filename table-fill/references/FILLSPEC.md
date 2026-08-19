@@ -89,7 +89,6 @@ mapping:
                                       # 越界 (> base_last_row) → REMOVE_TARGETS_APPEND_ZONE
       # styles:                       # 可选覆盖锚点/标签样式
       #   anchor: {font.size: 11}
-
 decisions:
   - 只迁移分体单冷/欧洲冷暖/32K 机型到 11_FRESH本土
   - 其他费用 = 源其它费用 + 源运费
@@ -827,6 +826,14 @@ mapping:
   逐行公式 / group 锚点与 label — **不含 sets** (sets 禁止进入占位区)。
 - **props 白名单**: V1 仅 `numberformat`; 值语义与展示语义正交
   (`value: null` + `props.numberformat` 合法)。白名单外 → PROPS_WHITELIST_VIOLATION。
+- **锚点样式继承 (Case 010 盲区, 2026-08-18)**: 合并区**非锚点**格通常无字体
+  样式; 组锚点重建后若新锚点落在旧非锚点格 (inplace 常见), 会缺失模板字体。
+  prepare 已采集 `meta.merge_anchor_styles` (锚点 font/alignment, 不入指纹);
+  Compiler 对 inplace 块的 group_merges/merges 锚点**继承占位区内同列行号最小
+  的既有锚点样式**。优先级: spec 显式 `styles: {anchor|label: {font.*}}` >
+  继承值 > STYLE_DEFAULTS (逐键, spec 声明过的键不被继承覆盖)。无既有锚点
+  或无样式 → 回退默认。`styles` 声明示例: `styles: {label: {font.size: "12pt",
+  font.name: "微软雅黑", font.bold: true}}`。
 
 ### 映射增强 (MXP 场景需求)
 

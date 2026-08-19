@@ -361,10 +361,19 @@ def officecli_outline_meta(filepath, sheet, outline_data=None):
 def detect_header_rows(cells, num_cols):
     """Detect the header row band (title/header rows above the data block).
 
-    Header rows are the text-dense rows: the LAST run of consecutive rows
-    (from the top) where a majority of cells are non-empty TEXT (SharedString)
-    rather than numbers — i.e. the table-header band. The first data row is
-    the first row after that band with numeric content or merged series labels.
+    Header rows are the text-dense rows: a run of rows (from the top) where a
+    majority of cells are non-empty TEXT (SharedString) rather than numbers —
+    i.e. the table-header band. The first data row is the first row after that
+    band with numeric content or merged series labels.
+
+    Blank rows are gaps, not boundaries: the band may span a blank separator
+    (e.g. a customer-title row, a blank row, then the real column-header row).
+    To avoid absorbing text-dense DATA rows into the band, each new band row
+    must be at least as dense (nonempty count) as the densest row already in
+    the band — a column-header row is typically the fullest row of a table,
+    while data rows leave price/panel columns empty and therefore drop below
+    the band maximum (Case 010: ATLAS Quotation row 4 title=2, row 6 header=6,
+    row 7 data=4 → band [4,6], data starts at 7).
 
     Returns {"header_rows": [r1, r2, ...], "data_start_row": N} or None when
     no header band can be identified (LLM then falls back to blocks).
@@ -390,20 +399,30 @@ def detect_header_rows(cells, num_cols):
     if not row_scores:
         return None
 
-    # Walk from top; a header row must be majority-text and have >= 2 nonempty
-    # cells. Collect consecutive header rows; stop at the first row that is
-    # majority-numeric OR has < 2 nonempty cells (blank separator).
+    # Walk from top. Before the band starts, non-header rows (e.g. a sparse
+    # company-title row) are skipped. Once started, the band continues across
+    # blank-row gaps while the next row is still a header row AND at least as
+    # dense as the densest band row; it ends at the first row that is
+    # majority-numeric, has < 2 nonempty cells, or is sparser than the band
+    # maximum (text-dense data rows must not be absorbed).
     header_rows = []
+    band_max_nonempty = 0
     max_row = max(row_scores)
     for r in range(1, max_row + 1):
         if r not in row_scores:
-            continue  # blank row → treat as boundary only if we already have headers
+            continue  # blank row → gap inside the band, not a boundary
         text, nonempty = row_scores[r]
         is_header = nonempty >= 2 and text >= max(1, nonempty // 2)
-        if is_header and (not header_rows or r == header_rows[-1] + 1):
+        if not header_rows:
+            if is_header:
+                header_rows.append(r)
+                band_max_nonempty = nonempty
+            continue  # sparse title rows before the band are skipped
+        if is_header and nonempty >= band_max_nonempty:
             header_rows.append(r)
-        elif header_rows:
-            break  # first non-header row after the band → data starts here
+            band_max_nonempty = nonempty
+        else:
+            break  # first non-header or sparser row after the band → data starts
 
     if not header_rows:
         return None
@@ -479,6 +498,43 @@ def build_merge_anchors(merged_ranges, formulas):
             "formula": formulas.get(anchor, ""),
         })
     return anchors
+
+
+# 锚点样式继承采集的键: 只取文本样式 (字体 + 对齐)。边框各格自带,
+# numberformat 由 spec/公式决定 — 均不采集。
+_ANCHOR_STYLE_KEYS = (
+    "font.bold", "font.size", "font.name", "font.charset",
+    "alignment.wrapText", "alignment.horizontal", "alignment.vertical",
+)
+
+
+def collect_anchor_styles(filepath, sheet, merge_anchors):
+    """采集合并锚点的文本样式 (font/alignment) → meta.merge_anchor_styles.
+
+    机制背景 (Case 010 盲区): 合并区**非锚点**单元格通常只有边框、无字体样式
+    (不显示内容); inplace/append 重建合并时, 新组锚点若恰好落在旧非锚点格,
+    将缺失模板字体 (如微软雅黑 12pt bold)。编译器据此继承「占位区内同列既有
+    锚点」的样式, 保证合并单元格文本格式与模板一致。本采集是机械事实收集,
+    结果不入结构指纹 (样式是展示层)。"""
+    styles = {}
+    for a in merge_anchors:
+        anchor = a.get("anchor", "")
+        if not anchor:
+            continue
+        proc = officecli("get", str(filepath), f"/{sheet}/{anchor}",
+                         "--depth", "1", "--json")
+        if proc.returncode != 0:
+            continue
+        try:
+            data = json.loads(proc.stdout)
+            results = data.get("data", {}).get("results", [])
+            fmt = (results[0].get("format") or {}) if results else {}
+        except (ValueError, AttributeError, IndexError):
+            continue
+        picked = {k: fmt[k] for k in _ANCHOR_STYLE_KEYS if k in fmt}
+        if picked:
+            styles[anchor] = picked
+    return styles
 
 
 # clone_roles 候选源行判定: title=块首行, header=+1, data=+2 (prepare 阶段无
@@ -699,6 +755,8 @@ def build_meta(filepath, sheet, cells, num_cols, num_rows, flat_rows, outline_da
     meta["formulas"] = facts["formulas"]
     meta["column_numfmt"] = facts["column_numfmt"]
     meta["merge_anchors"] = build_merge_anchors(meta["merged_ranges"], facts["formulas"])
+    meta["merge_anchor_styles"] = collect_anchor_styles(
+        filepath, sheet, meta["merge_anchors"])
     meta["row_gaps"] = detect_row_gaps(filepath, sheet)
     meta["column_width"] = detect_column_widths(filepath, sheet)
     meta["style_granularity"] = detect_style_granularity(

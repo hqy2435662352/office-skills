@@ -18,12 +18,21 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 # MOD_<name>
 
 ## Purpose            # 版本/可见性/规则数
-## Metadata           # Scope Signals / Aliases
+## Metadata           # Scope Signals / Aliases / Display Name / Exclusion Signals
 ## Applicability      # 业务逻辑指纹 — 提名匹配依据 (脚本读取)
 ## 业务逻辑摘要       # 提名卡数据源 (脚本读取)
 ## 业务场景上下文     # 业务背景 (可含客户示例, 但规则本体不得硬编码)
 | Rule ID | Group | Gate | Description | Applies to | Notes |   # 六列规则表
 ```
+
+## Metadata 段
+
+- `Scope Signals` / `Aliases` / `Exclusion Signals`: 提名匹配事实 (脚本读取)。
+- `Display Name` (可选): **中文展示名**, 仅用于提名卡/裁决选项的人读标签 —
+  英文 MOD 名始终是机器身份 (匹配/别名/路径/捕获都用它, ASCII 不变)。
+  `mod_nominate.py` 解析本字段并输出 `display_name` (缺省回退英文名)。
+  编码安全: MOD 文件与提名 JSON 全程 UTF-8 (`ensure_ascii=False` +
+  `_utf8_stdio()`), 展示层中文不会引入编码问题。
 
 ## Applicability（业务逻辑指纹）
 
