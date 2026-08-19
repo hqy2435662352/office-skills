@@ -18,13 +18,10 @@ description: >
   MOD Resolution interrupts only on genuine semantic ambiguity.
 license: MIT
 compatibility: >
-  Required: officecli (on PATH), Python 3.10+ (PyYAML).
-  Two rules for Office access: (a) structure parsing (column widths / row gaps /
-  OLE) may read ZIP/XML directly; (b) every officecli subprocess call must go
-  through scripts/_officecli.py officecli() (shared UTF-8 adapter). No openpyxl,
-  no pandas, no python-pptx in the pipeline.
-  Must co-load: officecli-xlsx (path syntax, open/save lifecycle, batch patterns, QA gates)
-  Recommended: officecli-win (Windows subprocess encoding workaround)
+  Required: officecli (on PATH), Python 3.10+ (PyYAML). No openpyxl, no pandas,
+  no python-pptx in the pipeline — officecli 子进程调用一律经 _officecli.officecli()
+  适配器 (规则见「不变量 6」)。Must co-load: officecli-xlsx; Recommended:
+  officecli-win (Windows subprocess encoding workaround)
 metadata:
   drift-risk: high
   gate-count: 1
@@ -33,31 +30,6 @@ metadata:
 
 # Table Fill (v2.5)
 
-Fill, migrate, or aggregate data between Office tables (xlsx/pptx, any direction —
-PPTX targets: column value fills + DOM-path sets; formulas/merges/nulls/remove_rows
-are compile-time rejected)
-with one canonical business-semantics file, one execution, one human gate, and
-full traceability. V2 replaced the old four-layer flow: it merged the batch
-builder / mapping renderer / validator / smoke test into a single Compiler, made
-MOD resolution a conditional interrupt, and made the user-approved draft the
-final file — promotion is a hash-verified copy, never a second execution.
-
-**Why this structure matters**: mapping errors caught after filling are expensive.
-V2 catches them in the Compiler (static validation, Section 9 below) before any
-file is touched, then proves executability exactly once on the draft, then lets
-you approve that validated draft — so what you approve is what gets delivered.
-
-**Why officecli over openpyxl**: All Office content read/write goes through
-officecli exclusively (structure parsing — column widths / row gaps / OLE — may
-read ZIP/XML directly, no officecli needed). Every officecli subprocess call
-must go through the shared adapter `scripts/_officecli.py` → `officecli()`
-(UTF-8 subprocess). Three reasons: (1) `add --type row` auto-updates dependent
-structures (formulas, conditional formatting sqref, data validation, named
-ranges); (2) python-pptx's `save()` silently overwrites all officecli-written
-changes; (3) openpyxl's dimension metadata is unreliable. If data cleaning or
-aggregation is needed, use pandas separately before entering the pipeline —
-never inside it.
-
 ## ⚠️ 依赖加载（必须先执行）
 
 ```python
@@ -65,16 +37,6 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 # 目标为 PPTX 时追加: skill(name="officecli-pptx")
 # Windows/中文路径时追加: skill(name="officecli-win")
 ```
-
-## v2.5 Skill-only 边界
-
-v2.5 is a skill-level workflow. It does NOT simulate V3 runtime governance:
-
-- No Governed Run, Runtime Guard, Host Adapter, protected paths, or Gate Basis binding.
-- The `.gate3_pending` marker is a flow hint, not a trusted authorization state.
-- Scripts raise the bar for following the workflow, but cannot enforce it —
-  the agent's job is to follow the workflow because it is correct, not because
-  a guard watches.
 
 ## 不变量
 
@@ -112,18 +74,10 @@ v2.5 is a skill-level workflow. It does NOT simulate V3 runtime governance:
 
 ## 工作流 (五个公开命令)
 
-```
-prepare_run.py ──► MOD Resolution ──► fill_spec.yaml ──► compile_fill.py
-      (outline)    (条件中断)          (LLM 撰写)          (plan+mapping+验证)
-                                                            │
-                                              execute_batch.py (唯一一次填充)
-                                                            │
-                                                        Validated Draft + receipt
-                                                            │
-                                              Execution Gate (唯一 Human Gate)
-                                                            │
-                                              promote_output.py (hash 验证复制)
-```
+`prepare_run.py` (outline) → MOD Resolution (条件中断) → `fill_spec.yaml` (LLM 撰写)
+→ `compile_fill.py` (plan+mapping+验证) → `execute_batch.py` (唯一一次填充) →
+Validated Draft + receipt → Execution Gate (唯一 Human Gate) → `promote_output.py`
+(hash 验证复制)
 
 ### 1. Prepare — `prepare_run.py` (两个阶段)
 
@@ -144,10 +98,9 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
 - 每个 sheet 一个 `{name}_digest.md` — **LLM 只读 digest, 不读 meta.json**。
 - 阶段 B 之前先读 outline 确认 sheet 名; 一次 outline 只跑一次, 不重复。
 - **`--sheets` 按任务文本一次列出全部源 sheet** (文件间用 `;` 分隔,
-  `file.xlsx:S1,S2;file2.xlsx:S3`) — 漏列 sheet 会触发 TARGET_NOT_FLATTENED
-  报错后补跑; 增量展平 (flatten 可多次调用) 是**兜底**不是常态。
-- flatten 可**多次调用增量展平** (如先源后目标、或分 sheet 批次): manifest
-  按条目 name 合并, 新覆盖旧, 不互相覆盖。
+  `file.xlsx:S1,S2;file2.xlsx:S3`) — 漏列触发 TARGET_NOT_FLATTENED, 补跑即可。
+- flatten 可**多次调用增量展平** (先源后目标或分 sheet 批次, 兜底不是常态):
+  manifest 按 name 合并, 新覆盖旧, 不互相覆盖。
 - **行号空洞修复 (TEMPLATE_ROW_GAP)**: `scripts/repair_row_gaps.py --workdir <dir>`
   物化缺失行元素后**自动重跑 flatten (仅目标 sheet) 同步 manifest 指纹** —
   flatten 不需手工重跑; 唯一动作 = 更新 spec 的 target_structure 指纹
@@ -338,15 +291,6 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
 - **note_phase 合规**: 关键相位至少各记录一次 — `mod_resolution` /
   `spec_authoring` / `compile_review` / `execute_review` / `gate_wait`;
   缺 Agent 相位 → run_timing 不完整, Gate 报告缺 Agent 时间栏。
-- **效率提示**: 把每轮验证成本从数分钟降到秒级 — compile 一轮 0.1s,
-  读源码是它的数百倍。不确定"编译器会怎样处理 X"时, 写正式 spec 走
-  formal compile 让编译器回答 (probe 只留给架构分叉)。
-- **失败成本量化 (为什么不怕第 1 轮失败)**: 第 1 轮执行失败是**预期路径** —
-  修复成本 ≈ 编译 0.1s + 重跑 ~20s + 一次 spec 改动, 合计 <2 分钟; 为防失败
-  而读源码是负收益 (一次源码阅读 ≈ 数分钟到十几分钟)。repair 预算 1 轮
-  约束的是**连续失败** (防无限循环), 不是单次失败 — 单次失败照常走
-  "失败处置表 → 修 → 重跑"。
-
 ### 4. Compile — `compile_fill.py` (唯一 Compiler)
 
 ```bash
@@ -354,24 +298,11 @@ python scripts/compile_fill.py --spec fill_spec.yaml --workdir <dir>
 ```
 
 产出 `execution_plan.json` + `mapping.md` (均为派生)。编译前静态验证
-(Section 9), 失败输出结构化 defect 清单并 exit 3 — **不生成 plan**。
+(Compiler 内置), 失败输出结构化 defect 清单并 exit 3 — **不生成 plan**。
 
-**Section 9 静态验证清单** (Compiler 内置):
-
-- 每条必需源记录进入且仅进入一个目标位置
-- 不存在重复目标写入 (同一格只能被一个 mapping/null/formula/group/set 写入)
-- 所有写入都有 source、transform 或 explicit decision
-- clone source 不是合并锚点 (锚点克隆携带锚点公式到非锚点格)
-- clone 残留空值政策完整 (template 行的非空列必须被 fill/null/formula/merge 覆盖)
-- **inplace 不变量 (12 码)**: 每目标至多一个 inplace 块且必须末位;
-  占位区必须存在且坐标稳定 (append 区合法性 + 重叠检查); 前置 remove_rows 只在
-  append 区; sets 禁止进占位区; 保留行残留按**每行自身原值**双基线检查
-  (PLACEHOLDER_RESIDUE_* 逐保留行 / 克隆残留沿用 template_row)
-- 公式引用范围不越过语义块 (aggregate rows 必须在数据块内)
-- aggregate 范围覆盖完整 (通常 `1:{n}`)
-- required gaps 已显式记录 (spec.gaps)
-- 目标路径来自结构摘要 — base_last_row / 列字母不得超出 digest 维度
-- FillSpec fingerprint 与当前输入匹配 (stale spec → 拒绝)
+**静态验证全部由编译器执行** — agent 不需要手工预检或复述清单; 命中即按
+stderr 的 defect 码定向修, 错误码 → 修复对照见 references/FILLSPEC.md
+「常见编译错误速查」与 references/FAILURE_CLASSES.md。
 
 **结构/层级缺陷预算 (硬性)**: Compile 返回的缺陷属**结构/层级类** —
 `KEY_OUTPUT_UNWRITTEN`、`CLONE_RESIDUE_*`、`BLOCK_KEY_STRUCTURE_INVALID`、
@@ -499,20 +430,16 @@ vMerge、unmerge 多步、`merge.down=N` 总跨度 N+1、validate 对合并残�
 
 ## 总原则: 思考按需升级
 
-不重新推导确定性状态, 不重复评估已解决决策。脚本/digest/失败记录已给出的事实
-不得重新推导。验证即证据: plan 派生 readback 通过即视为已验证 — 手动
-`officecli get` 全流程 ≤2 次, 仅用于异常驱动的定向检查。失败优先读
-`_draft_failure.json` 的 defect_class, 禁止自由实验。
+不重新推导确定性状态, 不重复评估已解决决策 — 脚本/digest/失败记录已给出的事实
+不得重新推导; 验证即证据, 手动 `officecli get` 全流程 ≤2 次, 仅用于异常驱动的
+定向检查; 失败优先读 `_draft_failure.json` 的 defect_class, 禁止自由实验。
 
 **机器证据终止条件 (硬性)**: `execute_batch.py` 已返回 `issues_new` /
 `validate` / readback (含结构 readback) / render 后, **禁止**再用 `officecli
-issues`、读 `execution_plan.json`、`officecli get` **逐格复核**, 也**禁止读
-case 复盘 / 测试病历作证据** (Case 07 改进 5 / Case 08 R1/R2 扩展: readback
-全绿后仍逐格 get 或读复盘找证据 = 冗余探索) — 坐标、列宽无 overflow、readback
-全过、组边界都已被机器证据证明, 人工复核是冗余探索 (Case 05 E5/E6: 627/627 +
-issues 0 后仍手翻 700+ 行 plan / 重跑 officecli issues)。唯一例外 = **异常驱动
-的定向检查**: 仅当失败记录/缺陷驱动 (如 render 失败、readback 出现意外差异)
-时, 才允许 `officecli get` ≤2 次定位具体格, 且 `get` 与 `issues` 是两回事 —
+issues`、读 `execution_plan.json`、`officecli get` 逐格复核, 也**禁止读 case
+复盘 / 测试病历作证据** — 坐标、列宽、readback、组边界都已被机器证据证明,
+人工复核是冗余探索。唯一例外 = **异常驱动的定向检查** (render 失败 / readback
+意外差异): 允许 `officecli get` ≤2 次定位具体格; `get` 与 `issues` 是两回事 —
 机器证据已证明时 `officecli issues` 一律禁止。
 
 ## 失败处置表 (每次失败先分类, 再行动)
