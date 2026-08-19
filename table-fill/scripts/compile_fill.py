@@ -2813,6 +2813,13 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         "blocks": blocks,
         "operations": ops,
         "operation_count": len(ops),
+        # 字体 scheme 后处理声明 (Q20 残余修复): 任何 op 写入 font.scheme=none
+        # (pin_font_scheme 或 spec 显式 none) → 执行期 raw-set 后处理把
+        # <scheme val='none'/> 元素整体移除 — 只有"无 scheme 元素"的字面字体
+        # 才在所有查看器 (含 WPS) 稳定渲染为 font.name 字面名。
+        "strip_scheme_none": any(
+            o.get("props", {}).get("font.scheme") == "none"
+            for o in ops if o.get("command") == "set"),
         "readback": readback,
         "source_csv": ", ".join(m["csv"] for m in matched_all),
         "source_coverage": cov_entries,

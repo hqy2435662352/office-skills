@@ -223,6 +223,8 @@ class MxpEndToEndTests(unittest.TestCase):
         self.assertEqual(plan["schema_version"], "2.5")
         self.assertEqual(plan["expected_final_row_count"], 35)
         self.assertEqual(plan["structural_deltas"]["inplace_trim"], 5)
+        self.assertIs(plan.get("strip_scheme_none"), True,
+                      "继承锚点字面字体 (font.scheme=none pin) 必须声明执行期剥离")
         self.assertEqual([g["expected_merges"] for g in plan["group_boundaries"]],
                          [["A7:A10", "A12:A14", "A16:A19"],
                           ["F7:F10", "F12:F14", "F16:F19"]])
@@ -246,6 +248,21 @@ class MxpEndToEndTests(unittest.TestCase):
 
         # Structural equivalence vs the v4 verified snapshot.
         draft = str(workdir / "validated_draft.xlsx")
+
+        # Q20 residual fix (2026-08-19): the executed draft must carry NO
+        # scheme val='none' font elements — the executor's post-pass strips
+        # them so inherited literal fonts (微软雅黑) render as the literal
+        # name in every viewer (WPS theme-renders ANY scheme element).
+        import zipfile as _zf
+        with _zf.ZipFile(draft) as _z:
+            styles_xml = _z.read("xl/styles.xml").decode("utf-8")
+        self.assertNotRegex(
+            styles_xml, r'<(?:[\w]+:)?scheme[^>]*val="none"',
+            "draft styles must not contain scheme val='none' after the "
+            "executor post-pass")
+        self.assertIn("微软雅黑", styles_xml,
+                      "draft styles must keep the inherited literal font")
+
         cells = flatten_cells(officecli_get(draft, "/ATLAS Quotation/A1:F35"))
         import re as _re
         merged = set()

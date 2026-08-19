@@ -649,24 +649,39 @@ formulas:
   merges+aggregates + 0-口径费用列 + 克隆残留/外部引用 nulls, rows.selectors 必须
   排除表头行)。
 
-### Q20: inplace 合并锚点继承字面字体时为什么必须补 `font.scheme: none`?
+### Q20: inplace 合并锚点继承字面字体时为什么必须补 `font.scheme: none` + 执行期剥离?
 
 **否则 officecli 在「显式 `font.name` 落到原本无字体的格子 (默认 style 的旧合并
-区非锚点格)」时注入 `<scheme val="minor"/>` + `<color theme="1"/>`, 使继承的
-微软雅黑被主题 minor 字体覆盖, 视觉上仍是宋体/等线**。这是 Case 010 锚点样式
+区非锚点格)」时复制旧字体的 `<scheme val="minor"/>` + `<color theme="1"/>`, 使
+继承的微软雅黑被主题 minor 字体覆盖, 视觉上仍是宋体**。这是 Case 010 锚点样式
 继承 (issue `table-fill-anchor-font-scheme/01`) 被暴露后的残余盲区: 继承样式本身
-取对了 (font.name=微软雅黑), 但写入无字体格时被 officecli 的 scheme 注入破坏。
+取对了 (font.name=微软雅黑), 但写入无字体格时被 officecli 的 scheme 合并破坏。
 
-- **修复契约**: Compiler 对 inplace 合并锚点 (group_merges 与 merges) 的最终
-  style 做 `pin_font_scheme`: 含 `font.name` 且未显式给定 `font.scheme` → 补
-  `font.scheme: none`, 钉住字面字体。spec 显式 `font.scheme` 逐键优先, 不被覆盖
-  (用户有意使用主题字体时保留)。
+**残余盲区之二 (2026-08-19, 用户视觉反馈)**: 补 `font.scheme: none` 只把元素值
+从 minor 改成 none, **没有移除元素** — 部分查看器 (WPS) 对**任何** scheme 元素
+(含 val='none') 仍走主题 minor 字体渲染, 视觉上依然是软件默认宋体。officecli
+`set` 无法在旧字体带 scheme 的格子上 OMIT 该元素 (实测三态: 不传 → 复制旧
+minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
+
+- **修复契约 (两段)**: ① Compiler 对 inplace 合并锚点 (group_merges 与 merges)
+  的最终 style 做 `pin_font_scheme`: 含 `font.name` 且未显式给定 `font.scheme`
+  → 补 `font.scheme: none` (作标记); spec 显式 `font.scheme` 逐键优先, 不被覆盖
+  (用户有意使用主题字体时保留)。任何 op 写入 font.scheme=none 时 plan 声明
+  `strip_scheme_none: true`。② 执行器在批量写入后、validate **之前**对 draft 跑
+  `officecli raw-set /styles --xpath "//x:scheme[@val='none']" --action remove`
+  (须 open/close resident 生命周期, 否则静默空跑), 然后直接读 styles.xml
+  (ZIP 结构读取) 验证无残留; 失败 → `SCHEME_STRIP_FAILED` (exit 3)。最终字体
+  **不带 scheme 元素** — 与模板自有字体的表示法一致, 在所有查看器稳定渲染
+  font.name 字面名。scheme=minor 的模板字体不受剥离影响 (xpath 只匹配 val='none';
+  scheme=none 语义上等价于无 scheme, 剥离是安全无操作)。
 - **既有锚点格不受影响**: 已带显式 `<rFont>` 的旧锚点格复用时不触发注入 (写入
   无害的 scheme=none); 只有旧**非**锚点格 (新组锚点落点) 才需要本次补丁。
 - **`font.color: dk1` 旁注**: 残余的主题深色1 (dk1, 近黑) 与默认文字色一致,
   非缺陷, 不作为清除目标 — 过度归一化反而破坏有意使用的主题配色。
 - 回归测试: `tests/test_optimization.py` AnchorStyleInheritanceTests 断言 inplace
-  锚点 `font.scheme != "minor"`。
+  锚点 `font.scheme == "none"` 且 plan 声明 `strip_scheme_none`; 无字体样式场景
+  断言不声明; `tests/test_mxp_e2e.py` 端到端断言执行后 draft styles.xml 无
+  scheme val='none' 残留。
 
 ## 执行顺序保证 (Execution Order Contract)
 

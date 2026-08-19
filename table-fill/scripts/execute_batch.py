@@ -39,6 +39,7 @@ import argparse
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -180,6 +181,45 @@ def _failed_chunk(start: int, proc, chunk: list) -> dict:
 
 def _chunk_has_structural(chunk: list) -> bool:
     return any(op.get("command") in ("add", "remove") for op in chunk)
+
+
+SCHEME_NONE_XPATH = "//x:scheme[@val='none']"
+SCHEME_NONE_RE = re.compile(r'<(?:[\w]+:)?scheme[^>]*val="none"')
+
+
+def strip_scheme_none_fonts(book: Path) -> tuple[bool, str]:
+    """Remove <scheme val='none'/> font elements from the draft styles part.
+
+    Q20 残余修复 (2026-08-19): officecli `set` 无法在"原字体携带 scheme"的
+    格子上 OMIT scheme 元素 — 不传 prop → 旧 scheme (minor) 被复制 (渲染回
+    主题字体=宋体); 显式 font.scheme=none → 写入 val='none' 元素, 但部分
+    查看器 (WPS) 对**任何** scheme 元素 (含 val='none') 仍走主题 minor 字体
+    渲染, 显示软件默认宋体。只有"无 scheme 元素"的字面字体 (模板自有字体
+    的表示法) 才在所有查看器稳定渲染 font.name 字面名。
+
+    编译器以 font.scheme=none 作标记 (pin_font_scheme), 本后处理把该元素
+    整体移除。raw-set 需要 open/close resident 生命周期: 不先 open 会静默
+    空跑 (rc 0, 文件不变) — 见 KNOWN_TRAPS。移除后直接读 draft 的
+    styles.xml (ZIP 结构读取, 无需 officecli) 验证无残留。
+
+    Returns (ok, err_text)."""
+    officecli("open", str(book))
+    proc = officecli("raw-set", str(book), "/styles",
+                     "--xpath", SCHEME_NONE_XPATH, "--action", "remove")
+    rc = proc.returncode
+    err = (proc.stderr or "").strip()
+    officecli("close", str(book))
+    if rc != 0:
+        return False, f"officecli raw-set failed rc={rc}: {err[-400:]}"
+    try:
+        with zipfile.ZipFile(book) as zf:
+            styles = zf.read("xl/styles.xml").decode("utf-8")
+    except (KeyError, OSError) as e:
+        return False, f"cannot verify draft styles after strip: {e}"
+    if SCHEME_NONE_RE.search(styles):
+        return False, ("scheme val='none' still present in draft styles after "
+                       "raw-set strip (xpath matched nothing)")
+    return True, ""
 
 
 NUMERIC_DECOR = str.maketrans("", "", ",%$￥€¥£")
@@ -485,6 +525,27 @@ def main() -> None:
             "standard_fix": standard_fix(cls),
             "corrective_action": "Fix fill_spec.yaml per standard_fix, recompile, re-run",
         }, 3)
+
+    # 1b. Font-scheme post-pass (Q20 residual): strip the <scheme val='none'/>
+    #     elements the anchor pin wrote, so inherited literal fonts (e.g.
+    #     微软雅黑) render as the literal name in every viewer — including
+    #     WPS, which theme-renders ANY scheme element (even val='none') as the
+    #     default 宋体. Runs BEFORE validate so every downstream verification
+    #     sees the final bytes.
+    if plan.get("strip_scheme_none") and platform == "xlsx":
+        ok, err_text = strip_scheme_none_fonts(draft_path)
+        if not ok:
+            fail_record(workdir, {
+                "code": "SCHEME_STRIP_FAILED",
+                "round": args.round,
+                "message": "font-scheme post-pass failed on the draft",
+                "detail": err_text,
+                "corrective_action": "officecli raw-set /styles must remove "
+                                     "scheme val='none' elements (check officecli "
+                                     "version / raw-set support); the pinned "
+                                     "literal fonts would otherwise render as the "
+                                     "theme font in WPS",
+            }, 3)
 
     # 2. Machine verification: validate FIRST, then issue delta vs template.
     #    A template that itself fails `officecli validate` (e.g. pptx chart

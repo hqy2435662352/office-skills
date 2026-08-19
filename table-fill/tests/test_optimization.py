@@ -2463,7 +2463,9 @@ class AnchorStyleInheritanceTests(unittest.TestCase):
     def test_inplace_anchor_pins_font_scheme_none(self):
         """残余盲区 (2026-08-19): 继承字面字体 (font.name) 落到原无字体格时,
         officecli 会注入 scheme=minor 主题引用使字体渲染回主题 minor 字体 (宋体)。
-        编译器必须以 font.scheme=none 钉住字面字体, 防注入覆盖继承字体名。"""
+        编译器必须以 font.scheme=none 钉住字面字体, 防注入覆盖继承字体名;
+        同时 plan 声明 strip_scheme_none, 执行期把 val='none' 元素整体剥离
+        (WPS 对任何 scheme 元素 — 含 none — 仍按主题字体渲染)。"""
         plan = compile_fill.compile_spec(self._spec(), self.wd["manifest"], self.tmp)
         a_ops = self._merge_ops(plan, "A")
         self.assertTrue(a_ops, "A 列应有组锚点 merge op")
@@ -2472,6 +2474,23 @@ class AnchorStyleInheritanceTests(unittest.TestCase):
             self.assertEqual(o["props"].get("font.scheme"), "none",
                              "继承字面字体必须钉 font.scheme=none, 不得漏留 "
                              "officecli 注入的 minor (否则渲染为主题 minor 字体=宋体)")
+        self.assertIs(plan.get("strip_scheme_none"), True,
+                      "写入 font.scheme=none 的 plan 必须声明执行期 scheme 剥离")
+
+    def test_no_font_pin_no_strip_declaration(self):
+        """无字体样式元数据 → 无 pin → plan 不声明 strip_scheme_none
+        (执行器不跑 styles 后处理)。"""
+        wd = make_preformatted_quotation_workdir(self.tmp)
+        wd["workdir"] = self.tmp
+        spec = self._spec()
+        spec["fingerprints"] = {
+            "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+            "target_structure": wd["manifest"]["fingerprints"]["target_structure"],
+        }
+        plan = compile_fill.compile_spec(spec, wd["manifest"], self.tmp)
+        self.assertNotIn("font.name", self._merge_ops(plan, "A")[0]["props"])
+        self.assertFalse(plan.get("strip_scheme_none"),
+                         "无 font.scheme=none 写入时不得声明 scheme 剥离")
 
     def test_spec_explicit_font_scheme_not_overridden(self):
         """spec 显式 font.scheme 逐键优先, pin_font_scheme 不得覆盖用户有意使用的
