@@ -1,0 +1,20 @@
+# task_bad_refs.yaml — 非法示例：引用不存在的源文件/目标模板、
+# 输出名不合法（含空格、路径穿越）。校验应拒绝，缺陷清单含
+# SOURCE_FILE_NOT_FOUND / TEMPLATE_NOT_FOUND / OUTPUT_NAME_INVALID。
+task:
+  id: bad-refs-task
+runs:
+  - id: run-1
+    source:
+      file: sources/does_not_exist.xlsx
+      sheets: [Sheet1]
+    target:
+      template: templates/not_there.xlsx
+      output: bad output.xlsx
+  - id: run-2
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: ../escape.xlsx

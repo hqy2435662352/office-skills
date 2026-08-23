@@ -1,0 +1,19 @@
+# task_dup_run_id.yaml — 非法示例：重复 run id。校验应拒绝，
+# 缺陷清单含 RUN_ID_DUPLICATE。
+task:
+  id: dup-run-id-task
+runs:
+  - id: dup-run
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: out_a.xlsx
+  - id: dup-run
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: out_b.xlsx

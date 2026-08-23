@@ -1,0 +1,18 @@
+# task_missing_fields.yaml — 非法示例：缺 task.id / 缺 target.output /
+# 缺 source.sheets。校验应拒绝，缺陷清单含 TASK_ID_MISSING / OUTPUT_MISSING /
+# SHEETS_MISSING。
+task:
+  customer: 埃及
+runs:
+  - id: run-a
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+  - id: run-b
+    source:
+      file: sources/parameter_book.xlsx
+    target:
+      template: templates/filling_template.xlsx
+      output: out_run_b.xlsx

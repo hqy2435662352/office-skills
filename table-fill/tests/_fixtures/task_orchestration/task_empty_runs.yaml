@@ -1,0 +1,5 @@
+# task_empty_runs.yaml — 非法示例：runs 为空。校验应拒绝，
+# 缺陷清单含 RUNS_EMPTY。
+task:
+  id: empty-runs-task
+runs: []

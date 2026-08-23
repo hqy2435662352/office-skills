@@ -1,0 +1,33 @@
+# task_valid.yaml — 合法 task.yaml 示例（issue 01 验收用）
+#
+# 一个任务 = 3 条 run，共享同一源工作簿与同一目标模板（埃及 13 产品线
+# 批量的缩小版）。业务映射（产品线→容量→Z 码→源列）永远不在此处，
+# 而是在 runs/<id>/fill_spec.yaml，由 MOD 规则指导撰写。
+# task.yaml 是 MOD Resolution 产物的消费方，不是生产方。
+task:
+  id: egypt-params-2026a
+  customer: 埃及
+  notes: 合成验收示例 — 单任务多 run 的缩小版
+runs:
+  - id: r32-cooling
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数, R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: out_r32_cooling.xlsx
+  - id: r32-heating
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: out_r32_heating.xlsx
+  - id: r410a-cooling
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      output: out_r410a_cooling.xlsx
+    template_family: 空调参数表 V3   # 模板族声明 — 仅作记录，D6 不实现
