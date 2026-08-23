@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts/prepare_task.py — Task 级编排入口（issue 01 + 02 切片）。
+scripts/prepare_task.py — Task 级编排入口（issue 01 + 02 + 03 切片）。
 
 当前实现：
   --validate  静态校验 task.yaml（run id 唯一 / sheets、target 引用存在 /
@@ -13,18 +13,27 @@ scripts/prepare_task.py — Task 级编排入口（issue 01 + 02 切片）。
               预留 supersede 路径）；manifest/status 被手改 → 一致性缺陷。
               快照的输入事实（staged/outline/cache/fingerprint）由 prepare
               阶段（issue 02）补全，本脚本只写声明骨架。
-  --prepare   阶段 1/2（issue 02）：staging + outline（任务级一次）+ eager
-              预展平入 task-local cache（每缓存键恰好一次，命中零 officecli）
-              + 逐 run 物化（缓存产物 → runs/<id>/，单 run 命名）+ run 级
-              prepare_manifest.json 组装（compile-facing 与单 run 同构，仅
-              flattened 条目多 cache_key/sha256）+ status 推进
-              （planned → prepared）。复用 prepare_run / flatten_cache /
-              task_prepare 的底层函数，现有单 run 脚本零改动。
+  --prepare   阶段 1/2（issue 02 + 03）：staging + outline（任务级一次）+
+              eager 预展平入 task-local cache（每缓存键恰好一个 worker，
+              命中零 officecli）+ 逐 run 物化（缓存产物 → runs/<id>/，单 run
+              命名）+ run 级 prepare_manifest.json 组装（compile-facing 与
+              单 run 同构，仅 flattened 条目多 cache_key/sha256）+ status
+              边界推进（planned → prepared）。复用 prepare_run /
+              flatten_cache / task_prepare 的底层函数，现有单 run 脚本零改动。
+  --run       阶段 1–5 完整编排（issue 03）：source_prepare → run_prepare →
+              compile → execute → gate。barrier 式阶段批处理（阶段内并行、
+              阶段间 barrier、无流水线）、并发默认值 = implementation
+              constant（不进 task.yaml、不暴露 CLI 调参）、单一写者
+              （task_status.json 在阶段边界统一写盘一次，阶段内零并发写）、
+              任一 run 失败不阻断同阶段其他 run（失败清单汇总）。gate 呈现
+              （--set）后停（fail-closed）：不自动确认、不自动 promote；
+              确认展开与 promote 由 gate_task（issue 05）/ resume_task
+              （issue 04）承担。
+  --resume    预留：断点恢复在 issue 04（resume_task.py）。
+  调度实现：Python 线程池 + subprocess 调用现有脚本（compile_fill.py /
+  execute_batch.py / execution_gate.py 本就是独立进程入口），现有脚本零改动。
 
-阶段调度（barrier + 并发常量）在 issue 03 落地；生命周期/resume/supersede
-在 issue 04。本脚本是它们的挂载点。
-
-Exit codes（与套件一致）: 0=pass, 1=fatal (env/file), 3=retryable (validate defects)。
+Exit codes（与套件一致）: 0=pass, 1=fatal (env/file), 3=retryable (validate defects / stage failures)。
 """
 
 from __future__ import annotations
@@ -34,12 +43,14 @@ import json
 import sys
 from pathlib import Path
 
-from _officecli import ensure_utf8_stdio, fail  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # 套件导入纪律：先 insert 再打 E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+import _officecli  # noqa: E402
 import task_schema  # noqa: E402
 import task_prepare  # noqa: E402
+
+ensure_utf8_stdio = _officecli.ensure_utf8_stdio
+fail = _officecli.fail
 
 
 def _ascii_path_check(root: Path) -> None:
@@ -162,13 +173,44 @@ def run_init(root: Path) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def _progress(line: str) -> None:
+    """进度摘要走 stderr（stdout 只承载结构化 JSON，解析器不受污染）。"""
+    print(line, file=sys.stderr)
+
+
+def _fail_json(code: str, message: str, corrective_action: str,
+               defects: list) -> None:
+    """阶段级失败（--prepare/--run 用）：结构化 ERROR JSON 走 stdout + exit 3。
+
+    与 fail() 同负载形态（status/code/message/corrective_action/defects），
+    但走 stdout —— 这两个模式的 stderr 已承载人读进度行，不再承担
+    fail() 的「整块 JSON」契约；守卫级失败（进度行出现之前）仍走 fail()
+    （stderr 纯 JSON 契约保持）。exit 3 = retryable 与套件一致。"""
+    print(json.dumps({
+        "status": "ERROR", "code": code,
+        "message": message, "corrective_action": corrective_action,
+        "defects": defects,
+    }, ensure_ascii=False, indent=2))
+    sys.exit(3)
+
+
 def run_prepare(root: Path) -> None:
-    """执行 task_prepare.run_prepare（staging/缓存/物化/run manifest）；
-    派生文件存在性与冻结一致性由 _load_derived 前置保证。"""
+    """执行 task_prepare.run_prepare（staging/缓存/物化/run manifest，阶段
+    1+2 barrier 编排）；派生文件存在性与冻结一致性由 _load_derived 前置保证。
+    run 级失败不阻断同阶段其他 run：失败清单在阶段边界汇总，统一 exit 3。"""
     task, _yaml_sha256, manifest, status = _load_derived(
         root, require_existing=True)
 
-    report = task_prepare.run_prepare(root, task, manifest, status)
+    report = task_prepare.run_prepare(root, task, manifest, status,
+                                      progress=_progress)
+    if report["failures"]:
+        # 失败路径：结构化 ERROR JSON 走 stdout（stderr 只承载人读进度行，
+        # 不被 fail() 的双语法打破）；exit 3 与 fail() 语义一致。
+        _fail_json("RUN_PREPARE_FAILED",
+                   f"{len(report['failures'])} 条 run 在 prepare 阶段失败",
+                   "失败二分（issue 04）：输入事实未变 → 阶段重试/REPAIR；"
+                   "输入事实改变 → supersede 该 run",
+                   defects=report["failures"])
     print(json.dumps({
         "status": "PASS",
         "code": "TASK_PREPARED",
@@ -180,10 +222,51 @@ def run_prepare(root: Path) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def run_task(root: Path) -> None:
+    """--run 完整编排（阶段 1–5 barrier 调度；并发 = implementation
+    constant）。阶段失败清单统一汇总；gate 呈现后停（fail-closed）。"""
+    task, _yaml_sha256, manifest, status = _load_derived(
+        root, require_existing=True)
+
+    report = task_prepare.run_staged_pipeline(root, task, manifest, status,
+                                              stages=task_prepare.RUN_STAGES,
+                                              progress=_progress)
+    if report["failures"]:
+        _fail_json("STAGE_FAILURES",
+                   f"{len(report['failures'])} 条 run 在阶段执行中失败",
+                   "失败二分（issue 04）：输入事实未变 → 重试该 run 的阶段；"
+                   "输入事实改变 → supersede 该 run",
+                   defects=report["failures"])
+    stage_summaries = [{
+        "stage": sr["stage"], "items": sr["items"],
+        "ok": len(sr["ok"]), "failed": len(sr["failed"]),
+    } for sr in report["stages"]]
+    output = {
+        "status": "PASS",
+        "code": "TASK_RUN_GATE_PRESENTED",
+        "task": {"id": task["task"]["id"],
+                 "runs": [r["id"] for r in task["runs"]]},
+        "stages": stage_summaries,
+        "cache": report["cache"],
+        "prepared": report["prepared"],
+        "superseded": report["superseded"],
+        "gate": {
+            # 词汇与状态机一致：task_status 的 gated 即「已呈现、待确认」
+            "state": "presented"
+            if any(sr["stage"] == "gate" and len(sr["ok"]) > 0
+                   for sr in report["stages"]) else "not-presented",
+            "note": "确认展开与 promote 由 gate_task（issue 05）/ resume_task"
+                    "（issue 04）承担；--run 不自动确认、不自动 promote",
+        },
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     ensure_utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Task 级编排：task.yaml 静态校验 + derived 文件初始化 + prepare")
+        description="Task 级编排：task.yaml 静态校验 + derived 文件初始化 + "
+                    "prepare（阶段 1–2）+ run（阶段 1–5 完整编排）")
     parser.add_argument("--task-root", type=Path, required=True,
                         help="任务根目录（ASCII），含 agent 撰写的 task.yaml")
     mode = parser.add_mutually_exclusive_group()
@@ -194,6 +277,9 @@ def main() -> None:
     mode.add_argument("--prepare", action="store_true",
                       help="staging + outline + eager 展平缓存 + 逐 run 物化"
                            "与 manifest 组装（需先 --init）")
+    mode.add_argument("--run", action="store_true",
+                      help="阶段 1–5 完整编排（prepare → compile → execute →"
+                           " gate，barrier 调度 + 单一写者；需先 --init）")
     args = parser.parse_args()
 
     root = args.task_root
@@ -207,8 +293,10 @@ def main() -> None:
         run_init(root)
     elif args.prepare:
         run_prepare(root)
+    elif args.run:
+        run_task(root)
     else:
-        fail("NO_MODE", "choose --validate, --init or --prepare",
+        fail("NO_MODE", "choose --validate, --init, --prepare or --run",
              "Pass one of the modes")
     sys.exit(0)
 

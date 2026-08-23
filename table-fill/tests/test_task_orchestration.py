@@ -1,5 +1,5 @@
 """Tests for the Task Artifact Model — issue 01 (spec S2) + Shared Flatten
-Cache (issue 02, spec S3/S4/S5).
+Cache (issue 02, spec S3/S4/S5) + Stage Orchestrator (issue 03, spec S6).
 
 Issue 01 coverage (two pre-agreed seams from spec Testing Decision #3):
   1. task_schema.py pure functions (import seam): validate_task_yaml /
@@ -23,6 +23,22 @@ must be importable pure functions so they are testable without Office):
   7. prepare_task.py --prepare guards (task_manifest required → --init
      first; frozen-manifest check fails closed).
 
+Issue 03 coverage (scheduler core = pure orchestration seam, fake workers,
+13-run synthetic scale; no Office):
+  8. task_scheduler constants — stage table + concurrency defaults as
+     implementation constants (not in task.yaml, no CLI flag).
+  9. task_scheduler.run_stage — barrier semantics: stage k+1 starts only
+     after stage k fully ends; in-stage max concurrency == default.
+  10. task_scheduler.run_stage failure isolation — one failed/raised item
+      never affects same-stage siblings; failure list aggregated.
+  11. task_scheduler.apply_stage_status — single-writer boundary semantics:
+      batch state advance per stage, failed runs not advanced, superseded
+      untouched; the boundary write happens exactly once per stage and the
+      status file is byte-stable DURING a stage (watchdog worker).
+  12. progress lines — `阶段 x/y 完成` boundary summaries.
+  13. prepare_task.py --run guards (no Office): needs --init first, stale
+      manifest fails closed — same prelude contract as --prepare.
+
 No Office involvement: cache/meta/digest fixtures are synthesized text;
 classify_columns.py / structure_digest.py are pure text subprocesses.
 
@@ -33,11 +49,14 @@ Run with:
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -49,6 +68,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import task_schema  # noqa: E402
 import flatten_cache  # noqa: E402
 import task_prepare  # noqa: E402
+import task_scheduler  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
@@ -763,6 +783,440 @@ class TestTaskYamlTargetSheet(unittest.TestCase):
         for rid, entry in manifest["runs"].items():
             run = next(r for r in data["runs"] if r["id"] == rid)
             self.assertEqual(entry["target"]["sheet"], run["target"]["sheet"])
+
+
+# ── issue 03: Stage Orchestrator (spec S6) ──────────────────────────────
+
+# 13 run 规模合成任务（验收规模；fake worker 驱动，无 Office）
+ITEMS13 = [f"r{i:02d}" for i in range(13)]
+
+
+def make_recorder():
+    """阶段内并发观测器：active/max_active（带锁）+ 全事件时间线。"""
+    return {"events": [], "lock": threading.Lock(), "active": 0,
+            "max_active": 0}
+
+
+def make_worker(rec, fail_ids=(), fail_code="SIM_FAILED", sleep=0.05):
+    """fake worker：记录事件与并发峰值；fail_ids 中的 item 返回 failed。"""
+    def worker(item):
+        with rec["lock"]:
+            rec["active"] += 1
+            rec["max_active"] = max(rec["max_active"], rec["active"])
+        rec["events"].append(("start", item, time.perf_counter()))
+        time.sleep(sleep)
+        try:
+            if item in fail_ids:
+                return {"run": item, "status": "failed", "code": fail_code,
+                        "message": "simulated worker failure"}
+            return {"run": item, "status": "ok",
+                    "artifacts": {"out": item}}
+        finally:
+            rec["events"].append(("end", item, time.perf_counter()))
+            with rec["lock"]:
+                rec["active"] -= 1
+    return worker
+
+
+class TestStageConstants(unittest.TestCase):
+    """阶段表 + 并发默认值 = implementation constant：不进入 task.yaml、
+    不暴露 CLI 调参（spec S6；环境稳定性参数不得污染任务定义）。"""
+
+    def test_stage_table_matches_spec(self):
+        self.assertEqual(task_scheduler.STAGES,
+                         ("source_prepare", "run_prepare", "compile",
+                          "execute", "gate", "promote"))
+
+    def test_concurrency_defaults_match_spec_table(self):
+        """spec S6 表格：2 / 2 / 4~8 / 2 / 1 / 2（compile 取实现常量 4）。"""
+        self.assertEqual(task_scheduler.STAGE_CONCURRENCY, {
+            "source_prepare": 2, "run_prepare": 2, "compile": 4,
+            "execute": 2, "gate": 1, "promote": 2,
+        })
+
+    def test_successor_states_follow_main_path(self):
+        """阶段边界后继状态 = 状态机主路径；source_prepare 是任务级阶段
+        （缓存构建），不推进 run 状态。"""
+        self.assertIsNone(task_scheduler.STAGE_SUCCESSOR["source_prepare"])
+        self.assertEqual(task_scheduler.STAGE_SUCCESSOR["run_prepare"],
+                         "prepared")
+        self.assertEqual(task_scheduler.STAGE_SUCCESSOR["compile"], "compiled")
+        self.assertEqual(task_scheduler.STAGE_SUCCESSOR["execute"], "drafted")
+        self.assertEqual(task_scheduler.STAGE_SUCCESSOR["gate"], "gated")
+        self.assertEqual(task_scheduler.STAGE_SUCCESSOR["promote"], "promoted")
+
+    def test_concurrency_not_in_task_yaml(self):
+        """并发默认值不进 task.yaml（结构性断言）。"""
+        data, defect = parse_fixture("task.yaml")
+        self.assertIsNone(defect)
+        self.assertNotIn("concurrency", data)
+        for run in data["runs"]:
+            self.assertNotIn("concurrency", run)
+
+    def test_no_cli_concurrency_flag(self):
+        """并发默认值不暴露 CLI 调参（结构性断言：--help 无调参旗标）。"""
+        proc = subprocess.run(
+            [sys.executable, str(PREPARE_TASK), "--help"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for flag in ("--concurrency", "--workers", "--parallel"):
+            self.assertNotIn(flag, proc.stdout)
+
+    def test_labels_cover_every_stage(self):
+        for stage in task_scheduler.STAGES:
+            self.assertIn(stage, task_scheduler.STAGE_LABELS)
+
+
+class TestRunStageBarrier(unittest.TestCase):
+    """barrier 调度：阶段间 barrier（无跨阶段流水线）、阶段内并发 == 默认值、
+    13 run 规模下 6 个阶段全部按序执行。"""
+
+    def test_stages_execute_in_barrier_order(self):
+        """验收：各阶段按 barrier 顺序执行 — 阶段 k 的全部 worker 结束后
+        阶段 k+1 才开始（下一阶段首个 start 严格晚于上一阶段末个 end，
+        无跨阶段流水线）。"""
+        rec = make_recorder()
+        bounds = {}
+        prev_len = 0
+        for stage in task_scheduler.STAGES:
+            res = task_scheduler.run_stage(stage, ITEMS13, make_worker(rec))
+            self.assertEqual(len(res["ok"]), 13)
+            ev = rec["events"][prev_len:]
+            prev_len = len(rec["events"])
+            self.assertEqual(len(ev), 26)
+            starts = [t for (k, _s, t) in ev if k == "start"]
+            ends = [t for (k, _s, t) in ev if k == "end"]
+            bounds[stage] = (min(starts), max(ends))
+        names = list(task_scheduler.STAGES)
+        for i in range(len(names) - 1):
+            _prev_start, prev_end = bounds[names[i]]
+            next_start, _next_end = bounds[names[i + 1]]
+            self.assertGreater(
+                next_start, prev_end,
+                f"stage {names[i + 1]} started before stage {names[i]} "
+                f"fully ended (pipelining)")
+
+    def test_in_stage_concurrency_matches_default(self):
+        """验收：阶段内并发符合默认值（13 项 > 任何默认并发，峰值必须到顶）。"""
+        for stage in task_scheduler.STAGES:
+            rec = make_recorder()
+            res = task_scheduler.run_stage(stage, ITEMS13, make_worker(rec))
+            expected = task_scheduler.STAGE_CONCURRENCY[stage]
+            self.assertEqual(rec["max_active"], expected,
+                             f"stage {stage}: max concurrency != default")
+            self.assertEqual(len(res["results"]), 13)
+
+    def test_unknown_stage_rejected(self):
+        with self.assertRaises(ValueError):
+            task_scheduler.run_stage("bogus", ITEMS13[:2], make_worker(make_recorder()))
+
+    def test_run_stage_api_has_no_concurrency_or_status_knobs(self):
+        """结构性断言：run_stage 只暴露 (stage, items, worker) —— 并发默认
+        值是 implementation constant（无运行时调参旋钮），且 API 不含任何
+        status 路径（单一写者：状态推进归调用方在阶段边界独占）。"""
+        params = list(inspect.signature(task_scheduler.run_stage).parameters)
+        self.assertEqual(params, ["stage", "items", "worker"])
+        # 模块层：编排核心没有任何文件写入点（write_text 只属于调用方在
+        # 阶段边界的边界写盘；docstring 提到 task_status.json 只是契约说明）
+        src = inspect.getsource(task_scheduler)
+        self.assertNotIn("write_text", src)
+
+    def test_results_order_stable(self):
+        """结果按 items 顺序收集（确定性，跨阶段依赖可预测）。"""
+        rec = make_recorder()
+        res = task_scheduler.run_stage("compile", ITEMS13, make_worker(rec))
+        self.assertEqual([r["run"] for r in res["results"]], ITEMS13)
+
+
+class TestRunStageFailureIsolation(unittest.TestCase):
+    """失败传播：任一 run 失败不阻断同阶段其他 run；失败清单正确汇总。"""
+
+    def test_failed_items_do_not_block_siblings(self):
+        """模拟 worker 失败（r02/r05/r11）：同阶段其余 10 个 run 正常完成，
+        失败清单恰好 3 条且带 code。"""
+        rec = make_recorder()
+        res = task_scheduler.run_stage(
+            "execute", ITEMS13, make_worker(rec, fail_ids={"r02", "r05", "r11"}))
+        self.assertEqual(len(res["results"]), 13)
+        self.assertEqual(len(res["ok"]), 10)
+        self.assertEqual(len(res["failed"]), 3)
+        codes = {r["code"] for r in res["failed"]}
+        self.assertEqual(codes, {"SIM_FAILED"})
+        runs = {r["run"] for r in res["failed"]}
+        self.assertEqual(runs, {"r02", "r05", "r11"})
+        # 失败不终止同阶段：全部 13 个 worker 都跑完了
+        self.assertEqual(len(rec["events"]), 26)
+
+    def test_stage_error_carries_code_and_action(self):
+        def worker(item):
+            raise task_scheduler.StageError(
+                "ENTRY_NAME_DUPLICATE", f"{item} 条目名重复", "改 staging 名")
+        res = task_scheduler.run_stage("run_prepare", ITEMS13[:2], worker)
+        self.assertEqual(res["failed"][0]["code"], "ENTRY_NAME_DUPLICATE")
+        self.assertIn("重复", res["failed"][0]["message"])
+        self.assertIn("改 staging 名", res["failed"][0]["corrective_action"])
+
+    def test_unexpected_raise_normalized(self):
+        def worker(item):
+            raise RuntimeError("boom")
+        res = task_scheduler.run_stage("compile", ITEMS13[:2], worker)
+        self.assertEqual(res["failed"][0]["code"], "WORKER_RAISED")
+        self.assertIn("boom", res["failed"][0]["message"])
+
+    def test_system_exit_from_fail_normalized(self):
+        """worker 内 fail()（sys.exit）不杀死进程 — 归一为 failed 结果。"""
+        def worker(item):
+            sys.exit(3)
+        res = task_scheduler.run_stage("gate", ITEMS13[:2], worker)
+        self.assertEqual(res["failed"][0]["code"], "WORKER_EXIT")
+
+    def test_non_dict_result_normalized(self):
+        def worker(item):
+            return "not-a-dict"
+        res = task_scheduler.run_stage("promote", ITEMS13[:2], worker)
+        self.assertEqual(res["failed"][0]["code"], "WORKER_INVALID_RESULT")
+
+    def test_aggregate_failures_across_stages(self):
+        rec = make_recorder()
+        r1 = task_scheduler.run_stage("run_prepare", ITEMS13,
+                                      make_worker(rec, fail_ids={"r00"}))
+        r2 = task_scheduler.run_stage("compile", ITEMS13[:12],
+                                      make_worker(rec, fail_ids={"r03"}))
+        agg = task_scheduler.aggregate_failures([r1, r2])
+        self.assertEqual(len(agg), 2)
+        self.assertEqual({f["run"] for f in agg}, {"r00", "r03"})
+        self.assertEqual({f["stage"] for f in agg},
+                         {"run_prepare", "compile"})
+        for f in agg:
+            self.assertIn("code", f)
+            self.assertIn("corrective_action", f)
+
+
+class TestApplyStageStatus(unittest.TestCase):
+    """阶段边界批量状态推进（单一写者语义）：只推进 ok 且在前驱状态的 run；
+    失败 run 不推进；superseded 不触碰；source_prepare 不推进。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.task, cls.defect = parse_fixture("task.yaml")
+        assert cls.defect is None
+        cls.sha = "ab" * 32
+
+    def _status(self, states):
+        """构造状态字典：states: {rid: state}（其余 run 保持 planned）。"""
+        status = task_schema.derive_task_status(self.task, self.sha,
+                                                updated_at="2026-08-22T00:00:00")
+        for rid, state in states.items():
+            status["runs"][rid]["state"] = state
+        return status
+
+    def _ok(self, rids):
+        return [{"run": rid, "status": "ok", "artifacts": {}}
+                for rid in rids]
+
+    def test_run_prepare_advances_planned_to_prepared(self):
+        status = self._status({})
+        new = task_scheduler.apply_stage_status(
+            status, "run_prepare", self._ok(["r32-cooling"]),
+            updated_at="2026-08-22T01:00:00")
+        self.assertEqual(new["runs"]["r32-cooling"]["state"], "prepared")
+        self.assertEqual(new["runs"]["r32-heating"]["state"], "planned")
+        self.assertEqual(new["updated_at"], "2026-08-22T01:00:00")
+
+    def test_full_main_path_transitions(self):
+        """compile→compiled, execute→drafted, gate→gated, promote→promoted。"""
+        status = self._status({"r32-cooling": "prepared"})
+        status = task_scheduler.apply_stage_status(
+            status, "compile", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "compiled")
+        status = task_scheduler.apply_stage_status(
+            status, "execute", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "drafted")
+        status = task_scheduler.apply_stage_status(
+            status, "gate", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "gated")
+        status = task_scheduler.apply_stage_status(
+            status, "promote", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "promoted")
+
+    def test_failed_run_not_advanced(self):
+        status = self._status({})
+        status = task_scheduler.apply_stage_status(status, "run_prepare", [{
+            "run": "r32-cooling", "status": "failed", "code": "SIM",
+            "message": "x", "corrective_action": "y"}])
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "planned")
+
+    def test_superseded_untouched(self):
+        status = self._status({"r32-cooling": "superseded"})
+        status = task_scheduler.apply_stage_status(
+            status, "run_prepare", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "superseded")
+
+    def test_non_precursor_state_not_touched(self):
+        """防御性：compile 阶段只推进 prepared 的 run；drafted 的 run 不
+        回退也不推进（幂等，item 选择已按状态过滤）。"""
+        status = self._status({"r32-cooling": "drafted"})
+        status = task_scheduler.apply_stage_status(
+            status, "compile", self._ok(["r32-cooling"]))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "drafted")
+
+    def test_source_prepare_never_advances_runs(self):
+        """阶段 1 是任务级（缓存键），不推进任何 run 状态，只刷新检查点。"""
+        status = self._status({})
+        new = task_scheduler.apply_stage_status(
+            status, "source_prepare", [], updated_at="2026-08-22T02:00:00")
+        for entry in new["runs"].values():
+            self.assertEqual(entry["state"], "planned")
+        self.assertEqual(new["updated_at"], "2026-08-22T02:00:00")
+
+    def test_original_status_not_mutated(self):
+        """apply 返回新字典（deepcopy）：调用方原 status 不被并发语义污染。"""
+        status = self._status({})
+        before = json.dumps(status, ensure_ascii=False, sort_keys=True)
+        task_scheduler.apply_stage_status(
+            status, "run_prepare", self._ok(["r32-cooling"]))
+        self.assertEqual(json.dumps(status, ensure_ascii=False, sort_keys=True),
+                         before)
+
+
+class TestSingleWriterBoundary(unittest.TestCase):
+    """单一写者：阶段内状态文件零并发写（字节稳定），阶段边界恰好写盘一次。"""
+
+    def test_status_bytes_stable_during_stage_and_one_write_per_boundary(self):
+        root = Path(tempfile.mkdtemp(prefix="single_writer_"))
+        try:
+            task, defect = parse_fixture("task.yaml")
+            self.assertIsNone(defect)
+            status_path = root / "task_status.json"
+            status = task_schema.derive_task_status(task, "ab" * 32,
+                                                    updated_at="2026-08-22T00:00:00")
+            writes = []
+            snapshot = status_path.read_bytes() if status_path.is_file() else None
+
+            def write_status(s):
+                writes.append(1)
+                status_path.write_text(json.dumps(s, ensure_ascii=False,
+                                                  indent=2),
+                                       encoding="utf-8")
+
+            stages = ("source_prepare", "run_prepare", "compile",
+                      "execute", "gate")
+            # worker 的 run id 必须存在于状态索引中（fixture run 集）
+            items = sorted(VALID_RUN_IDS)
+            for stage in stages:
+                violations = []
+
+                def watchdog(item):
+                    # worker 只回报结果；期间反复校验状态文件字节不变
+                    for _ in range(4):
+                        time.sleep(0.02)
+                        cur = status_path.read_bytes() \
+                            if status_path.is_file() else None
+                        if cur != snapshot:
+                            violations.append((item, cur, snapshot))
+                    return {"run": item, "status": "ok", "artifacts": {}}
+
+                res = task_scheduler.run_stage(stage, items, watchdog)
+                self.assertEqual(violations, [],
+                                 f"stage {stage}: status file changed during "
+                                 f"concurrent workers")
+                status = task_scheduler.apply_stage_status(
+                    status, stage, res["results"],
+                    updated_at=f"2026-08-22T0{stages.index(stage)+3}:00:00")
+                write_status(status)
+                snapshot = status_path.read_bytes()
+
+            # 边界写盘次数 == 阶段数（每次恰好一次；阶段内零写）
+            self.assertEqual(len(writes), len(stages))
+            final = json.loads(status_path.read_text(encoding="utf-8"))
+            for rid, entry in final["runs"].items():
+                self.assertEqual(entry["state"], "gated")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_workers_never_receive_status_path(self):
+        """运行期断言：run_stage 的 worker 载荷只有 item 本身 —— status
+        路径不存在于 API（见 test_run_stage_api_has_no_concurrency_or_
+        status_knobs 的结构断言），worker 从结构上无法写状态文件。"""
+        rec = make_recorder()
+        seen = []
+
+        def worker(item):
+            seen.append(item)
+            return {"run": item, "status": "ok", "artifacts": {}}
+
+        task_scheduler.run_stage("compile", ITEMS13, worker)
+        self.assertEqual(sorted(seen), sorted(ITEMS13))
+
+    def test_missing_status_in_result_normalized(self):
+        """结果缺 status（或非法 status）不得静默当作成功 — 归为
+        WORKER_INVALID_RESULT（失败二分不会被哑成功掩盖）。"""
+        def worker(item):
+            return {"run": item}  # 缺 status
+        res = task_scheduler.run_stage("compile", ITEMS13[:1], worker)
+        self.assertEqual(res["failed"][0]["code"], "WORKER_INVALID_RESULT")
+
+        def worker2(item):
+            return {"run": item, "status": "maybe"}  # 非法 status
+        res = task_scheduler.run_stage("compile", ITEMS13[:1], worker2)
+        self.assertEqual(res["failed"][0]["code"], "WORKER_INVALID_RESULT")
+
+
+class TestProgressLines(unittest.TestCase):
+    """进度报告：阶段边界输出 `阶段 x/y 完成` 摘要（对齐『超过 60 秒主动
+    说明进度』的要求）。"""
+
+    def test_start_line_format(self):
+        line = task_scheduler.stage_start_line(1, 6, "source_prepare", 3)
+        self.assertIn("阶段 1/6 开始", line)
+        self.assertIn("3 项", line)
+        self.assertIn("并发 2", line)
+
+    def test_end_line_format(self):
+        rec = make_recorder()
+        res = task_scheduler.run_stage(
+            "compile", ITEMS13, make_worker(rec, fail_ids={"r05"}))
+        line = task_scheduler.stage_end_line(2, 6, "compile", res)
+        self.assertIn("阶段 2/6 完成", line)
+        self.assertIn("ok=12", line)
+        self.assertIn("failed=1", line)
+
+
+class TestPrepareTaskCLIRun(unittest.TestCase):
+    """--run 的公共 CLI 前置守卫（无 Office）：与 --prepare 同一前置契约
+    （--init 产物存在 + 冻结一致性）；完整管线在 issue 08 的 e2e 层验证。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_run_cli_"))
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_run_without_init_exit3(self):
+        proc = run_cli(self.root, "--run")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_run_stale_manifest_exit3(self):
+        run_cli(self.root, "--init")
+        with (self.root / "task.yaml").open("a", encoding="utf-8") as fh:
+            fh.write("\n# 输入事实变化 — 快照已冻结\n")
+        proc = run_cli(self.root, "--run")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("MANIFEST_STALE", proc.stderr)
+
+    def test_run_without_task_yaml_exit1(self):
+        """--run 前置：任务根存在但无 task.yaml → fatal exit 1（与
+        --validate 同契约，先于任何 officecli 调用）。"""
+        empty = Path(tempfile.mkdtemp(prefix="task_run_empty_"))
+        try:
+            proc = run_cli(empty, "--run")
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("TASK_YAML_NOT_FOUND", proc.stderr)
 
 
 if __name__ == "__main__":
