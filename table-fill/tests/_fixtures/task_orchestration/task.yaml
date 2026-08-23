@@ -15,6 +15,7 @@ runs:
       sheets: [R32参数, R410A参数]
     target:
       template: templates/filling_template.xlsx
+      sheet: Sheet1          # 要展平的目标模板 sheet（阶段 1 eager 需求）
       output: out_r32_cooling.xlsx
   - id: r32-heating
     source:
@@ -22,6 +23,7 @@ runs:
       sheets: [R32参数]
     target:
       template: templates/filling_template.xlsx
+      sheet: Sheet1
       output: out_r32_heating.xlsx
   - id: r410a-cooling
     source:
@@ -29,5 +31,6 @@ runs:
       sheets: [R410A参数]
     target:
       template: templates/filling_template.xlsx
+      sheet: Sheet1
       output: out_r410a_cooling.xlsx
     template_family: 空调参数表 V3   # 模板族声明 — 仅作记录，D6 不实现

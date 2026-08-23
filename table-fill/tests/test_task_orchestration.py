@@ -1,13 +1,30 @@
-"""Tests for the Task Artifact Model — issue 01 (spec S2).
+"""Tests for the Task Artifact Model — issue 01 (spec S2) + Shared Flatten
+Cache (issue 02, spec S3/S4/S5).
 
-Covers the two pre-agreed seams (spec Testing Decision #3):
+Issue 01 coverage (two pre-agreed seams from spec Testing Decision #3):
   1. task_schema.py pure functions (import seam): validate_task_yaml /
      derive_task_manifest / derive_task_status / freeze & status checks.
   2. prepare_task.py public CLI (subprocess seam): --validate / --init,
      exit codes 0/1/3, derived-file freeze semantics.
 
-No Office involvement: fixtures are YAML examples + minimal placeholder
-workbooks that only satisfy static existence checks.
+Issue 02 coverage (same pre-agreed seam discipline; cache + prepare logic
+must be importable pure functions so they are testable without Office):
+  3. flatten_cache.cache_key — Task-local Flatten Cache key pure seam
+     (SHA256(staged_source_hash + sheet_name + flatten_schema_version +
+     officecli_version); no task identity inside).
+  4. task_prepare.staged_name_for / collect_demands — deterministic staged
+     naming + eager flatten demand collection (唯一需求数 dedup by key).
+  5. flatten_cache.materialize_entry — materialization seam: cache products
+     copied into run workdir with single-run naming, candidates/digest
+     regenerated per missing piece, entry carries sha256 + cache_key.
+  6. task_prepare.assemble_run_manifest — run manifest compile-facing
+     isomorphism with single-run prepare_manifest.json (extra cache_key
+     metadata allowed only).
+  7. prepare_task.py --prepare guards (task_manifest required → --init
+     first; frozen-manifest check fails closed).
+
+No Office involvement: cache/meta/digest fixtures are synthesized text;
+classify_columns.py / structure_digest.py are pure text subprocesses.
 
 Run with:
   python -m pytest table-fill/tests/test_task_orchestration.py -q
@@ -30,6 +47,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import task_schema  # noqa: E402
+import flatten_cache  # noqa: E402
+import task_prepare  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
@@ -342,6 +361,408 @@ class TestPrepareTaskCLI(unittest.TestCase):
             shutil.rmtree(root_cn, ignore_errors=True)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("NON_ASCII_PATH", proc.stderr)
+
+    def test_prepare_without_init_exit3(self):
+        """--prepare 需要 --init 产物（task_manifest/task_status）; 缺失 →
+        exit 3 + 指引用 --init（先于任何 officecli 调用，无 Office 可测）."""
+        proc = run_cli(self.root, "--prepare")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["status"], "ERROR")
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_prepare_stale_manifest_exit3(self):
+        """task.yaml 变化 → --prepare 拒绝（输入快照已封存，不静默重派生）."""
+        proc1 = run_cli(self.root, "--init")
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        with (self.root / "task.yaml").open("a", encoding="utf-8") as fh:
+            fh.write("\n# 输入事实变化 — 快照已冻结\n")
+        proc = run_cli(self.root, "--prepare")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("MANIFEST_STALE", proc.stderr)
+
+
+# ── issue 02: Task-local Flatten Cache (spec S3/S4/S5) ──────────────────
+
+class TestCacheKey(unittest.TestCase):
+    """Cache key 纯函数 seam（spec Testing Decision #3）:
+    SHA256(staged_source_hash + sheet_name + flatten_schema_version +
+    officecli_version)；键内不含任务身份（未来升级全局缓存零迁移）。"""
+
+    def test_deterministic(self):
+        """相同输入 → 相同键."""
+        k1 = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        k2 = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        self.assertEqual(k1, k2)
+
+    def test_sha256_hex_shape(self):
+        key = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        self.assertRegex(key, r"^[0-9a-f]{64}$")
+
+    def test_varies_on_source_hash(self):
+        a = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        b = flatten_cache.cache_key("cd" * 32, "R32参数", 1, "1.0.144")
+        self.assertNotEqual(a, b)
+
+    def test_varies_on_sheet_name(self):
+        a = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        b = flatten_cache.cache_key("ab" * 32, "R410A参数", 1, "1.0.144")
+        self.assertNotEqual(a, b)
+
+    def test_varies_on_flatten_schema_version(self):
+        a = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        b = flatten_cache.cache_key("ab" * 32, "R32参数", 2, "1.0.144")
+        self.assertNotEqual(a, b)
+
+    def test_varies_on_officecli_version(self):
+        """officecli 升级 → 缓存键变化（产物可能不同，缓存身份随之失效）。"""
+        a = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.144")
+        b = flatten_cache.cache_key("ab" * 32, "R32参数", 1, "1.0.145")
+        self.assertNotEqual(a, b)
+
+    def test_component_boundary_never_collides(self):
+        """键的分量边界必须无歧义：纯拼接下 sheet 'R32参数' + schema_v=11
+        与 sheet 'R32参数1' + schema_v=1 会拼出相同 payload —— 长度前缀编码
+        后两者必须不同键。"""
+        v = "1.0.144"
+        a = flatten_cache.cache_key("ab" * 32, "R32参数", 11, v)
+        b = flatten_cache.cache_key("ab" * 32, "R32参数1", 1, v)
+        self.assertNotEqual(a, b)
+
+    def test_products_and_schema_version_constants(self):
+        """缓存内容白名单 + 展平 schema 版本被模块显式承载."""
+        self.assertEqual(flatten_cache.CACHE_PRODUCTS,
+                         ("flat.csv", "meta.json", "digest.md"))
+        self.assertIsInstance(flatten_cache.FLATTEN_SCHEMA_VERSION, int)
+
+
+class TestStagedNameFor(unittest.TestCase):
+    """确定性 staged 命名（任务级一次性 staging 的命名规则）."""
+
+    def test_basename_when_free(self):
+        self.assertEqual(
+            task_prepare.staged_name_for(Path("sources/parameter_book.xlsx"), set()),
+            "parameter_book.xlsx")
+
+    def test_collision_gets_suffix(self):
+        taken = {"parameter_book.xlsx"}
+        self.assertEqual(
+            task_prepare.staged_name_for(Path("templates/parameter_book.xlsx"), taken),
+            "parameter_book_2.xlsx")
+
+    def test_collision_suffix_skips_taken(self):
+        taken = {"parameter_book.xlsx", "parameter_book_2.xlsx"}
+        self.assertEqual(
+            task_prepare.staged_name_for(Path("templates/parameter_book.xlsx"), taken),
+            "parameter_book_3.xlsx")
+
+    def test_non_ascii_basename_rejected(self):
+        """中文文件名无法 ASCII staging（officecli 在中文路径失败）→ None,
+        由调用方转为 STAGED_NAME_NON_ASCII 缺陷."""
+        self.assertIsNone(
+            task_prepare.staged_name_for(Path("sources/参数表.xlsx"), set()))
+
+    def test_deterministic_given_order(self):
+        a = task_prepare.staged_name_for(Path("a.xlsx"), {"a.xlsx"})
+        b = task_prepare.staged_name_for(Path("a.xlsx"), {"a.xlsx"})
+        self.assertEqual(a, b)
+
+
+class TestCollectDemands(unittest.TestCase):
+    """eager 预展平的 (file, sheet) 需求收集：任务级唯一需求数 U=3
+    （2 源 sheet + 1 目标 sheet，与 issue 08 的 U=3 设计一致）."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.task, cls.defect = parse_fixture("task.yaml")
+        assert cls.defect is None
+        cls.resolved = {
+            FIX / "sources/parameter_book.xlsx": "parameter_book.xlsx",
+            FIX / "templates/filling_template.xlsx": "filling_template.xlsx",
+        }
+        cls.demands = task_prepare.collect_demands(cls.task, cls.resolved, FIX)
+
+    def test_demand_count(self):
+        """3 run × (2|1 源 + 1 目标) = 7 条需求."""
+        self.assertEqual(len(self.demands), 7)
+
+    def test_unique_demand_count_is_three(self):
+        """验收: 任务内唯一 (file, sheet) 需求数 == 3（cache/ 目录数上限）."""
+        uniq = {(d["staged"], d["sheet"]) for d in self.demands}
+        self.assertEqual(uniq, {
+            ("parameter_book.xlsx", "R32参数"),
+            ("parameter_book.xlsx", "R410A参数"),
+            ("filling_template.xlsx", "Sheet1"),
+        })
+
+    def test_every_run_has_exactly_one_target_demand(self):
+        """每条 run 恰好一个 target 需求（target.sheet 声明展平目标 sheet）."""
+        per_run = {}
+        for d in self.demands:
+            if d["sheet"] == "Sheet1":
+                per_run.setdefault(d["run"], []).append(d)
+        for run in self.task["runs"]:
+            self.assertEqual(len(per_run.get(run["id"], [])), 1)
+
+    def test_single_run_entry_naming_convention(self):
+        """物料命名与单 run 约定一致: <staged_stem>_<ascii_slug(sheet)>.
+        'R32参数' → ascii_slug 'R32'（非 ASCII 字符丢弃）."""
+        src = next(d for d in self.demands
+                   if d["sheet"] == "R32参数" and d["kind"] == "source")
+        self.assertEqual(src["name"], "parameter_book_R32")
+        tgt = next(d for d in self.demands if d["kind"] == "target")
+        self.assertEqual(tgt["name"], "filling_template_Sheet1")
+
+    def test_kinds_recorded(self):
+        kinds = {d["kind"] for d in self.demands}
+        self.assertEqual(kinds, {"source", "target"})
+
+
+def make_fake_meta() -> dict:
+    """合成 flatten meta（shape 对齐 flatten_table build_meta 的子集，
+    供 classify_columns / structure_digest 纯文本消费）。"""
+    return {
+        "file": "C:/tmp/staged/parameter_book.xlsx",
+        "sheet": "R32参数",
+        "dimensions": {"rows": 6, "cols": 4, "data_rows": 5, "formulas": 0,
+                       "errorCells": 0, "tables": 0, "charts": 0, "oleObjects": 0},
+        "header_band": {"header_rows": [1], "data_start_row": 2},
+        "merged_ranges": [],
+        "merge_anchors": [],
+        "blocks": [{"id": 1, "start": 2, "end": 6, "title": "测试块", "score": 0.8}],
+        "formulas": {},
+        "column_numfmt": {},
+        "columns": [
+            {"col": "A", "nonempty": 5, "numeric_ratio": 0.0, "unique": 2,
+             "samples": ["R32", "R32", "R32", "R32", "R32"]},
+            {"col": "B", "nonempty": 5, "numeric_ratio": 1.0, "unique": 5,
+             "samples": ["1", "2", "3", "4", "5"], "min": 1, "max": 5},
+        ],
+        "row_gaps": [],
+        "style_granularity": {
+            "placeholder_segments": [{"start": 10, "end": 13, "styled": False,
+                                      "sample": None}],
+        },
+    }
+
+
+def make_fake_cache(task_root: Path, key: str) -> Path:
+    """合成一个缓存条目目录（3 个白名单产物），模拟 cache hit。"""
+    entry = flatten_cache.cache_entry_dir(task_root, key)
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / "flat.csv").write_bytes(b"R32,1,1\nR32,2,2\nR32,3,3\nR32,4,4\nR32,5,5\n")
+    (entry / "meta.json").write_text(
+        json.dumps(make_fake_meta(), ensure_ascii=False, indent=2), encoding="utf-8")
+    (entry / "digest.md").write_text("# R32参数 — 结构摘要\n- 缓存产物\n", encoding="utf-8")
+    return entry
+
+
+class TestCacheEntryDirAndHit(unittest.TestCase):
+    """cache 布局: <task_root>/cache/<key>/；命中 = 三个白名单产物齐全."""
+
+    def test_entry_dir_layout(self):
+        root = Path(tempfile.mkdtemp(prefix="cache_layout_"))
+        try:
+            key = flatten_cache.cache_key("ab" * 32, "S", 1, "v")
+            self.assertEqual(flatten_cache.cache_entry_dir(root, key),
+                             root / "cache" / key)
+            make_fake_cache(root, key)
+            self.assertTrue(flatten_cache.cache_hit(
+                flatten_cache.cache_entry_dir(root, key)))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_partial_entry_is_not_a_hit(self):
+        """只有 flat.csv → 不算命中（不静默以残缺产物物化）."""
+        entry = make_fake_cache(Path(tempfile.mkdtemp(prefix="cache_part_")),
+                                "k" * 64)
+        try:
+            (entry / "digest.md").unlink()
+            self.assertFalse(flatten_cache.cache_hit(entry))
+        finally:
+            shutil.rmtree(entry.parent.parent, ignore_errors=True)
+
+    def test_missing_entry_is_not_a_hit(self):
+        root = Path(tempfile.mkdtemp(prefix="cache_miss_"))
+        try:
+            self.assertFalse(flatten_cache.cache_hit(root / "cache" / ("f" * 64)))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class TestMaterializeEntry(unittest.TestCase):
+    """物化 seam：缓存产物 → run workdir（单 run 命名）+ 逐字节复制 +
+    candidates 再生成 + 目标 digest 以 --target 再生成 + 条目元数据."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="materialize_"))
+        self.key = flatten_cache.cache_key("ab" * 32, "R32参数",
+                                           flatten_cache.FLATTEN_SCHEMA_VERSION,
+                                           "1.0.144")
+        make_fake_cache(self.root, self.key)
+        self.run_dir = self.root / "runs" / "r32-cooling"
+        self.run_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_cache_products_copy_byte_identical_with_single_run_naming(self):
+        """验收: 物化 CSV 与缓存产物逐字节一致，命名按
+        <staged>_<sheet>_flat.csv 单 run 约定；meta 的 file 字段重定向到
+        run 自身 staged 副本（run artifact 自包含，S5）。"""
+        entry = flatten_cache.materialize_entry(
+            self.root, self.key, self.run_dir,
+            staged_name="parameter_book.xlsx", sheet="R32参数",
+            name="parameter_book_R32", is_target=False)
+        cache_dir = flatten_cache.cache_entry_dir(self.root, self.key)
+        # flat.csv 逐字节复制（业务身份 = 物化后 hash）
+        self.assertEqual((self.run_dir / "parameter_book_R32_flat.csv").read_bytes(),
+                         (cache_dir / "flat.csv").read_bytes())
+        # meta 复制后 file 指向 run 自己的 staged 副本（与单 run 语义一致）
+        meta = json.loads((self.run_dir / "parameter_book_R32_meta.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(meta["file"],
+                         str(self.run_dir / "parameter_book.xlsx"))
+        # digest 复制后保持缓存原样（不在 run 侧额外改写）
+        self.assertEqual((self.run_dir / "parameter_book_R32_digest.md").read_bytes(),
+                         (cache_dir / "digest.md").read_bytes())
+        # 缓存侧 meta 不被改写（Cache Identity ≠ Run Artifact Identity）
+        cached_meta = json.loads((cache_dir / "meta.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(cached_meta["file"], "C:/tmp/staged/parameter_book.xlsx")
+
+    def test_entry_carries_name_source_sheet_sha256_cache_key(self):
+        """验收: flattened 条目记录 name/source/sheet/sha256/cache_key
+        （cache_key 是 provenance metadata；CSV hash 是业务身份）."""
+        entry = flatten_cache.materialize_entry(
+            self.root, self.key, self.run_dir,
+            staged_name="parameter_book.xlsx", sheet="R32参数",
+            name="parameter_book_R32", is_target=False)
+        self.assertEqual(entry["file"], "parameter_book.xlsx")
+        self.assertEqual(entry["sheet"], "R32参数")
+        self.assertEqual(entry["name"], "parameter_book_R32")
+        self.assertEqual(entry["cache_key"], self.key)
+        self.assertEqual(entry["csv"], "parameter_book_R32_flat.csv")
+        self.assertEqual(entry["meta"], "parameter_book_R32_meta.json")
+        self.assertEqual(entry["digest"], "parameter_book_R32_digest.md")
+        self.assertEqual(entry["candidates"], "parameter_book_R32_candidates.yaml")
+        self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
+        # sha256 = 物化 CSV 的 hash（run 的业务身份）
+        self.assertEqual(entry["sha256"],
+                         task_schema.file_sha256(
+                             self.run_dir / "parameter_book_R32_flat.csv"))
+
+    def test_candidates_regenerated_in_run_workdir(self):
+        """candidates 不入缓存（白名单 3 文件），物化时确定性再生成."""
+        flatten_cache.materialize_entry(
+            self.root, self.key, self.run_dir,
+            staged_name="parameter_book.xlsx", sheet="R32参数",
+            name="parameter_book_R32", is_target=False)
+        cand = (self.run_dir / "parameter_book_R32_candidates.yaml").read_text(
+            encoding="utf-8")
+        self.assertIn("column_classifications:", cand)
+        self.assertIn("uncertain_columns:", cand)
+        # 缓存目录仍只有白名单产物（candidates 未污染缓存）
+        cache_dir = flatten_cache.cache_entry_dir(self.root, self.key)
+        self.assertEqual(sorted(p.name for p in cache_dir.iterdir()),
+                         ["digest.md", "flat.csv", "meta.json"])
+
+    def test_target_entry_digest_regenerated_with_target_facts(self):
+        """目标条目: digest 以 --target 再生成（占位行样式决策事实入内）."""
+        entry = flatten_cache.materialize_entry(
+            self.root, self.key, self.run_dir,
+            staged_name="filling_template.xlsx", sheet="Sheet1",
+            name="filling_template_Sheet1", is_target=True)
+        digest = (self.run_dir / "filling_template_Sheet1_digest.md").read_text(
+            encoding="utf-8")
+        self.assertIn("占位行样式", digest)
+        cache_dir = flatten_cache.cache_entry_dir(self.root, self.key)
+        self.assertNotIn("占位行样式",
+                         (cache_dir / "digest.md").read_text(encoding="utf-8"))
+
+
+class TestRunManifestAssembly(unittest.TestCase):
+    """run 级 prepare_manifest.json 组装：compile-facing 字段与单 run 同构，
+    仅多 cache_key 元数据（spec S5 / issue 02 验收 3）."""
+
+    def test_compile_facing_shape_isomorphic_to_single_run(self):
+        files = [{"staged": "parameter_book.xlsx", "source": "sources/parameter_book.xlsx",
+                  "sha256": "ab" * 32}]
+        outlines = {"parameter_book.xlsx": "parameter_book_outline.txt"}
+        flat = [{
+            "file": "parameter_book.xlsx", "sheet": "R32参数",
+            "name": "parameter_book_R32",
+            "csv": "parameter_book_R32_flat.csv",
+            "meta": "parameter_book_R32_meta.json",
+            "digest": "parameter_book_R32_digest.md",
+            "candidates": "parameter_book_R32_candidates.yaml",
+            "sha256": "cd" * 32, "cache_key": "ef" * 32,
+        }]
+        target = {"file": "filling_template.xlsx", "sheet": "Sheet1",
+                  "name": "filling_template_Sheet1",
+                  "csv": "filling_template_Sheet1_flat.csv",
+                  "meta": "filling_template_Sheet1_meta.json",
+                  "digest": "filling_template_Sheet1_digest.md",
+                  "candidates": "filling_template_Sheet1_candidates.yaml",
+                  "sha256": "ab" * 32, "cache_key": "ef" * 32}
+        manifest = task_prepare.assemble_run_manifest(
+            workdir=r"C:\Temp\tablefill\egypt\run",
+            task_label="egypt-params-2026a",
+            files=files, outlines=outlines, flattened=flat, target_entry=target,
+            fingerprints={"source_structure": "11" * 32,
+                          "target_structure": "22" * 32})
+        # compile-facing 顶层字段（与 prepare_run.py 的单 run manifest 同构）
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["files"], files)
+        self.assertEqual(manifest["outlines"], outlines)
+        self.assertEqual(manifest["flattened"], flat)
+        self.assertEqual(manifest["target"], target)
+        self.assertEqual(manifest["fingerprints"],
+                         {"source_structure": "11" * 32,
+                          "target_structure": "22" * 32})
+        self.assertIn("workdir", manifest)
+        self.assertIn("task", manifest)
+        self.assertIn("row_gaps", manifest)
+        self.assertIn("style_granularity", manifest)
+        # 只比单 run 多 cache_key/sha256 元数据？断言不依赖 workdir 落盘
+        for entry in manifest["flattened"]:
+            self.assertIn("cache_key", entry)
+            self.assertIn("sha256", entry)
+            for k in ("file", "sheet", "name", "csv", "meta", "digest", "candidates"):
+                self.assertIn(k, entry)
+
+
+class TestTaskYamlTargetSheet(unittest.TestCase):
+    """task.yaml 的 target.sheet 声明（阶段 1 收集 (file, sheet) 对的前提）."""
+
+    def test_valid_fixture_declares_target_sheet(self):
+        """合法示例: 每条 run 的 target.sheet 已声明 → 校验零缺陷."""
+        data, defect = parse_fixture("task.yaml")
+        self.assertIsNone(defect)
+        for run in data["runs"]:
+            self.assertIsInstance(run["target"].get("sheet"), str)
+        self.assertEqual(task_schema.validate_task_yaml(data, FIX), [])
+
+    def test_missing_target_sheet_rejected(self):
+        run = {
+            "id": "run-a",
+            "source": {"file": "sources/parameter_book.xlsx",
+                       "sheets": ["R32参数"]},
+            "target": {"template": "templates/filling_template.xlsx",
+                       "output": "out_a.xlsx"},
+        }
+        data = {"task": {"id": "ts-task"}, "runs": [run]}
+        codes = {d["code"] for d in task_schema.validate_task_yaml(data, FIX)}
+        self.assertIn("TARGET_SHEET_MISSING", codes)
+
+    def test_derive_manifest_records_target_sheet(self):
+        data, defect = parse_fixture("task.yaml")
+        self.assertIsNone(defect)
+        manifest = task_schema.derive_task_manifest(data, "ab" * 32,
+                                                    frozen_at="2026-08-22T00:00:00")
+        for rid, entry in manifest["runs"].items():
+            run = next(r for r in data["runs"] if r["id"] == rid)
+            self.assertEqual(entry["target"]["sheet"], run["target"]["sheet"])
 
 
 if __name__ == "__main__":

@@ -245,6 +245,16 @@ def validate_task_yaml(data: dict, task_root=None) -> list[dict]:
                 defects.append(_d("OUTPUT_NAME_INVALID", f"{rid_label} 的输出名不合法: {out!r}",
                                   "输出名须匹配 [A-Za-z0-9][A-Za-z0-9._-]*.(xlsx|xlsm|xltx|pptx)",
                                   at=f"{rid_label}.target.output"))
+            t_sheet = tgt.get("sheet")
+            if t_sheet is None or (isinstance(t_sheet, str) and not t_sheet.strip()):
+                defects.append(_d("TARGET_SHEET_MISSING", f"{rid_label} 缺 target.sheet",
+                                  "声明要展平的目标模板 sheet 名（issue 02 阶段 1 收集 "
+                                  "(file, sheet) 需求对的前提）",
+                                  at=f"{rid_label}.target.sheet"))
+            elif not isinstance(t_sheet, str):
+                defects.append(_d("TARGET_SHEET_INVALID",
+                                  f"{rid_label} 的 target.sheet 必须是非空字符串",
+                                  "声明目标模板 sheet 名", at=f"{rid_label}.target.sheet"))
 
         # template_family：模板族声明仅作记录（D6 不实现）
         tf = run.get("template_family")
@@ -327,6 +337,7 @@ def derive_task_manifest(task: dict, yaml_sha256: str, *,
             "source": {"file": r["source"]["file"],
                        "sheets": list(r["source"]["sheets"])},
             "target": {"template": r["target"]["template"],
+                       "sheet": r["target"]["sheet"],
                        "output": r["target"]["output"]},
         }
         if r.get("template_family") is not None:
