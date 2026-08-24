@@ -56,6 +56,7 @@ from _officecli import record_timing as _record_timing  # noqa: E402
 
 import task_resume  # noqa: E402
 import task_scheduler  # noqa: E402
+import task_timing  # noqa: E402 —— task 级 timing 双栏聚合（issue 06）
 from task_prepare import _run_child  # noqa: E402 —— 现有脚本 subprocess 入口复用
 from task_resume import _try_json  # noqa: E402 —— 与 resume 共享同一 JSON 读取语义
 from task_schema import TASK_STATUS_NAME, utc_now_iso  # noqa: E402
@@ -66,7 +67,7 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 GATE_SUMMARY_NAME = "gate_summary.json"
-GATE_SUMMARY_SCHEMA_VERSION = 1
+GATE_SUMMARY_SCHEMA_VERSION = 2  # v2: 增加 task_timing 双栏块（issue 06）
 
 # 最终交付目录（task 级输出的唯一归属；命名来自 task.yaml 的 target.output）
 FINAL_OUTPUT_DIR = "outputs"
@@ -99,21 +100,9 @@ def timing_totals(run_dir) -> dict:
     SKILL.md Observability 契约：机器相位由脚本自动追加（kind: machine），
     思考/等待由 agent 自报（kind: agent）；Gate 引用该文件时按两栏呈现。
     缺失/损坏/非数值条目 → 零值（计时缺失不阻塞 Gate，timing 不是执行约束）。
+    计时解析单一事实源在 task_timing（issue 06），此处直接复用。
     """
-    entries = _try_json(Path(run_dir) / "run_timing.json")
-    machine_ms = agent_ms = 0
-    if isinstance(entries, list):
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            ms = e.get("duration_ms")
-            if not isinstance(ms, (int, float)):
-                continue
-            if e.get("kind") == "agent":
-                agent_ms += ms
-            else:
-                machine_ms += ms
-    return {"machine_ms": int(machine_ms), "agent_ms": int(agent_ms)}
+    return task_timing.totals(task_timing.load_entries(run_dir))
 
 
 def mod_summary(run_dir) -> dict | None:
@@ -233,6 +222,11 @@ def collect_gate_summary(task: dict, status: dict, root: Path) -> dict:
       列全（带 state + reason，人读诊断）；
     - 真正终态 run（promoted / superseded）不入呈现也不入缺口，excluded
       单独记录（授权已消费或显式废弃，不是「未完成」）。
+    - task_timing：task 级双栏聚合（issue 06）—— active（prepared..
+       promoted 且非 superseded，合计 = 本次交付成本）与 superseded（废弃
+       轮次的量化证据 = 优化收益）各带跨 run 的 kind+phase 分组与逐 run
+       汇总；只读，不改写任何 run_timing.json。每 run 的机器 + agent 双栏
+       （该 run 的 timing 键）既有要求不变。
     """
     root = Path(root)
     runs_dir = root / "runs"
@@ -267,6 +261,8 @@ def collect_gate_summary(task: dict, status: dict, root: Path) -> dict:
                 "run": rid, "state": decision["status"],
                 "reason": decision["reason"],
             })
+    summary["task_timing"] = task_timing.aggregate_task_timing(
+        task, status, root)
     return summary
 
 

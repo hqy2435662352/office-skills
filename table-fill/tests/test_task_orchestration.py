@@ -1,6 +1,7 @@
 """Tests for the Task Artifact Model — issue 01 (spec S2) + Shared Flatten
 Cache (issue 02, spec S3/S4/S5) + Stage Orchestrator (issue 03, spec S6) +
-Lifecycle / Resume / Supersede (issue 04, spec S7).
+Lifecycle / Resume / Supersede (issue 04, spec S7) + Timing Aggregation
+(issue 06, spec S7 Timing).
 
 Issue 01 coverage (two pre-agreed seams from spec Testing Decision #3):
   1. task_schema.py pure functions (import seam): validate_task_yaml /
@@ -96,6 +97,21 @@ Testing Decision #8):
       (GATE_NOT_CONFIRMED — fail-closed preserved, existing script zero
       change).
 
+Issue 06 coverage (task-level timing aggregation — active/superseded 双栏;
+read-only pure seam + CLI subprocess seam, no Office — spec S7 Timing /
+ticket 06):
+  23. task_timing pure seam — totals (machine+agent 双栏, defensive vs
+      non-numeric/bool), load_entries (缺失/损坏 → []), phase_rows
+      (kind+phase 分组复用 aggregate_run_timings 语义), summarize_entries
+      /summarize_run, aggregate_task_timing — 验收 (2 superseded + 4 active:
+      双栏正确分栏、声明序、kind+phase 跨 run 聚合、flatten 返工量化证据、
+      superseded 证据只读不被改写、planned 不入栏、prepared..promoted 全
+      谱系入 active).
+  24. gate summary integration — collect_gate_summary 增加 task_timing 双栏
+      块; 每 run 机器+agent 双栏既有要求不变.
+  25. timing_task.py CLI — 独立报告 (缺 task.yaml exit 1; 缺 derived exit
+      3; --init 后双栏 JSON 输出).
+
 No Office involvement: cache/meta/digest fixtures are synthesized text;
 classify_columns.py / structure_digest.py are pure text subprocesses;
 execution_gate.py / promote_output.py are pure Python (zipfile check).
@@ -134,11 +150,13 @@ import task_scheduler  # noqa: E402
 import task_resume  # noqa: E402
 import task_gate  # noqa: E402
 import gate_task  # noqa: E402
+import task_timing  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
 RESUME_TASK = _SCRIPTS_DIR / "resume_task.py"
 GATE_TASK = _SCRIPTS_DIR / "gate_task.py"
+TIMING_TASK = _SCRIPTS_DIR / "timing_task.py"
 VALID_RUN_IDS = {"r32-cooling", "r32-heating", "r410a-cooling"}
 
 
@@ -163,6 +181,15 @@ def run_resume_cli(task_root: Path, *args: str) -> subprocess.CompletedProcess:
     """resume_task.py 的公共 CLI seam（无 Office 前置守卫 / --supersede）。"""
     return subprocess.run(
         [sys.executable, str(RESUME_TASK), "--task-root", str(task_root), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60,
+    )
+
+
+def run_timing_cli(task_root: Path) -> subprocess.CompletedProcess:
+    """timing_task.py 的公共 CLI seam（无 Office：只读聚合报告）。"""
+    return subprocess.run(
+        [sys.executable, str(TIMING_TASK), "--task-root", str(task_root)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=60,
     )
@@ -2418,6 +2445,20 @@ def write_timing(run_dir: Path, machine_ms: list | None = None,
         json.dumps(entries, ensure_ascii=False), encoding="utf-8")
 
 
+def write_phased_timing(run_dir: Path, *, machine: list | None = None,
+                        agent: list | None = None) -> None:
+    """合成带真实 phase 名的 run_timing.json（machine/agent 各为
+    (duration_ms, phase) 列表）—— issue 06 验收用「重复 flatten / 模板
+    返工」等真实相位名演示优化收益的量化证据。"""
+    entries = []
+    for ms, phase in machine or []:
+        entries.append({"kind": "machine", "phase": phase, "duration_ms": ms})
+    for ms, phase in agent or []:
+        entries.append({"kind": "agent", "phase": phase, "duration_ms": ms})
+    (run_dir / "run_timing.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+
 def write_mod(run_dir: Path, status: str = "resolved",
               names: tuple = ("cost_reply",)) -> None:
     """合成 mod_resolution.json（MOD 裁决表面）。"""
@@ -3179,6 +3220,289 @@ class TestGateTaskCLI(unittest.TestCase):
         self.assertFalse((run_dir / "final_receipt.json").exists())
         self.assertFalse(
             (self.root / "outputs" / decl["target"]["output"]).exists())
+
+
+# ── issue 06: Timing Aggregation（active / superseded 双栏） ───────────────
+
+class TestTaskTimingPure(unittest.TestCase):
+    """task 级 timing 聚合（纯函数 seam，无 Office — spec S7 Timing + ticket
+    06）：双栏合计 / kind+phase 分组（复用 aggregate_run_timings 语义）/
+    先按状态过滤 run 集 / 证据不删（聚合只读）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_timing_"))
+        (self.root / "runs").mkdir(parents=True, exist_ok=True)
+        self.task, self.defect = parse_fixture("task.yaml")
+        assert self.defect is None
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def status_of(self, states: dict) -> dict:
+        return make_status([r["id"] for r in self.task["runs"]], states)
+
+    def test_totals_machine_and_agent_columns(self):
+        """entries → 机器 + agent 双栏毫秒合计；非数值/bool → 忽略（与
+        timing_totals 同一防御；bool 是 int 子类，显式排除）。"""
+        entries = [
+            {"kind": "machine", "phase": "compile", "duration_ms": 100},
+            {"kind": "machine", "phase": "compile", "duration_ms": "bad"},
+            {"kind": "machine", "phase": "compile", "duration_ms": True},
+            {"kind": "agent", "phase": "spec_authoring", "duration_ms": 50},
+            {"kind": "agent", "phase": "gate_wait", "duration_ms": None},
+        ]
+        self.assertEqual(task_timing.totals(entries),
+                         {"machine_ms": 100, "agent_ms": 50})
+        self.assertEqual(task_timing.totals([]),
+                         {"machine_ms": 0, "agent_ms": 0})
+
+    def test_load_entries_defensive(self):
+        """缺失/损坏/非 list 的 run_timing.json → []（计时缺失不阻塞聚合）。"""
+        run_dir = self.root / "runs" / "r32-cooling"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(task_timing.load_entries(run_dir), [])
+        (run_dir / "run_timing.json").write_text("not-a-list", encoding="utf-8")
+        self.assertEqual(task_timing.load_entries(run_dir), [])
+        write_timing(run_dir, machine_ms=[1], agent_ms=[2])
+        loaded = task_timing.load_entries(run_dir)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["kind"], "machine")
+
+    def test_phase_rows_kind_phase_grouping(self):
+        """复用 aggregate_run_timings 的 kind+phase 分组语义：同 (kind, phase)
+        多条目聚合 count/total/average/min/max/percent_of_kind，按
+        (-total_seconds, kind, phase) 稳定排序。"""
+        entries = [
+            {"kind": "machine", "phase": "compile", "duration_ms": 1000},
+            {"kind": "machine", "phase": "compile", "duration_ms": 3000},
+            {"kind": "machine", "phase": "prepare_flatten", "duration_ms": 4000},
+            {"kind": "agent", "phase": "spec_authoring", "duration_ms": 2000},
+        ]
+        rows = task_timing.phase_rows(entries)
+        by = {(r["kind"], r["phase"]): r for r in rows}
+        c = by[("machine", "compile")]
+        self.assertEqual(c["count"], 2)
+        self.assertEqual(c["total_seconds"], 4.0)
+        self.assertEqual(c["average_seconds"], 2.0)
+        self.assertEqual(c["minimum_seconds"], 1.0)
+        self.assertEqual(c["maximum_seconds"], 3.0)
+        self.assertEqual(c["percent_of_kind"], 50.0)   # 4.0 / (4.0 + 4.0)
+        self.assertEqual(by[("machine", "prepare_flatten")]["percent_of_kind"],
+                         50.0)
+        self.assertEqual(by[("agent", "spec_authoring")]["percent_of_kind"],
+                         100.0)
+        self.assertEqual([(r["kind"], r["phase"]) for r in rows],
+                         [("machine", "compile"),
+                          ("machine", "prepare_flatten"),
+                          ("agent", "spec_authoring")])
+
+    def test_aggregate_two_columns_acceptance(self):
+        """验收：2 superseded + 4 活 run —— 活 run 不含 superseded 耗时、
+        superseded 栏单独列出、totals 回答「本次交付成本 vs 优化收益」、
+        栏内 kind+phase 跨 run 聚合、声明序确定。相位用真实名字（重复
+        flatten 是埃及复盘 27→7~9 次的量化证据）。"""
+        task = make_synthetic_task(6)
+        ids = [r["id"] for r in task["runs"]]
+        active_ids, superseded_ids = ids[:4], ids[4:]
+        for rid in active_ids:  # 活 run：一次 flatten + 一次 spec 思考
+            run_dir = self.root / "runs" / rid
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_phased_timing(
+                run_dir, machine=[(1000, "prepare_flatten")],
+                agent=[(500, "spec_authoring")])
+        for rid in superseded_ids:  # 废弃 run：重复 flatten 返工 + 模板返工
+            run_dir = self.root / "runs" / rid
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_phased_timing(
+                run_dir,
+                machine=[(4000, "prepare_flatten"), (4000, "prepare_flatten")],
+                agent=[(2000, "template_rework")])
+        states = {rid: "drafted" for rid in active_ids}
+        states.update({rid: "superseded" for rid in superseded_ids})
+        report = task_timing.aggregate_task_timing(
+            task, make_status(ids, states), self.root)
+
+        # 双栏分别回答两个问题：本次交付成本（active）与优化收益（superseded）
+        self.assertEqual(report["active"]["runs"], active_ids)
+        self.assertEqual(report["active"]["entry_count"], 8)
+        self.assertEqual(report["active"]["totals_ms"],
+                         {"machine_ms": 4000, "agent_ms": 2000,
+                          "total_ms": 6000})
+        self.assertEqual(report["superseded"]["runs"], superseded_ids)
+        self.assertEqual(report["superseded"]["entry_count"], 6)
+        self.assertEqual(report["superseded"]["totals_ms"],
+                         {"machine_ms": 16000, "agent_ms": 4000,
+                          "total_ms": 20000})
+        self.assertEqual(report["excluded"], [])
+
+        # 栏内 kind+phase 分组跨 run 聚合（superseded 的重复 flatten：
+        # 2 run × 2 条目 → count 4，合计 16s —— 本可避免的浪费量化证据）
+        sup_phases = {(p["kind"], p["phase"]): p
+                      for p in report["superseded"]["phases"]}
+        flatten_sup = sup_phases[("machine", "prepare_flatten")]
+        self.assertEqual(flatten_sup["count"], 4)
+        self.assertEqual(flatten_sup["total_seconds"], 16.0)
+        self.assertEqual(flatten_sup["average_seconds"], 4.0)
+        self.assertEqual(flatten_sup["percent_of_kind"], 100.0)
+        self.assertEqual(sup_phases[("agent", "template_rework")]
+                         ["percent_of_kind"], 100.0)
+        # 埃及「27→7~9 次 flatten 的对应耗时」：同一 phase 两栏对照 ——
+        # superseded flatten 合计 16s vs active flatten 合计 4s（优化收益）
+        act_phases = {(p["kind"], p["phase"]): p
+                      for p in report["active"]["phases"]}
+        act_flatten = act_phases[("machine", "prepare_flatten")]
+        self.assertEqual(act_flatten["total_seconds"], 4.0)
+        self.assertGreater(flatten_sup["total_seconds"],
+                           act_flatten["total_seconds"])
+        # 每 run 独立汇总（逐 run 各阶段耗时）
+        per = {p["run"]: p for p in report["active"]["per_run"]}
+        self.assertEqual(per[active_ids[0]]["totals_ms"],
+                         {"machine_ms": 1000, "agent_ms": 500,
+                          "total_ms": 1500})
+        self.assertEqual(per[active_ids[3]]["totals_ms"],
+                         {"machine_ms": 1000, "agent_ms": 500,
+                          "total_ms": 1500})
+        self.assertEqual(report["active"]["per_run"][0]["run"], active_ids[0])
+
+    def test_aggregation_read_only_superseded_timing_untouched(self):
+        """验收：superseded run 的 run_timing.json 未被删除或改写 —— 聚合
+        只读（证据不删，spec S7 Timing）。"""
+        task = make_synthetic_task(4)
+        ids = [r["id"] for r in task["runs"]]
+        superseded = ids[2]
+        run_dir = self.root / "runs" / superseded
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_timing(run_dir, machine_ms=[100, 200], agent_ms=[50])
+        timing_path = run_dir / "run_timing.json"
+        original = timing_path.read_bytes()
+        states = {rid: ("superseded" if rid == superseded else "drafted")
+                  for rid in ids}
+        for rid in ids:
+            if rid != superseded:
+                d = self.root / "runs" / rid
+                d.mkdir(parents=True, exist_ok=True)
+                write_timing(d, machine_ms=[10], agent_ms=[])
+        task_timing.aggregate_task_timing(
+            task, make_status(ids, states), self.root)
+        self.assertTrue(timing_path.is_file())
+        self.assertEqual(timing_path.read_bytes(), original)
+
+    def test_planned_runs_excluded_from_both_columns(self):
+        """planned（未开始）不进任一栏：excluded 列出（state 透明），其耗时
+        （若有残余条目）不污染 active 合计。"""
+        task = make_synthetic_task(3)
+        ids = [r["id"] for r in task["runs"]]
+        for rid in ids:
+            run_dir = self.root / "runs" / rid
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_timing(run_dir, machine_ms=[999] if rid != ids[0] else [100],
+                         agent_ms=[])
+        states = {ids[0]: "drafted", ids[1]: "planned",
+                  ids[2]: "superseded"}
+        report = task_timing.aggregate_task_timing(
+            task, make_status(ids, states), self.root)
+        self.assertEqual(report["active"]["runs"], [ids[0]])
+        self.assertEqual(report["active"]["totals_ms"]["machine_ms"], 100)
+        self.assertEqual(report["superseded"]["runs"], [ids[2]])
+        self.assertEqual(report["excluded"], [{"run": ids[1], "state": "planned"}])
+
+    def test_prepared_through_promoted_all_active(self):
+        """活 run = 状态 ∈ prepared..promoted（含已交付的 promoted）且非
+        superseded —— 全谱系都在 active 栏。"""
+        states = {"r32-cooling": "prepared", "r32-heating": "promoted",
+                  "r410a-cooling": "gated"}
+        for rid in states:
+            run_dir = self.root / "runs" / rid
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_timing(run_dir, machine_ms=[100], agent_ms=[])
+        report = task_timing.aggregate_task_timing(
+            self.task, self.status_of(states), self.root)
+        self.assertEqual(set(report["active"]["runs"]),
+                         {"r32-cooling", "r32-heating", "r410a-cooling"})
+        self.assertEqual(report["active"]["totals_ms"],
+                         {"machine_ms": 300, "agent_ms": 0, "total_ms": 300})
+
+    def test_gate_summary_includes_task_level_timing_columns(self):
+        """验收：报告随 Execution Gate 呈现 —— collect_gate_summary 增加
+        task 级双栏（active/superseded 合计 + kind+phase 行）；每 run 机器
+        +agent 双栏既有要求不变。"""
+        write_run_at(self.root, "r32-cooling", "drafted", spec_text="spec c")
+        write_run_at(self.root, "r32-heating", "gated", spec_text="spec h")
+        write_run_at(self.root, "r410a-cooling", "planned")
+        write_timing(self.root / "runs" / "r32-cooling",
+                     machine_ms=[300], agent_ms=[70])
+        write_timing(self.root / "runs" / "r32-heating",
+                     machine_ms=[100], agent_ms=[])
+        write_timing(self.root / "runs" / "r410a-cooling",
+                     machine_ms=[999], agent_ms=[])
+        summary = task_gate.collect_gate_summary(
+            self.task, self.status_of({"r32-cooling": "drafted",
+                                       "r32-heating": "gated",
+                                       "r410a-cooling": "planned"}),
+            self.root)
+        tt = summary["task_timing"]
+        self.assertEqual(tt["active"]["runs"],
+                         ["r32-cooling", "r32-heating"])
+        self.assertEqual(tt["active"]["totals_ms"],
+                         {"machine_ms": 400, "agent_ms": 70, "total_ms": 470})
+        self.assertEqual(tt["superseded"]["totals_ms"],
+                         {"machine_ms": 0, "agent_ms": 0, "total_ms": 0})
+        self.assertEqual([e["run"] for e in tt["excluded"]],
+                         ["r410a-cooling"])
+        # 既有 per-run 机器+agent 双栏不变（Gate 呈现形态要求）
+        self.assertEqual(summary["runs"]["r32-cooling"]["timing"],
+                         {"machine_ms": 300, "agent_ms": 70})
+
+
+class TestTimingTaskCLI(unittest.TestCase):
+    """timing_task.py 独立报告 CLI（subprocess seam，无 Office）：不依赖
+    Gate 流程即可回答「本次交付成本 vs 优化收益」。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_timing_cli_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_report_missing_task_yaml_exit1(self):
+        proc = run_timing_cli(self.root)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("TASK_YAML_NOT_FOUND", proc.stderr)
+
+    def test_report_requires_init_derived_files(self):
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+        proc = run_timing_cli(self.root)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_report_after_init_prints_two_columns(self):
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        status = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        status["runs"]["r32-cooling"]["state"] = "drafted"
+        status["runs"]["r32-heating"]["state"] = "gated"
+        status["runs"]["r410a-cooling"]["state"] = "superseded"
+        (self.root / "task_status.json").write_text(
+            json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+        for rid, machine, agent in (("r32-cooling", [300], [70]),
+                                    ("r32-heating", [100], []),
+                                    ("r410a-cooling", [2000, 1000], [500])):
+            d = self.root / "runs" / rid
+            d.mkdir(parents=True, exist_ok=True)
+            write_timing(d, machine_ms=machine, agent_ms=agent)
+        proc = run_timing_cli(self.root)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["active"]["runs"],
+                         ["r32-cooling", "r32-heating"])
+        self.assertEqual(report["active"]["totals_ms"],
+                         {"machine_ms": 400, "agent_ms": 70, "total_ms": 470})
+        self.assertEqual(report["superseded"]["totals_ms"],
+                         {"machine_ms": 3000, "agent_ms": 500,
+                          "total_ms": 3500})
+        self.assertEqual(report["excluded"], [])
 
 
 if __name__ == "__main__":

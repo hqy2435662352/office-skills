@@ -139,6 +139,11 @@ def run_gate_set(root: Path) -> None:
         "gaps": summary["gaps"],
         "excluded": summary["excluded"],
         "gate": summary["gate"],
+        "timing": {  # task 级双栏合计（issue 06；完整 kind+phase 分组见
+                     # gate_summary.json 的 task_timing 块）
+            "active": summary["task_timing"]["active"]["totals_ms"],
+            "superseded": summary["task_timing"]["superseded"]["totals_ms"],
+        },
     }, ensure_ascii=False, indent=2))
 
 
@@ -257,7 +262,8 @@ def main() -> None:
     mode.add_argument("--set", action="store_true",
                       help="聚合呈现：收集全部 Draft 就绪 run 的验证摘要生成 "
                            "gate_summary.json（缺 pending 的 run 先 --set；"
-                           "呈现后停，等待用户确认）")
+                           "呈现后停，等待用户确认；含 task 级 timing 双栏 — "
+                           "active/superseded，issue 06）")
     mode.add_argument("--confirm", action="store_true",
                       help="确认展开：按呈现集合逐 run execution_gate --confirm"
                            "（任一失败即整体停止）→ 全部确认后逐 run promote"
