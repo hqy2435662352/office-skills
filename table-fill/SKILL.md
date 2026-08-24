@@ -243,9 +243,12 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
 
 - **先写后编译**: 写 spec (信任 FILLSPEC「组合行为契约」+「能力映射表」,
   按问题定位答案) → `compile_fill.py` (单轮 ~0.1s) → stderr 缺陷清单
-  (code + corrective_action) 即**权威反馈** → 定向修 → 重编译。**禁止以源码
-  阅读替代编译验证** — 读源码的成本是编译的数百倍, 结论还不一定对
-  (precision: keep 反例: 读了源码反而选错, 见 references/KNOWN_TRAPS.md)。
+  (code + corrective_action) 即**权威反馈** → 定向修 → 重编译。**失败成本已
+  量化**: 第 1 轮失败是预期路径, 定向修复通常 <2 分钟 (单轮编译 ~0.1s + 按
+  corrective_action 改 spec + 重编译), 预算只约束连续失败而不约束单次失败
+  —— 不要因"怕失败"而读源码。**禁止以源码阅读替代编译验证** — 读源码的成本
+  是编译的数百倍, 结论还不一定对 (precision: keep 反例: 读了源码反而选错,
+  见 references/KNOWN_TRAPS.md)。
 - **能力求证 (Capability Resolution) — 按需加载, 正常 Run 不预读**: happy
   path 直接撰写正式 spec → formal compile; 不先 probe, 不预读 capability
   材料。只有产生**单一、可证伪的 Capability Question** (机制能力疑问: 关于
@@ -390,6 +393,29 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 3. 原子复制 draft → final, 验证 final 哈希 == draft 哈希。
 4. 最小 ZIP/结构确认 (pptx 查 presentation.xml)。
 5. 写 `final_receipt.json`。**Gate 后绝不再次执行填充。**
+
+## Task Orchestration (单任务多 run 批量编排)
+
+**何时用**: 一个业务任务包含**多条 run**（多条产品线/输出），且各 run 共享同一
+源工作簿（或同 sheet）的准备事实 —— Task 层把「共享源准备」从「每 run 重复
+准备」改成「任务级一次 + 逐 run 物化」，并统一批量 run 的生命周期、聚合 Gate
+与计时。单 run 任务不需要 Task 层，仍走上方五个公开命令。
+
+三个入口脚本（任务级唯一命令面，run 层五个公开命令零改动）:
+
+```bash
+python scripts/prepare_task.py --task-root <task_dir> --validate|--init|--prepare|--run
+python scripts/gate_task.py      --task-root <task_dir> --set|--confirm
+python scripts/resume_task.py    --task-root <task_dir> --resume [--rebuild] | --supersede --map old=new
+```
+
+- `task.yaml` 只描述编排（run 清单 + 输入输出引用 + 输出命名），**不承载业务
+  映射** —— 映射/公式/校验永远在 `runs/<id>/fill_spec.yaml`（MOD 规则指导撰写）；
+  业务映射确认后再写 task.yaml。
+- 完整契约（task model / cache / 调度 / 生命周期与恢复 / 聚合 Gate / CLI）见
+  `references/TASK_ORCHESTRATION.md` —— 本文件只给入口，机制细节不内嵌。
+- Task 层**不自动确认 Gate、不自动 promote**（fail-closed 不变）；中断恢复、
+  输入事实变化后的 supersede 都走 `resume_task.py`。
 
 ## PPTX 目标
 
@@ -550,6 +576,7 @@ python scripts/note_phase.py --workdir <dir> --phase <名称>
 - `references/TOOL_TRAPS.md` — Windows/bash/officecli 工具摩擦。
 - `references/OFFICECLI_REFERENCE.md` — 路径语法、batch JSON、编码规则。
 - `references/LAYER4_EXECUTE_LOOP.md` — 收敛循环与失败记录 schema。
+- `references/TASK_ORCHESTRATION.md` — Task 层唯一详细契约源（单任务多 run 编排）。
 
 > **After editing this skill or any of its scripts/references:**
 > Quit and restart OpenCode for changes to take effect. OpenCode loads

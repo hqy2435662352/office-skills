@@ -47,6 +47,16 @@
 | **scheme=none 元素仍被 WPS 按主题字体渲染 (残余之二, 2026-08-19)** | 已 pin scheme=none, 但用户视觉反馈 A 列合并单元格**仍显示软件默认宋体** — XML 里字面名是微软雅黑、scheme val='none' 都在 | WPS 对**任何** scheme 元素 (含 val='none') 仍走主题 minor 字体渲染; officecli `set` 无法在旧字体带 scheme 的格子上 OMIT 元素 (实测三态: 不传 → 复制旧 minor; none → val='none'; null/空串 → val='' 非法); batch 无 raw-set 动词 | 两段修复: pin 保留 scheme=none 作标记 (plan 声明 `strip_scheme_none`), 执行器在批量后、validate 前 `officecli raw-set /styles --xpath "//x:scheme[@val='none']" --action remove` 整体移除元素, 再直读 styles.xml 验证无残留 (失败 → SCHEME_STRIP_FAILED exit 3); 最终字体无 scheme 元素 = 模板自有字体的表示法, 全查看器渲染字面名 |
 | **officecli raw-set 不先 open 静默空跑 (2026-08-19)** | raw-set 返回 rc 0 + success, 但文件哈希不变、目标元素仍在 | raw-set 需要 open/close resident 生命周期; 无 resident 时静默 no-op (不报错, 极易误判已修复) | 调 raw-set 前后检查文件哈希或直读 XML 验证; 执行器 `strip_scheme_none_fonts` 内置 zipfile 读 styles.xml 的残留断言 |
 
+## Task 层陷阱 (task orchestration, 单任务多 run)
+
+| 陷阱 | 症状 | 根因 | 修复 |
+|------|------|------|------|
+| **execute crash window** | 中断后 resume 凭 draft 存在性直接判定可 gate/promote — 但 execute 在写 draft 与写 receipt 之间崩溃, 验证证据链不完整 | draft 存在但 receipt 缺失/不匹配; 旧流程只查产物存在性不查证据对 | 断点判定必须校验 receipt: draft+receipt 均有效才 drafted; draft 存在但 receipt 缺失/不匹配 → **重跑 execute**, 不得直接 gate (见 TASK_ORCHESTRATION.md 断点矩阵) |
+| **status ≠ truth** | task_status.json 说 prepared/compiled, 但产物缺失或 hash 漂移, resume 跳过必要阶段 → 坏输入进 compile/execute | 状态文件是生命周期**索引**, 不是真值源; 手改/中断/半写都可能让状态领先或落后于产物事实 | 断点一律以 artifact 存在性 + hash 校验判定; task_status 只作索引与展示, 不作断点证据 (TASK_ORCHESTRATION.md §4) |
+| **Office 并发 = 2** | 3 并发 flatten/execute 时 validate_state=fail 或文件锁错误 | Windows resident 进程持文件锁; Office 并发上限是**环境经验**, 不是架构契约 (3 并发曾实证失败) | 阶段并发默认值按 implementation constant 执行 (flatten/execute=2), 不进 task.yaml、不暴露 CLI 调参; 换 Office 发行版先按实证复核再调 |
+| **supersede 后继续修旧 run** | 输入事实已变 (task.yaml 修改/源 hash 漂移/模板重建/MOD 裁决变化), 还在旧 run 上修 spec 重编译 → 交付基于已失效输入, 旧产物链无意义 | 失败二分未执行: 输入事实改变时应 supersede, 而不是 REPAIR 旧版本 | 失败二分: 输入事实未变 → 阶段重试/REPAIR; 输入事实改变 → `resume_task.py --supersede --map old=new` (旧 run 标 superseded + superseded_by 链接), 新版本上继续 |
+| **引用式路径破坏 run 自包含** | run 目录依赖 `../../cache/<key>/...` 引用或 symlink/junction; 归档/迁移/复验 run 时产物悬空 | run 产物通过引用指向 task cache 而不是物化副本 | 缓存产物必须**物化 (逐字节复制)** 进 run 目录后才进 compile; 禁止 `../../cache` 引用路径、禁止 symlink/junction; 物化后 run artifact 自包含, 可脱离 task cache 独立归档复验 (TASK_ORCHESTRATION.md §2) |
+
 ## spike 四坑 (pptx 合并 lowering)
 
 来自能力 spike (officecli 1.0.143, fixture.pptx) — **先于实现验证的机械事实**:
