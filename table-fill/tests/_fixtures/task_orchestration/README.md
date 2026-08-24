@@ -12,6 +12,8 @@
 - `sources/parameter_book.xlsx`、`templates/filling_template.xlsx` — 最小真实
   工作簿占位文件（sheet: R32参数/R410A参数 / Sheet1）。issue 01 只用于静态
   "引用存在"校验（无 Office 依赖）；issue 02 起真实 sheet 使 --prepare 可在
-  安装 officecli 的机器上直接跑通（契约测试本身仍无 Office）。issue 08 的
-  E2E 合成工作簿（1 源 3 sheets + 4 run 共享设计）届时将替换/扩充此目录；
-  测试运行时绝不通过 openpyxl 现场生成。
+  安装 officecli 的机器上直接跑通（契约测试本身仍无 Office）。
+- `e2e/` — issue 08 的 E2E 合成 fixture（1 源工作簿 3 sheets × ~30 行 + 4 个
+  run 共享设计，见 `e2e/README.md`），供 `tests/test_task_e2e.py`（有 Office
+  性能验收，skipIf officecli 缺失）整目录复制为任务根使用；测试运行时绝不
+  通过 openpyxl 现场生成。

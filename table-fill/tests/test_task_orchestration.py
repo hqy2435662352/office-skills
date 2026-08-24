@@ -112,6 +112,24 @@ ticket 06):
   25. timing_task.py CLI — 独立报告 (缺 task.yaml exit 1; 缺 derived exit
       3; --init 后双栏 JSON 输出).
 
+Issue 08 coverage (三层验证 — spec S8 / ticket 08；恢复场景矩阵已由 issue 04
+item 14 覆盖; 性能验收 e2e 在 tests/test_task_e2e.py):
+  26. 契约测试 — Compiler 视角 task ≡ 单 run (spec Testing Decision #2/#3):
+      同一编译输入 (同一 fill_spec + staged / flat.csv / meta / digest /
+      candidates；manifest 仅多 cache_key/sha256 元数据) 经 public CLI
+      compile_fill.py 两次编译 → plan 的 input_hashes / fingerprints /
+      operations 完全一致；两 manifest 的 compile-facing 字段
+      (files/outlines/flattened/target/fingerprints) 去元数据后同构.
+  27. 共享源 sheet 物化逐字节一致：同一缓存键物化进两个 run → flat.csv
+      hash 相等 (共享 flatten 不改变 run 产物身份, cache identity ≠ run
+      artifact identity).
+  28. 性能验收 (有 Office, skipIf officecli 缺失) — tests/test_task_e2e.py:
+      断言 1 cache/ 目录数 == 唯一需求数 (4 = 3 源 sheet + 1 共享目标模板,
+      而非 4 run × 2 sheet = 8); 断言 2 第二次 prepare 缓存零新增
+      (hits=4/misses=0) + 物化 CSV hash 不变; 断言 3 物化 CSV 与单 run
+      CSV 逐字节一致 + plan 等价; 完整 task 流程走通 (prepare_task →
+      compile → execute → gate_task --set/--confirm → promote → 幂等 noop).
+
 No Office involvement: cache/meta/digest fixtures are synthesized text;
 classify_columns.py / structure_digest.py are pure text subprocesses;
 execution_gate.py / promote_output.py are pure Python (zipfile check).
@@ -151,6 +169,7 @@ import task_resume  # noqa: E402
 import task_gate  # noqa: E402
 import gate_task  # noqa: E402
 import task_timing  # noqa: E402
+from prepare_run import _entry_for  # noqa: E402 —— 单 run 条目组装的真实 seam
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
@@ -3503,6 +3522,317 @@ class TestTimingTaskCLI(unittest.TestCase):
                          {"machine_ms": 3000, "agent_ms": 500,
                           "total_ms": 3500})
         self.assertEqual(report["excluded"], [])
+
+
+# ── issue 08: 三层验证（spec S8 / ticket 08）— 契约层 ───────────────────────
+
+COMPILE_FILL = _SCRIPTS_DIR / "compile_fill.py"
+
+SOURCE_CSV = (
+    "产品线,型号,容量,数量,备注,1\n"
+    "R32 变频,R32-0001,9000Btu,2,批次 1,2\n"
+    "R32 变频,R32-0002,12000Btu,3,批次 1,3\n"
+    "R32 变频,R32-0003,18000Btu,4,批次 1,4\n"
+    "R32 变频,R32-0004,9000Btu,5,批次 2,5\n"
+    "R32 变频,R32-0005,12000Btu,6,批次 2,6\n"
+)
+TARGET_CSV = (
+    "空调客户参数表,,,,,1\n"
+    "产品线,型号,容量,数量,备注,2\n"
+    ",,,,,3\n"          # 数据模板行：空值（无克隆残留）
+    "合计,,,,,4\n"
+    ",,,,,5\n"
+    ",,,,,6\n"
+)
+
+
+def _contract_meta(file: str, sheet: str, *, rows: int = 6,
+                   cols: int = 5) -> dict:
+    """真实契约测试用的合成 flatten meta（compile 可消费的最小形态，与
+    make_fake_meta 同族：classify_columns / structure_digest 纯文本 subprocess
+    均以该形态验证过）。"""
+    meta = make_fake_meta()
+    meta["file"] = file
+    meta["sheet"] = sheet
+    meta["dimensions"] = {"rows": rows, "cols": cols,
+                          "data_rows": rows - 1, "formulas": 0,
+                          "errorCells": 0, "tables": 0, "charts": 0,
+                          "oleObjects": 0}
+    meta["columns"] = [
+        {"col": ch, "nonempty": rows - 1,
+         "numeric_ratio": 1.0 if ch >= "D" else 0.0, "unique": rows - 1,
+         "samples": [f"{ch}{i}" for i in range(1, min(4, rows))]}
+        for ch in "ABCDE"[:cols]
+    ]
+    return meta
+
+
+def _contract_cache_key(sheet: str) -> str:
+    """契约测试的固定缓存键（同一 staged source hash + flatten schema v1 +
+    officecli v1.0.144 — 键分量语义由 TestCacheKey 覆盖）。"""
+    return flatten_cache.cache_key("ab" * 32, sheet, 1, "1.0.144")
+
+
+def _seed_contract_cache(root: Path) -> dict:
+    """合成两个缓存条目（源 R32参数 + 目标 Sheet1），返回 sheet → 缓存键。"""
+    keys = {}
+    for schema_name, sheet, csv, is_target in (
+            ("parameter_book.xlsx", "R32参数", SOURCE_CSV, False),
+            ("filling_template.xlsx", "Sheet1", TARGET_CSV, True)):
+        key = _contract_cache_key(sheet)
+        entry = flatten_cache.cache_entry_dir(root, key)
+        entry.mkdir(parents=True, exist_ok=True)
+        # 字节直写：避免 Windows 文本模式把 \n 翻成 \r\n（逐字节契约）
+        (entry / "flat.csv").write_bytes(csv.encode("utf-8"))
+        meta = _contract_meta(schema_name, sheet,
+                              rows=6, cols=5 if is_target else 4)
+        (entry / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        (entry / "digest.md").write_text(
+            f"# {sheet} — 结构摘要\n- 契约测试条目\n", encoding="utf-8")
+        keys[sheet] = key
+    return keys
+
+
+def _materialize_contract(root: Path, run_dir: Path) -> dict:
+    """按任务物化路径把两个缓存条目物化进 run 目录（真实 materialize_entry：
+    candidates/digest 纯文本 subprocess 再生成），返回按 name 索引的条目。"""
+    entries = [
+        flatten_cache.materialize_entry(
+            root, _contract_cache_key("R32参数"), run_dir,
+            staged_name="parameter_book.xlsx", sheet="R32参数",
+            name="parameter_book_R32", is_target=False),
+        flatten_cache.materialize_entry(
+            root, _contract_cache_key("Sheet1"), run_dir,
+            staged_name="filling_template.xlsx", sheet="Sheet1",
+            name="filling_template_Sheet1", is_target=True),
+    ]
+    return {e["name"]: e for e in entries}
+
+
+def _contract_fill_spec(workdir: Path, fingerprints: dict) -> Path:
+    """契约测试用 fill_spec（append clone 最小映射，与 e2e 的合成任务同构）。"""
+    spec = {
+        "task": {"intent": "契约测试 — Compiler 视角 task ≡ 单 run",
+                 "selected_mod": "NONE", "selected_mod_revision": None},
+        "inputs": {"sources": ["parameter_book.xlsx"],
+                   "target": "filling_template.xlsx",
+                   "source_sheets": [{"source": "parameter_book.xlsx",
+                                      "sheets": ["R32参数"]}],
+                   "target_sheet": "Sheet1"},
+        "fingerprints": fingerprints,
+        "mapping": {"targets": [{
+            "sheet": "Sheet1", "base_last_row": 4,
+            "clone_roles": [{"role": "data", "template_row": 3}],
+            "rows": {"source": "parameter_book_R32",
+                     "selectors": [{"column": "A", "not_value": ""},
+                                   {"column": "A", "not_value": "产品线"}]},
+            "columns": [{"source": "A", "target": "A"},
+                        {"source": "B", "target": "B"},
+                        {"source": "C", "target": "C"},
+                        {"source": "D", "target": "D"}],
+        }]},
+        "decisions": ["仅纳入资料行（表头排除）"],
+        "gaps": [],
+        "lineage": [{"source": "parameter_book_R32_flat.csv", "role": "primary",
+                     "note": "契约 fixture"}],
+        "validation": {"required_coverage": [], "required_empty": [],
+                       "key_outputs": ["A5", "B5", "C5", "D5"]},
+    }
+    path = workdir / "fill_spec.yaml"
+    path.write_text(yaml_dump(spec), encoding="utf-8")
+    return path
+
+
+def yaml_dump(spec: dict) -> str:
+    """fill_spec 序列化（PyYAML 是 compile_fill 的硬依赖，缺失时应显式暴露，
+    不做 JSON 兜底掩盖环境缺陷）。"""
+    import yaml
+    return yaml.safe_dump(spec, allow_unicode=True, sort_keys=False)
+
+
+def run_compile_cli(workdir: Path) -> subprocess.CompletedProcess:
+    """compile_fill.py 的公共 CLI seam（无 Office — 纯文本编译）。"""
+    return subprocess.run(
+        [sys.executable, str(COMPILE_FILL),
+         "--spec", str(workdir / "fill_spec.yaml"),
+         "--workdir", str(workdir)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120,
+    )
+
+
+def strip_extra_fields(entry: dict) -> dict:
+    """去掉任务物化条目的 provenance 元数据（sha256/cache_key）→ 单 run 形态。"""
+    return {k: v for k, v in entry.items() if k not in ("sha256", "cache_key")}
+
+
+class TestContractCompileEquivalence(unittest.TestCase):
+    """issue 08 契约测试 #3（spec Testing Decision #2/#3）：
+
+    同一编译输入（同一 fill_spec + 同一 staged/flat.csv/meta/digest/
+    candidates；manifest 仅多 cache_key/sha256 元数据）—— task 形态
+    prepare_manifest.json 与单 run 形态各自经 public CLI compile_fill.py
+    编译后，plan 的 input_hashes / fingerprints / operations 完全一致；
+    双 manifest 的 compile-facing 字段去元数据后同构。
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_contract_"))
+        _seed_contract_cache(self.root)
+        self.workdir = self.root / "runs" / "run-a"
+        self.workdir.mkdir(parents=True)
+        # 真实任务物化路径（materialize_entry：candidates/digest 再生成）
+        self.entries = _materialize_contract(self.root, self.workdir)
+        # staged 文件（compile 的 input_hashes 绑定对象，两形态共用同一份）
+        (self.workdir / "parameter_book.xlsx").write_bytes(b"source-bytes")
+        (self.workdir / "filling_template.xlsx").write_bytes(b"template-bytes")
+        (self.workdir / "parameter_book_outline.txt").write_text(
+            '{"data": {"sheets": [{"name": "R32参数"}]}}', encoding="utf-8")
+        (self.workdir / "filling_template_outline.txt").write_text(
+            '{"data": {"sheets": [{"name": "Sheet1"}]}}', encoding="utf-8")
+        files = [
+            {"staged": "parameter_book.xlsx", "source": "sources/parameter_book.xlsx",
+             "sha256": task_schema.file_sha256(self.workdir / "parameter_book.xlsx")},
+            {"staged": "filling_template.xlsx",
+             "source": "templates/filling_template.xlsx",
+             "sha256": task_schema.file_sha256(self.workdir / "filling_template.xlsx")},
+        ]
+        outlines = {"parameter_book.xlsx": "parameter_book_outline.txt",
+                    "filling_template.xlsx": "filling_template_outline.txt"}
+        metas = {n: json.loads((self.workdir / e["meta"]).read_text(encoding="utf-8"))
+                 for n, e in self.entries.items()}
+        src_facts = task_prepare.structure_facts(metas["parameter_book_R32"])
+        tgt_facts = task_prepare.structure_facts(metas["filling_template_Sheet1"])
+        self.fingerprints = {
+            "source_structure": task_prepare.facts_sha256([src_facts]),
+            "target_structure": task_prepare.facts_sha256([tgt_facts]),
+        }
+        self.task_manifest = task_prepare.assemble_run_manifest(
+            str(self.workdir), "contract-task",
+            files, outlines,
+            [self.entries["parameter_book_R32"], self.entries["filling_template_Sheet1"]],
+            self.entries["filling_template_Sheet1"], self.fingerprints)
+        self.spec = _contract_fill_spec(self.workdir, self.fingerprints)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def single_run_manifest(self) -> dict:
+        """单 run 形态：经 prepare_run 的真实条目组装 seam（_entry_for）重建
+        —— 不是从 task manifest 反剥，而是 Run Layer 自身生产条目形态：
+        entry 无 sha256/cache_key，compile-facing 顶层字段原样保留。"""
+        m = json.loads(json.dumps(self.task_manifest))
+        m["flattened"] = [
+            _entry_for(e["file"], e["sheet"], e["name"])
+            for e in self.task_manifest["flattened"]
+        ]
+        tgt = self.task_manifest["target"]
+        m["target"] = _entry_for(tgt["file"], tgt["sheet"], tgt["name"])
+        return m
+
+    def test_compile_facing_fields_isomorphic_after_stripping_metadata(self):
+        """验收（契约测试 #1）：task 产物与单 run 产物的 compile-facing 字段
+        （files/outlines/flattened/target/fingerprints）一致，仅多 cache_key
+        metadata（物化条目另带 sha256 = run 业务身份）。"""
+        single = self.single_run_manifest()
+        self.assertEqual(single["files"], self.task_manifest["files"])
+        self.assertEqual(single["outlines"], self.task_manifest["outlines"])
+        self.assertEqual(single["fingerprints"], self.task_manifest["fingerprints"])
+        # 目标条目同构：去元数据后一致；task 侧只比单 run 多 sha256/cache_key
+        self.assertEqual(single["target"],
+                         strip_extra_fields(self.task_manifest["target"]))
+        self.assertEqual(set(self.task_manifest["target"])
+                         - set(single["target"]), {"cache_key", "sha256"})
+        self.assertEqual(single["flattened"],
+                         [strip_extra_fields(e)
+                          for e in self.task_manifest["flattened"]])
+        # 元数据只增不减：task 条目比单 run 多且仅多 cache_key/sha256
+        for t_entry, s_entry in zip(self.task_manifest["flattened"],
+                                    single["flattened"]):
+            self.assertEqual(set(t_entry) - set(s_entry), {"cache_key", "sha256"})
+            self.assertEqual(s_entry,
+                             strip_extra_fields(t_entry))
+
+    def test_compile_plan_equivalent(self):
+        """验收（契约测试 #3）：两种 manifest 形态经 public CLI 编译 →
+        plan 的 input_hashes / fingerprints / operations 完全一致。"""
+        (self.workdir / "prepare_manifest.json").write_text(
+            json.dumps(self.task_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        proc = run_compile_cli(self.workdir)
+        self.assertEqual(proc.returncode, 0,
+                         proc.stdout[-800:] + proc.stderr[-800:])
+        plan_task = json.loads(
+            (self.workdir / "execution_plan.json").read_text(encoding="utf-8"))
+
+        (self.workdir / "prepare_manifest.json").write_text(
+            json.dumps(self.single_run_manifest(), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        proc = run_compile_cli(self.workdir)
+        self.assertEqual(proc.returncode, 0,
+                         proc.stdout[-800:] + proc.stderr[-800:])
+        plan_single = json.loads(
+            (self.workdir / "execution_plan.json").read_text(encoding="utf-8"))
+
+        for key in ("input_hashes", "fingerprints", "operations",
+                    "operation_count", "blocks", "warnings", "key_outputs",
+                    "expected_final_row_count", "structural_deltas",
+                    "writes", "readback", "source_csv"):
+            self.assertEqual(plan_task[key], plan_single[key],
+                             f"plan field {key} diverged between task and "
+                             f"single-run compile")
+        # 编译期 input_hashes 绑定 = staged 文件真值（两形态同一绑定对象）
+        expected = {
+            "parameter_book.xlsx":
+                task_schema.file_sha256(self.workdir / "parameter_book.xlsx"),
+            "filling_template.xlsx":
+                task_schema.file_sha256(self.workdir / "filling_template.xlsx"),
+        }
+        self.assertEqual(plan_task["input_hashes"], expected)
+        # 编译真的产出了行操作（不是空 plan 的“等价”）
+        self.assertGreater(plan_task["operation_count"], 0)
+        self.assertIn("parameter_book_R32_flat.csv", plan_task["source_csv"])
+
+
+class TestSharedSheetMaterializeIdentity(unittest.TestCase):
+    """issue 08 契约测试 #2 的单元层背书：同一缓存键物化进两个 run →
+    flat.csv 逐字节一致（hash 相等）—— 共享 flatten 不改变 run 产物身份
+    （Cache Identity ≠ Run Artifact Identity；e2e 层再与单 run CSV 对账）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_shared_sheet_"))
+        _seed_contract_cache(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_two_runs_sharing_sheet_get_byte_identical_csv(self):
+        key_src = _contract_cache_key("R32参数")
+        hashes = []
+        for rid in ("run-a", "run-b"):
+            run_dir = self.root / "runs" / rid
+            run_dir.mkdir(parents=True)
+            entry = flatten_cache.materialize_entry(
+                self.root, key_src, run_dir,
+                staged_name="parameter_book.xlsx", sheet="R32参数",
+                name="parameter_book_R32", is_target=False)
+            hashes.append(entry["sha256"])
+        self.assertEqual(hashes[0], hashes[1])
+        self.assertEqual(
+            (self.root / "runs/run-a/parameter_book_R32_flat.csv").read_bytes(),
+            (self.root / "runs/run-b/parameter_book_R32_flat.csv").read_bytes())
+        self.assertEqual(
+            (self.root / "runs/run-a/parameter_book_R32_flat.csv").read_bytes(),
+            SOURCE_CSV.encode("utf-8"))
+        # 两 run 的 meta.file 各自重定向（run artifact 自包含）— 身份
+        # 差异只出现在 provenance/路径字段，不入 compile 事实
+        meta_a = json.loads((self.root / "runs/run-a/parameter_book_R32_meta.json")
+                            .read_text(encoding="utf-8"))
+        meta_b = json.loads((self.root / "runs/run-b/parameter_book_R32_meta.json")
+                            .read_text(encoding="utf-8"))
+        self.assertNotEqual(meta_a["file"], meta_b["file"])
+        self.assertEqual(meta_a["sheet"], meta_b["sheet"])
 
 
 if __name__ == "__main__":

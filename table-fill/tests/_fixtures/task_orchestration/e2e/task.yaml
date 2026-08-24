@@ -1,0 +1,47 @@
+# task.yaml — issue 08 E2E 合成任务（性能验收三层测试的第三层专用）
+#
+# 设计（ticket 08 fixture 策略）：1 个源工作簿（3 sheets × ~30 行）+ 4 个 run：
+#   - r32-cooling / r32-heating 共享 sheet A（R32参数）
+#   - r410a-cooling / r22-cooling 分别用 B/C（R410A参数 / R22参数）
+#   - 唯一源 sheet 需求 U_source = 3；4 run 共享同一目标模板 →
+#     任务内唯一 (file, sheet) 需求总数 = 3 源 + 1 目标 = 4（cache/ 目录数上限，
+#     而非 4 run × 2 sheet = 8 次重复展平）。
+# 业务映射（产品线→容量→Z 码→源列）永远不在此处，而是在
+# runs/<id>/fill_spec.yaml（由 e2e 测试按 MOD 规则撰写）。
+task:
+  id: egypt-params-e2e
+  customer: 埃及
+  notes: 合成验收任务 — 与单 run 流程逐字节对比用（issue 08）
+runs:
+  - id: r32-cooling
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_r32_cooling.xlsx
+  - id: r32-heating
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_r32_heating.xlsx
+  - id: r410a-cooling
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_r410a_cooling.xlsx
+  - id: r22-cooling
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R22参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_r22_cooling.xlsx
