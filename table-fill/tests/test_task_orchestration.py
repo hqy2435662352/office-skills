@@ -66,8 +66,39 @@ Issue 04 coverage (lifecycle / resume / supersede; checkpoint determination
       supersede suggestion — acceptance #3 (in-process seam, officecli
       probes patched).
 
+Issue 05 coverage (aggregate gate: gate_summary generation + per-run confirm
+expansion; no Office — spec S6 phase 5 / Implementation Decision 31 /
+Testing Decision #8):
+  19. task_gate summary pure seam — timing_totals (machine+agent 双栏),
+      mod_summary (MOD 裁决), spec_mod (selected_mod), receipt_validation
+      (readback/source_coverage/issue_delta/structural/render_qa/validate),
+      collect_gate_summary (13-run synthetic: gate_summary only contains
+      drafted/gated runs, gaps complete, terminal runs excluded).
+  20. task_gate.confirm_plan — presented-set vs current-evidence guard:
+      matching partition (confirm/already_confirmed/promote in task.yaml
+      order), stale (presented but no longer confirmable), not_presented
+      (confirmable but never presented → cannot authorize unseen content).
+  21. task_gate.run_confirm_expansion (injectable workers) — per-run
+      .gate3_confirmed each bound to its OWN hash trio (real execution_gate
+      --confirm), promote stage concurrency contract via task_scheduler,
+      **confirm failure stops everything and reports the run (no promote)**,
+      promote failure isolated with partial status advance, single-writer
+      status advance gated→promoted at the promote boundary.
+  22. gate_task.py CLI — --set aggregates only drafted runs (+ runs
+      pending set for evidence-drafted), gaps listed; nothing-to-present
+      fails closed; --confirm without gate_summary fails closed; full
+      --set → --confirm flow with REAL execution_gate/promote_output
+      subprocesses (final outputs land in <task_root>/outputs/, final hash
+      == confirmed draft hash, status all promoted, re-run is a no-op);
+      stale presentation blocks without promote; in-flight confirm failure
+      (patched confirmer) stops and reports the run with no promote;
+      promote before confirmation rejected by promote_output itself
+      (GATE_NOT_CONFIRMED — fail-closed preserved, existing script zero
+      change).
+
 No Office involvement: cache/meta/digest fixtures are synthesized text;
-classify_columns.py / structure_digest.py are pure text subprocesses.
+classify_columns.py / structure_digest.py are pure text subprocesses;
+execution_gate.py / promote_output.py are pure Python (zipfile check).
 
 Run with:
   python -m pytest table-fill/tests/test_task_orchestration.py -q
@@ -86,7 +117,8 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr
+import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -100,11 +132,23 @@ import flatten_cache  # noqa: E402
 import task_prepare  # noqa: E402
 import task_scheduler  # noqa: E402
 import task_resume  # noqa: E402
+import task_gate  # noqa: E402
+import gate_task  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
 RESUME_TASK = _SCRIPTS_DIR / "resume_task.py"
+GATE_TASK = _SCRIPTS_DIR / "gate_task.py"
 VALID_RUN_IDS = {"r32-cooling", "r32-heating", "r410a-cooling"}
+
+
+def run_gate_cli(task_root: Path, mode: str) -> subprocess.CompletedProcess:
+    """gate_task.py 的公共 CLI seam（无 Office：呈现/确认/断言全链路）。"""
+    return subprocess.run(
+        [sys.executable, str(GATE_TASK), "--task-root", str(task_root), mode],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60,
+    )
 
 
 def run_cli(task_root: Path, mode: str) -> subprocess.CompletedProcess:
@@ -1263,11 +1307,13 @@ class TestPrepareTaskCLIRun(unittest.TestCase):
 # ── issue 04: Lifecycle / Resume / Supersede（spec S7） ─────────────────────
 
 def write_run_at(root: Path, rid: str, level: str, *,
-                 status_state: str | None = None) -> Path:
+                 status_state: str | None = None,
+                 spec_text: str = "fill_spec: level") -> Path:
     """在合成任务根下按断点层级生成一个 run 目录（纯文件系统 + 真实 SHA-256，
     无 Office）。level ∈ planned / prepared / compiled / drafted /
     crash_noreceipt / crash_receipt_mismatch / gated / confirmed / promoted /
     binding_spec_changed / binding_plan_changed / materialized_modified。
+    spec_text 可注入以区分 run 的哈希三元组（plan/receipt 按实际内容重算）。
     返回 run_dir。"""
     run_dir = root / "runs" / rid
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1316,7 +1362,7 @@ def write_run_at(root: Path, rid: str, level: str, *,
                  "crash_receipt_mismatch", "gated", "confirmed", "promoted",
                  "binding_spec_changed", "binding_plan_changed"):
         spec = run_dir / "fill_spec.yaml"
-        spec.write_text("fill_spec: level\n", encoding="utf-8")
+        spec.write_text(spec_text + "\n", encoding="utf-8")
         plan = {
             "schema_version": "2.5",
             "fill_spec_sha256": task_schema.file_sha256(spec),
@@ -2355,6 +2401,784 @@ class TestResumeRealWorkers(unittest.TestCase):
             (self.root / "task_status.json").read_text(encoding="utf-8"))
         self.assertEqual(status_file["runs"]["r32-cooling"]["state"],
                          "prepared")
+
+
+# ── issue 05: 聚合 Gate（gate_summary 生成 + 逐 run 确认展开） ─────────────
+
+def write_timing(run_dir: Path, machine_ms: list | None = None,
+                 agent_ms: list | None = None) -> None:
+    """合成 run_timing.json（机器 + agent 双栏条目；duration_ms 非数值条目
+    用于计时解析防御）。"""
+    entries = []
+    for i, ms in enumerate(machine_ms or []):
+        entries.append({"kind": "machine", "phase": f"m{i}", "duration_ms": ms})
+    for i, ms in enumerate(agent_ms or []):
+        entries.append({"kind": "agent", "phase": f"a{i}", "duration_ms": ms})
+    (run_dir / "run_timing.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+
+def write_mod(run_dir: Path, status: str = "resolved",
+              names: tuple = ("cost_reply",)) -> None:
+    """合成 mod_resolution.json（MOD 裁决表面）。"""
+    (run_dir / "mod_resolution.json").write_text(json.dumps({
+        "status": status,
+        "candidates": [{"name": n, "display_name": n,
+                        "hits": ["scope::value"], "pending": [],
+                        "missed": []} for n in names],
+        "why": "exactly one candidate",
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def write_promotable_run(root: Path, rid: str, run_decl: dict,
+                         spec_text: str = "fill_spec: synthetic",
+                         ) -> tuple[Path, dict]:
+    """完整可 promote 的合成 run（无 Office；draft 是合法 zip）。
+
+    覆盖 promote_output 的全部既有校验前置：staged 输入 + plan 的
+    input_hashes 绑定 + 合法 zip draft + 完整 receipt（source_hashes /
+    template_sha256 / 哈希三元组 / readback / coverage / structural /
+    validate）+ run_timing + mod_resolution。返回 (run_dir, hashes)。"""
+    run_dir = Path(root) / "runs" / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    spec = run_dir / "fill_spec.yaml"
+    spec.write_text(spec_text + "\n", encoding="utf-8")
+    staged_src = run_dir / "parameter_book.xlsx"
+    staged_src.write_bytes(f"source-bytes-{rid}".encode("utf-8"))
+    tpl = run_dir / "filling_template.xlsx"
+    tpl.write_bytes(f"template-bytes-{rid}".encode("utf-8"))
+    draft = run_dir / "validated_draft.xlsx"
+    with zipfile.ZipFile(draft, "w") as z:
+        z.writestr("xl/workbook.xml", "<workbook/>")  # promote 的最小 zip 检查
+    input_hashes = {
+        "parameter_book.xlsx": task_schema.file_sha256(staged_src),
+        "filling_template.xlsx": task_schema.file_sha256(tpl),
+    }
+    plan = {"schema_version": "2.5",
+            "fill_spec_sha256": task_schema.file_sha256(spec),
+            "target": "filling_template.xlsx", "input_hashes": input_hashes}
+    (run_dir / "execution_plan.json").write_text(
+        json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    hashes = {
+        "fill_spec_sha256": task_schema.file_sha256(spec),
+        "execution_plan_sha256": task_schema.file_sha256(
+            run_dir / "execution_plan.json"),
+        "draft_sha256": task_schema.file_sha256(draft),
+    }
+    receipt = {
+        "schema_version": "2.5",
+        "source_hashes": {"parameter_book.xlsx":
+                          input_hashes["parameter_book.xlsx"]},
+        "template_sha256": input_hashes["filling_template.xlsx"],
+        "input_hash_check": {"drifted": []},
+        **hashes, "draft_path": str(draft),
+        "operation_counts": {},
+        "source_coverage": {"entries": [], "result": "pass"},
+        "readback": {"total": 10, "passed": 10},
+        "structural": {"pass": True, "actual_final_row_count": 24},
+        "render_qa": {"status": "ok"},
+        "issue_delta": {"supported": True, "new_issues": 0},
+        "validate": "ok",
+    }
+    (run_dir / "draft_receipt.json").write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_timing(run_dir, machine_ms=[100, 200], agent_ms=[50])
+    write_mod(run_dir)
+    return run_dir, hashes
+
+
+def add_pending(run_dir: Path, hashes: dict) -> None:
+    """写入有效 pending 呈现（呈现态 = 当前产物哈希三元组）。"""
+    (run_dir / ".gate3_pending").write_text(json.dumps(
+        {"presented_at": "2026-08-25T00:00:00Z", "hashes": hashes},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_synthetic_task(n: int, prefix: str = "r") -> dict:
+    """n-run 合成 task 定义（共享源/模板，与 fixture 同构）。"""
+    runs = [{
+        "id": f"{prefix}{i:02d}",
+        "source": {"file": "sources/parameter_book.xlsx",
+                   "sheets": ["R32参数"]},
+        "target": {"template": "templates/filling_template.xlsx",
+                   "sheet": "Sheet1", "output": f"out_{prefix}{i:02d}.xlsx"},
+    } for i in range(1, n + 1)]
+    return {"task": {"id": f"synthetic-{prefix}-{n}"}, "runs": runs}
+
+
+class TestGateSummaryPure(unittest.TestCase):
+    """gate_summary 生成（纯函数 seam，无 Office）：timing 双栏 / MOD /
+    selected_mod / 校验结果摘要 / 聚合呈现（13 run 合成：只含 drafted/gated，
+    缺口列全，终态 excluded）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_gate_sum_"))
+        (self.root / "runs").mkdir(parents=True, exist_ok=True)
+        self.task, self.defect = parse_fixture("task.yaml")
+        assert self.defect is None
+        self.by_id = {r["id"]: r for r in self.task["runs"]}
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def status_of(self, states: dict) -> dict:
+        return make_status([r["id"] for r in self.task["runs"]], states)
+
+    def test_timing_totals_two_columns(self):
+        """run_timing.json → 机器 + agent 双栏合计（缺失/非数值条目忽略）。"""
+        run_dir = self.root / "runs" / "r32-cooling"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_timing(run_dir, machine_ms=[100, 200, "bad"], agent_ms=[50])
+        self.assertEqual(task_gate.timing_totals(run_dir),
+                         {"machine_ms": 300, "agent_ms": 50})
+        empty = self.root / "runs" / "r32-heating"
+        empty.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(task_gate.timing_totals(empty),
+                         {"machine_ms": 0, "agent_ms": 0})
+        (empty / "run_timing.json").write_text("not-a-list", encoding="utf-8")
+        self.assertEqual(task_gate.timing_totals(empty),
+                         {"machine_ms": 0, "agent_ms": 0})
+
+    def test_mod_summary_compact_and_absent(self):
+        """MOD 裁决摘要（status/candidates 命中等/why）；缺失 → None。"""
+        run_dir = self.root / "runs" / "r32-cooling"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_mod(run_dir)
+        mod = task_gate.mod_summary(run_dir)
+        self.assertEqual(mod["status"], "resolved")
+        self.assertEqual(mod["candidates"][0]["name"], "cost_reply")
+        self.assertIn("why", mod)
+        other = self.root / "runs" / "r32-heating"
+        other.mkdir(parents=True, exist_ok=True)
+        self.assertIsNone(task_gate.mod_summary(other))
+
+    def test_spec_mod_reads_selected_mod(self):
+        """fill_spec 的 selected_mod（关键 mapping 与业务决策）；缺失 → None。"""
+        run_dir = self.root / "runs" / "r32-cooling"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "fill_spec.yaml").write_text(
+            "selected_mod: cost_reply\n", encoding="utf-8")
+        self.assertEqual(task_gate.spec_mod(run_dir), "cost_reply")
+        (run_dir / "fill_spec.yaml").write_text(
+            "columns:\n  - source: A\n", encoding="utf-8")
+        self.assertIsNone(task_gate.spec_mod(run_dir))  # 无 selected_mod
+
+    def test_receipt_validation_extract(self):
+        """关键校验结果摘要（readback/coverage/issue delta/structural/
+        render_qa/validate）；非 mapping → 空。"""
+        receipt = {
+            "readback": {"total": 10, "passed": 10},
+            "source_coverage": {"entries": [{"name": "s"}], "result": "pass"},
+            "issue_delta": {"supported": True, "new_issues": 0},
+            "structural": {"pass": True, "actual_final_row_count": 24},
+            "render_qa": {"status": "ok"},
+            "validate": "ok",
+        }
+        v = task_gate.receipt_validation(receipt)
+        self.assertEqual(v["readback"], {"total": 10, "passed": 10})
+        self.assertEqual(v["source_coverage"]["result"], "pass")
+        self.assertEqual(v["issue_delta"]["new_issues"], 0)
+        self.assertEqual(v["structural"]["final_row_count"], 24)
+        self.assertEqual(v["render_qa"], {"status": "ok"})
+        self.assertEqual(v["validate"], "ok")
+        self.assertEqual(task_gate.receipt_validation(None), {})
+        self.assertEqual(task_gate.receipt_validation([]), {})
+
+    def test_collect_gate_summary_only_drafted_gated_plus_gaps(self):
+        """呈现集合 = drafted/gated（产物证据）；planned 不入呈现、缺口列全。"""
+        write_run_at(self.root, "r32-cooling", "drafted", spec_text="spec c")
+        write_run_at(self.root, "r32-heating", "gated", spec_text="spec h")
+        write_run_at(self.root, "r410a-cooling", "planned")
+        summary = task_gate.collect_gate_summary(
+            self.task, self.status_of({"r32-cooling": "drafted",
+                                       "r32-heating": "gated",
+                                       "r410a-cooling": "planned"}),
+            self.root)
+        self.assertEqual(set(summary["runs"]),
+                         {"r32-cooling", "r32-heating"})
+        self.assertEqual(len(summary["gaps"]), 1)
+        self.assertEqual(summary["gaps"][0]["run"], "r410a-cooling")
+        self.assertEqual(summary["gaps"][0]["state"], "planned")
+        self.assertEqual(summary["excluded"], [])
+
+    def test_summary_per_run_fields_align_gate_content(self):
+        """每 run: id/输出名/行数/校验结果/哈希三元组/MOD/timing 双栏
+        （呈现形态对齐 Execution Gate 内容要求）。"""
+        write_run_at(self.root, "r32-cooling", "drafted", spec_text="spec c")
+        run_dir = self.root / "runs" / "r32-cooling"
+        receipt = json.loads(
+            (run_dir / "draft_receipt.json").read_text(encoding="utf-8"))
+        receipt.update({
+            "readback": {"total": 10, "passed": 10},
+            "source_coverage": {"entries": [], "result": "pass"},
+            "issue_delta": {"supported": True, "new_issues": 0},
+            "structural": {"pass": True, "actual_final_row_count": 24},
+            "render_qa": {"status": "ok"},
+            "validate": "ok",
+        })
+        (run_dir / "draft_receipt.json").write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        write_timing(run_dir, machine_ms=[300], agent_ms=[70])
+        write_mod(run_dir)
+        (run_dir / "fill_spec.yaml").write_text(
+            "selected_mod: cost_reply\n", encoding="utf-8")
+        facts = task_resume.gather_run_facts(run_dir)
+        entry = task_gate.summarize_run(
+            "r32-cooling", self.by_id["r32-cooling"], run_dir, facts)
+        self.assertEqual(entry["id"], "r32-cooling")
+        self.assertEqual(entry["output"], "out_r32_cooling.xlsx")
+        self.assertEqual(entry["rows"], 24)
+        self.assertEqual(entry["hashes"], task_resume.gate_hashes(run_dir))
+        self.assertEqual(entry["validation"]["readback"],
+                         {"total": 10, "passed": 10})
+        self.assertEqual(entry["validation"]["issue_delta"]["new_issues"], 0)
+        self.assertEqual(entry["validation"]["source_coverage"]["result"],
+                         "pass")
+        self.assertEqual(entry["validation"]["validate"], "ok")
+        self.assertEqual(entry["mod"]["status"], "resolved")
+        self.assertEqual(entry["spec"]["selected_mod"], "cost_reply")
+        self.assertEqual(entry["timing"], {"machine_ms": 300, "agent_ms": 70})
+
+    def test_13_run_synthetic_only_drafted_gaps_complete(self):
+        """验收：13 run 合成任务 —— gate_summary 只含 drafted run，缺口列
+        完整（state + reason），每 run 哈希三元组独立。"""
+        task = make_synthetic_task(13)
+        ids = [r["id"] for r in task["runs"]]
+        levels = {f"r{i:02d}": ("drafted" if i % 2 == 1 else "gated")
+                  for i in range(1, 11)}
+        levels.update({"r11": "planned", "r12": "compiled",
+                       "r13": "crash_noreceipt"})
+        states = {rid: ("drafted" if levels[rid] in ("drafted", "gated")
+                        else "planned") for rid in ids}
+        for rid, level in levels.items():
+            write_run_at(self.root, rid, level, spec_text=f"spec {rid}")
+        summary = task_gate.collect_gate_summary(
+            task, make_status(ids, states), self.root)
+        self.assertEqual(len(summary["runs"]), 10)  # 只含 drafted/gated
+        self.assertEqual(set(summary["runs"]),
+                         {f"r{i:02d}" for i in range(1, 11)})
+        gaps = {g["run"]: g for g in summary["gaps"]}
+        self.assertEqual(set(gaps), {"r11", "r12", "r13"})
+        self.assertEqual(gaps["r11"]["state"], "planned")
+        self.assertEqual(gaps["r12"]["state"], "compiled")
+        self.assertEqual(gaps["r13"]["state"], "execute_retry")
+        self.assertTrue(all(g["reason"] for g in summary["gaps"]))
+        # 每 run 的哈希三元组绑定自己的呈现内容（spec 各异 → 三元组互异）
+        trios = {rid: tuple(sorted(summary["runs"][rid]["hashes"].items()))
+                 for rid in summary["runs"]}
+        self.assertEqual(len(set(trios.values())), 10)
+
+    def test_terminal_runs_excluded_not_gaps(self):
+        """promoted/superseded 不入呈现、不入缺口（excluded 记录）；已确认
+        未交付（confirmed）作为未决项在 summary["confirmed"] 呈现。"""
+        write_run_at(self.root, "r32-cooling", "promoted")
+        write_run_at(self.root, "r32-heating", "confirmed")
+        write_run_at(self.root, "r410a-cooling", "planned")
+        summary = task_gate.collect_gate_summary(
+            self.task, self.status_of({"r32-cooling": "promoted",
+                                       "r32-heating": "drafted",
+                                       "r410a-cooling": "planned"}),
+            self.root)
+        self.assertEqual(summary["runs"], {})
+        ex = {e["run"]: e for e in summary["excluded"]}
+        self.assertEqual(set(ex), {"r32-cooling"})
+        self.assertEqual(ex["r32-cooling"]["state"], "promoted")
+        self.assertEqual([c["run"] for c in summary["confirmed"]],
+                         ["r32-heating"])
+        self.assertEqual(summary["confirmed"][0]["state"], "confirmed")
+        self.assertEqual([g["run"] for g in summary["gaps"]],
+                         ["r410a-cooling"])
+
+
+class TestConfirmPlanPure(unittest.TestCase):
+    """confirm_plan：呈现集合 vs 当前证据判定（stale / not_presented /
+    skipped_terminal 守卫 + task.yaml 声明顺序的授权顺序）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_gate_plan_"))
+        (self.root / "runs").mkdir(parents=True, exist_ok=True)
+        self.task, self.defect = parse_fixture("task.yaml")
+        assert self.defect is None
+        self.ids = [r["id"] for r in self.task["runs"]]
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def decisions_for(self, levels: dict, states: dict) -> dict:
+        out = {}
+        for rid, level in levels.items():
+            write_run_at(self.root, rid, level, spec_text=f"spec {rid}")
+            facts = task_resume.gather_run_facts(self.root / "runs" / rid)
+            out[rid] = task_resume.classify_run_facts(
+                facts, status_state=states.get(rid))
+        return out
+
+    def test_matching_partition_and_task_order(self):
+        """全匹配：confirm/already_confirmed/promote 按 task.yaml 声明顺序；
+        promoted 跳过且不阻塞。"""
+        decisions = self.decisions_for(
+            {"r32-cooling": "gated", "r32-heating": "gated",
+             "r410a-cooling": "confirmed"},
+            {"r32-cooling": "gated", "r32-heating": "gated",
+             "r410a-cooling": "drafted"})
+        summary = {"runs": {"r32-cooling": {}, "r32-heating": {},
+                            "r410a-cooling": {}}}
+        plan = task_gate.confirm_plan(summary, decisions)
+        self.assertEqual(plan["confirm"], ["r32-cooling", "r32-heating"])
+        self.assertEqual(plan["already_confirmed"], ["r410a-cooling"])
+        self.assertEqual(plan["promote"],
+                         ["r32-cooling", "r32-heating", "r410a-cooling"])
+        self.assertEqual(plan["stale"], [])
+        self.assertEqual(plan["not_presented"], [])
+
+    def test_stale_presented_but_no_longer_confirmable(self):
+        """呈现过的 run 已不可确认（产物回退）→ stale 阻塞；promoted 终态
+        跳过不阻塞。"""
+        decisions = self.decisions_for(
+            {"r32-cooling": "planned", "r32-heating": "gated",
+             "r410a-cooling": "promoted"},
+            {"r32-cooling": "drafted", "r32-heating": "gated",
+             "r410a-cooling": "promoted"})
+        summary = {"runs": {"r32-cooling": {}, "r32-heating": {},
+                            "r410a-cooling": {}}}
+        plan = task_gate.confirm_plan(summary, decisions)
+        self.assertEqual([e["run"] for e in plan["stale"]],
+                         ["r32-cooling"])
+        self.assertEqual(plan["confirm"], ["r32-heating"])
+        self.assertEqual([e["run"] for e in plan["skipped_terminal"]],
+                         ["r410a-cooling"])
+
+    def test_not_presented_blocks_unseen_content(self):
+        """确认时可确认但不在呈现集合（新出现）→ 未呈现的内容不能被授权。"""
+        decisions = self.decisions_for(
+            {"r32-cooling": "gated", "r32-heating": "gated",
+             "r410a-cooling": "planned"},
+            {"r32-cooling": "gated", "r32-heating": "gated",
+             "r410a-cooling": "planned"})
+        summary = {"runs": {"r32-cooling": {}}}  # r32-heating 未被呈现
+        plan = task_gate.confirm_plan(summary, decisions)
+        self.assertEqual([e["run"] for e in plan["not_presented"]],
+                         ["r32-heating"])
+        self.assertEqual(plan["confirm"], ["r32-cooling"])
+
+    def test_confirmed_not_presented_still_promotable(self):
+        """已 confirmed 但不在呈现集合 → 不阻塞：授权已落账（.gate3_confirmed
+        绑定呈现三元组），重试幂等跳过确认仍进 promote（呈现守卫只约束待
+        确认的 gated run —— 未呈现的新授权不被放行）。"""
+        decisions = self.decisions_for(
+            {"r32-cooling": "confirmed"}, {"r32-cooling": "drafted"})
+        plan = task_gate.confirm_plan({"runs": {}}, decisions)
+        self.assertEqual(plan["already_confirmed"], ["r32-cooling"])
+        self.assertEqual(plan["promote"], ["r32-cooling"])
+        self.assertEqual(plan["not_presented"], [])
+
+    def test_terminal_skipped_terminal_named(self):
+        """superseded 标记 → skipped_terminal（跳过且不阻塞）。"""
+        decisions = self.decisions_for(
+            {"r32-cooling": "drafted"}, {"r32-cooling": "superseded"})
+        plan = task_gate.confirm_plan({"runs": {"r32-cooling": {}}},
+                                      decisions)
+        self.assertEqual([e["run"] for e in plan["skipped_terminal"]],
+                         ["r32-cooling"])
+        self.assertEqual(plan["confirm"], [])
+        self.assertEqual(plan["stale"], [])
+
+    def test_refresh_gate_summary_state_evolution(self):
+        """refresh_gate_summary：gate.state 演进（promoted / confirm_failed /
+        promote_failed / noop），per-run 呈现快照不动（被呈现内容的封存）。
+        blocked 不落账：调用方在 refresh 前 fail（GATE_PRESENTATION_
+        MISMATCH）。"""
+        summary = {"schema_version": 1, "runs": {"r1": {"id": "r1"}},
+                   "confirmed": [], "gaps": [], "excluded": []}
+        base = {"plan": {"confirm": [], "already_confirmed": []},
+                "blocked": [], "confirm_failures": [],
+                "promote_failures": [], "confirmed": [],
+                "already_confirmed": [], "promoted": []}
+
+        r = task_gate.refresh_gate_summary(
+            summary, dict(base, confirmed=["r1"], promoted=["r1"]))
+        self.assertEqual(r["gate"]["state"], "promoted")
+        self.assertEqual(r["gate"]["confirmed"], ["r1"])
+        self.assertEqual(r["gate"]["promoted"], ["r1"])
+
+        r = task_gate.refresh_gate_summary(
+            summary, dict(base, confirm_failures=[{"run": "r1"}]))
+        self.assertEqual(r["gate"]["state"], "confirm_failed")
+
+        r = task_gate.refresh_gate_summary(
+            summary, dict(base, promote_failures=[{"run": "r1"}]))
+        self.assertEqual(r["gate"]["state"], "promote_failed")
+
+        r = task_gate.refresh_gate_summary(summary, dict(base))
+        self.assertEqual(r["gate"]["state"], "noop")
+        # per-run 呈现快照不被演进触碰
+        self.assertEqual(r["runs"]["r1"], {"id": "r1"})
+
+
+class TestGateExpand(unittest.TestCase):
+    """run_confirm_expansion（worker 可注入，无 Office）：逐 run 确认独立
+    绑定自己的哈希三元组（真实 execution_gate --confirm subprocess）+
+    promote 阶段（并发契约经 task_scheduler）+ 确认失败整体停止（不
+    promote）+ promote 失败隔离与部分状态推进。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_gate_exp_"))
+        self.task, self.defect = parse_fixture("task.yaml")
+        assert self.defect is None
+        self.ids = [r["id"] for r in self.task["runs"]]
+        (self.root / "runs").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def gated_ctx(self):
+        """3 run 全部 gated 证据（有效 pending 三元组，spec 各异）+
+        索引 gated + 展开 ctx。"""
+        for run in self.task["runs"]:
+            write_run_at(self.root, run["id"], "gated",
+                         spec_text=f"spec {run['id']}")
+        status = make_status(self.ids, {rid: "gated" for rid in self.ids})
+        ctx = {"root": self.root, "runs_dir": self.root / "runs",
+               "final_paths": {run["id"]: task_gate.final_output_path(
+                   self.root, run) for run in self.task["runs"]}}
+        return ctx, status
+
+    def summary_and_plan(self, status) -> tuple[dict, dict]:
+        decisions = {rid: task_resume.classify_run_facts(
+            task_resume.gather_run_facts(self.root / "runs" / rid),
+            status_state=status["runs"][rid]["state"]) for rid in self.ids}
+        summary = task_gate.collect_gate_summary(self.task, status, self.root)
+        return summary, task_gate.confirm_plan(summary, decisions)
+
+    def spy_promote(self):
+        calls: list = []
+
+        def worker_of(_ctx):
+            def worker(rid):
+                calls.append(rid)
+                return {"run": rid, "status": "ok", "artifacts": {}}
+            return worker
+        return calls, worker_of
+
+    def test_success_each_confirmed_trio_bound_independently(self):
+        """逐 run .gate3_confirmed 绑定自己的哈希三元组（3 run 三元组互不
+        相同 —— 聚合不削弱逐 run 授权粒度）；promote 全部执行、状态推进到
+        promoted（单一写者：阶段边界恰写一次）。"""
+        ctx, status = self.gated_ctx()
+        summary, plan = self.summary_and_plan(status)
+        calls, worker_of = self.spy_promote()
+        report = task_gate.run_confirm_expansion(
+            self.root, self.task, status, plan,
+            confirmer=lambda rid: task_gate.default_confirm_worker(ctx, rid),
+            promote_worker_of=worker_of, progress=lambda _: None)
+        self.assertEqual(report["confirm_failures"], [])
+        self.assertEqual(report["promote_failures"], [])
+        self.assertEqual(report["confirmed"], self.ids)
+        self.assertEqual(sorted(calls), sorted(self.ids))  # promote 全部
+        for rid in self.ids:
+            run_dir = self.root / "runs" / rid
+            confirmed = json.loads(
+                (run_dir / ".gate3_confirmed").read_text(encoding="utf-8"))
+            self.assertEqual(confirmed["hashes"],
+                             task_resume.gate_hashes(run_dir))
+            self.assertFalse((run_dir / ".gate3_pending").exists())
+        trios = {rid: tuple(sorted(task_resume.gate_hashes(
+            self.root / "runs" / rid).items())) for rid in self.ids}
+        self.assertEqual(len(set(trios.values())), 3)  # 独立绑定
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        for rid in self.ids:
+            self.assertEqual(status_file["runs"][rid]["state"], "promoted")
+
+    def test_confirm_failure_stops_and_reports_no_promote(self):
+        """模拟某 run 确认失败：整体停止并报告该 run，不继续确认、不进入
+        promote（验收 #3：任一 run 确认失败即停止并报告，不静默跳过）。"""
+        ctx, status = self.gated_ctx()
+        summary, plan = self.summary_and_plan(status)
+        calls, worker_of = self.spy_promote()
+
+        def flaky_confirmer(rid):
+            if rid == "r32-heating":
+                raise task_scheduler.StageError(
+                    "GATE_CONFIRM_FAILED", "模拟确认失败（哈希漂移）",
+                    "重新 --set 呈现后确认")
+            return task_gate.default_confirm_worker(ctx, rid)
+
+        report = task_gate.run_confirm_expansion(
+            self.root, self.task, status, plan,
+            confirmer=flaky_confirmer, promote_worker_of=worker_of,
+            progress=lambda _: None)
+        self.assertEqual([f["run"] for f in report["confirm_failures"]],
+                         ["r32-heating"])
+        self.assertEqual(report["confirmed"], ["r32-cooling"])
+        self.assertEqual(calls, [])  # 不进入 promote
+        self.assertEqual(report["promoted"], [])
+        self.assertFalse(any(
+            (self.root / "runs" / rid / "final_receipt.json").exists()
+            for rid in self.ids))
+        # r32-cooling 已确认（授权落账），r32-heating 未被触碰
+        self.assertTrue(
+            (self.root / "runs" / "r32-cooling" / ".gate3_confirmed").is_file())
+        self.assertTrue(
+            (self.root / "runs" / "r32-heating" / ".gate3_pending").is_file())
+
+    def test_promote_failure_isolated_partial_status(self):
+        """promote 失败 run 不推进状态，同阶段其他 run 不受影响（失败清单
+        汇总；重试幂等 —— 已确认 run 跳过确认仍可重跑 promote）。"""
+        ctx, status = self.gated_ctx()
+        summary, plan = self.summary_and_plan(status)
+        calls: list = []
+
+        def worker_of(_ctx):
+            def worker(rid):
+                calls.append(rid)
+                if rid == "r32-heating":
+                    raise task_scheduler.StageError(
+                        "PROMOTE_FAILED", "模拟 promote 失败",
+                        "修复后重试该 run 的确认展开")
+                return {"run": rid, "status": "ok", "artifacts": {}}
+            return worker
+
+        report = task_gate.run_confirm_expansion(
+            self.root, self.task, status, plan,
+            confirmer=lambda rid: task_gate.default_confirm_worker(ctx, rid),
+            promote_worker_of=worker_of, progress=lambda _: None)
+        self.assertEqual(report["promote_failures"][0]["run"],
+                         "r32-heating")
+        self.assertEqual(sorted(report["promoted"]),
+                         ["r32-cooling", "r410a-cooling"])
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r32-heating"]["state"],
+                         "gated")
+        self.assertEqual(status_file["runs"]["r32-cooling"]["state"],
+                         "promoted")
+
+    def test_blocked_no_expansion(self):
+        """stale/not_presented → blocked，不展开（confirmer/promote 零调用）。"""
+        ctx, status = self.gated_ctx()
+        decision = task_resume.classify_run_facts(
+            task_resume.gather_run_facts(self.root / "runs" / "r32-cooling"),
+            status_state="gated")
+        plan = task_gate.confirm_plan({"runs": {}},
+                                      {"r32-cooling": decision})  # 未呈现
+        called: list = []
+        promote_called: list = []
+
+        def confirmer(rid):
+            called.append(rid)
+            return {"run": rid, "status": "ok", "artifacts": {}}
+
+        def worker_of(_ctx):
+            def worker(rid):
+                promote_called.append(rid)
+                return {"run": rid, "status": "ok", "artifacts": {}}
+            return worker
+
+        report = task_gate.run_confirm_expansion(
+            self.root, self.task, status, plan, confirmer=confirmer,
+            promote_worker_of=worker_of, progress=lambda _: None)
+        self.assertEqual(len(report["blocked"]), 1)
+        self.assertEqual(report["blocked"][0]["code"], "GATE_NOT_PRESENTED")
+        self.assertEqual(called, [])
+        self.assertEqual(promote_called, [])
+
+
+class TestGateTaskCLI(unittest.TestCase):
+    """gate_task.py 公共 CLI seam（无 Office）：聚合呈现 + 确认展开全链路
+    （真实 execution_gate / promote_output subprocess —— 纯 Python +
+    zipfile）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_gate_cli_"))
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def fixture_runs(self) -> dict:
+        task, _ = parse_fixture("task.yaml")
+        return {r["id"]: r for r in task["runs"]}
+
+    def init_and_stage_gated(self) -> dict:
+        """--init + 构造 3 个 gated evidence 的完整可 promote run（pending
+        绑定各自三元组）+ 索引推进 gated（模拟 pipeline 阶段边界推进）。"""
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        by_id = self.fixture_runs()
+        for rid, decl in by_id.items():
+            _, hashes = write_promotable_run(self.root, rid, decl,
+                                             spec_text=f"spec {rid}")
+            add_pending(self.root / "runs" / rid, hashes)
+        status_path = self.root / "task_status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        for rid in by_id:
+            status["runs"][rid]["state"] = "gated"
+        status_path.write_text(json.dumps(status, ensure_ascii=False,
+                                          indent=2), encoding="utf-8")
+        return by_id
+
+    def test_set_without_init_exit3(self):
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_set_aggregates_drafted_only_and_presents(self):
+        """--set：只聚合 Draft 就绪 run；evidence-drafted run 先 --set 呈现
+        （pending 落账 + 索引推进 gated）；planned 入缺口。"""
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        write_run_at(self.root, "r32-cooling", "drafted", spec_text="spec c")
+        write_run_at(self.root, "r32-heating", "gated", spec_text="spec h")
+        write_run_at(self.root, "r410a-cooling", "planned")
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["code"], "GATE_SUMMARY_WRITTEN")
+        summary = json.loads((self.root / "gate_summary.json")
+                             .read_text(encoding="utf-8"))
+        self.assertEqual(set(summary["runs"]),
+                         {"r32-cooling", "r32-heating"})
+        self.assertEqual([g["run"] for g in summary["gaps"]],
+                         ["r410a-cooling"])
+        # evidence-drafted run 已被呈现（pending 落账 + 索引推进 gated）
+        self.assertTrue((self.root / "runs" / "r32-cooling"
+                         / ".gate3_pending").is_file())
+        status = json.loads((self.root / "task_status.json")
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "gated")
+
+    def test_set_nothing_to_present_exit3(self):
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        err = json.loads(proc.stdout)  # _fail_json 结构化 JSON 走 stdout
+        self.assertEqual(err["code"], "GATE_NOTHING_TO_PRESENT")
+        self.assertTrue((self.root / "gate_summary.json").is_file())
+
+    def test_confirm_without_set_exit3(self):
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = run_gate_cli(self.root, "--confirm")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("GATE_SUMMARY_MISSING", proc.stdout)
+
+    def test_full_flow_set_confirm_promote(self):
+        """全链路：--set 呈现（只有 drafted/gated）→ --confirm 逐 run 确认
+        （各自三元组独立绑定）+ promote（outputs/ 落盘，final hash == 已确认
+        draft hash）→ 状态全 promoted；重复 --confirm 是 noop（幂等）。"""
+        by_id = self.init_and_stage_gated()
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        summary = json.loads((self.root / "gate_summary.json")
+                             .read_text(encoding="utf-8"))
+        self.assertEqual(set(summary["runs"]), set(by_id))
+        self.assertEqual(summary["gaps"], [])
+        self.assertEqual(summary["gate"]["state"], "presented")
+
+        proc = run_gate_cli(self.root, "--confirm")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["code"], "GATE_CONFIRMED_AND_PROMOTED")
+        self.assertEqual(out["confirmed"], list(by_id))
+        self.assertEqual(out["promoted"], list(by_id))
+        self.assertEqual(out["gate"]["state"], "promoted")
+        for rid, decl in by_id.items():
+            run_dir = self.root / "runs" / rid
+            confirmed = json.loads(
+                (run_dir / ".gate3_confirmed").read_text(encoding="utf-8"))
+            self.assertEqual(confirmed["hashes"],
+                             task_resume.gate_hashes(run_dir))
+            final = self.root / "outputs" / decl["target"]["output"]
+            self.assertTrue(final.is_file())
+            final_receipt = json.loads(
+                (run_dir / "final_receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(final_receipt["final_sha256"],
+                             task_schema.file_sha256(final))
+            self.assertEqual(
+                final_receipt["draft_sha256"],
+                task_schema.file_sha256(run_dir / "validated_draft.xlsx"))
+        status = json.loads((self.root / "task_status.json")
+                            .read_text(encoding="utf-8"))
+        for rid in by_id:
+            self.assertEqual(status["runs"][rid]["state"], "promoted")
+
+        # 幂等重跑：全部终态 → GATE_NOOP（不重复确认/交付）
+        proc = run_gate_cli(self.root, "--confirm")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["code"], "GATE_NOOP")
+
+    def test_stale_presentation_blocks_without_promote(self):
+        """呈现后 draft 被改动 → --confirm 阻塞（GATE_PRESENTATION_MISMATCH），
+        不做任何 promote（fail-closed：改动即重新授权）。"""
+        by_id = self.init_and_stage_gated()
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        draft = (self.root / "runs" / "r32-heating" / "validated_draft.xlsx")
+        draft.write_bytes(b"tampered-after-presentation")
+        proc = run_gate_cli(self.root, "--confirm")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        err = json.loads(proc.stdout)
+        self.assertEqual(err["code"], "GATE_PRESENTATION_MISMATCH")
+        self.assertEqual([d["run"] for d in err["defects"]],
+                         ["r32-heating"])
+        self.assertFalse((self.root / "outputs").exists())  # 未做任何 promote
+        self.assertTrue((self.root / "runs" / "r32-cooling"
+                         / ".gate3_pending").is_file())  # 未被确认
+
+    def test_inflight_confirm_failure_stops_and_reports(self):
+        """模拟确认展开中某 run 失败（in-process patch confirmer）：整体
+        停止并报告该 run，不继续确认、不做 promote（验收 #3）。"""
+        self.init_and_stage_gated()
+        proc = run_gate_cli(self.root, "--set")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        real_confirm = task_gate.default_confirm_worker
+
+        def flaky(ctx, rid):
+            if rid == "r32-heating":
+                raise task_scheduler.StageError(
+                    "GATE_CONFIRM_FAILED", "模拟确认失败",
+                    "重新 --set 呈现后确认")
+            return real_confirm(ctx, rid)
+
+        out = io.StringIO()
+        with mock.patch.object(task_gate, "default_confirm_worker",
+                               side_effect=flaky), redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                gate_task.run_gate_confirm(self.root)
+        self.assertEqual(cm.exception.code, 3)
+        err = json.loads(out.getvalue())
+        self.assertEqual(err["code"], "GATE_CONFIRM_FAILED")
+        self.assertEqual([d["run"] for d in err["defects"]],
+                         ["r32-heating"])
+        self.assertFalse((self.root / "outputs").exists())  # 不继续 promote
+        self.assertTrue((self.root / "runs" / "r32-cooling"
+                         / ".gate3_confirmed").is_file())
+        self.assertTrue((self.root / "runs" / "r32-heating"
+                         / ".gate3_pending").is_file())
+
+    def test_promote_before_confirm_rejected_fail_closed(self):
+        """确认前 promote 被拒（fail-closed 保持）：promote_output.py 零
+        改动 —— 缺 .gate3_confirmed → GATE_NOT_CONFIRMED（exit 3），
+        no final_receipt / no final output。"""
+        by_id = self.fixture_runs()
+        rid, decl = next(iter(by_id.items()))
+        run_dir, _hashes = write_promotable_run(self.root, rid, decl)
+        self.assertFalse((run_dir / ".gate3_confirmed").exists())
+        proc = subprocess.run(
+            [sys.executable, str(_SCRIPTS_DIR / "promote_output.py"),
+             "--workdir", str(run_dir),
+             "--final", str(task_gate.final_output_path(self.root, decl))],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60)
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+        self.assertIn("GATE_NOT_CONFIRMED", proc.stderr)
+        self.assertFalse((run_dir / "final_receipt.json").exists())
+        self.assertFalse(
+            (self.root / "outputs" / decl["target"]["output"]).exists())
 
 
 if __name__ == "__main__":
