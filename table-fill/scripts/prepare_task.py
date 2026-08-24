@@ -29,7 +29,10 @@ scripts/prepare_task.py — Task 级编排入口（issue 01 + 02 + 03 切片）�
               （--set）后停（fail-closed）：不自动确认、不自动 promote；
               确认展开与 promote 由 gate_task（issue 05）/ resume_task
               （issue 04）承担。
-  --resume    预留：断点恢复在 issue 04（resume_task.py）。
+  --resume    断点恢复不在本脚本：唯一恢复/supersede 入口是
+              scripts/resume_task.py（issue 04 —— resume_task.py --resume /
+              --supersede，产物证据定断点，跳过 promoted/superseded，不绕过
+              Gate、不自动 promote）。
   调度实现：Python 线程池 + subprocess 调用现有脚本（compile_fill.py /
   execute_batch.py / execution_gate.py 本就是独立进程入口），现有脚本零改动。
 

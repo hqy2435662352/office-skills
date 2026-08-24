@@ -67,7 +67,10 @@ KIND_TARGET = "target"
 
 # run 生命周期状态的 prepare 语义（与 task_schema.RUN_STATES 同一集合）：
 # prepare 阶段只允许重建 planned/prepared 的 run；superseded 是保留证据的
-# 终止分支（跳过）；其余状态（compiled+）由 issue 04 的 resume 语义承担。
+# 终止分支（跳过）；其余状态（compiled+）由 issue 04 的 resume 语义承担
+# （resume_task 调用 prepare_task_level 时传 allowed_states=RUN_STATES 放宽
+# RUN_STATE_GUARD —— 断点恢复允许任意状态的 run 进入编排，但每 run 阶段
+# 调度仍由产物证据判定，见 task_resume.schedule_resume）。
 PREPARE_ALLOWED_STATES = ("planned", "prepared")
 SUPERSEDED_STATE = "superseded"
 
@@ -155,9 +158,14 @@ def assemble_run_manifest(workdir, task_label, files, outlines, flattened,
 # ── 任务级串行预演（issue 02 步骤 1–7 + RUN_STATE_GUARD） ───────────────
 
 def prepare_task_level(root: Path, task: dict, manifest: dict,
-                       status: dict) -> dict:
+                       status: dict, *,
+                       allowed_states: tuple = PREPARE_ALLOWED_STATES) -> dict:
     """串行任务级输入事实确定（prelude）：staging + outline + 需求收集 +
     sheet 校验 + 缓存键计算 + 指纹 + 冻结校验 + 快照补全 + RUN_STATE_GUARD。
+
+    allowed_states 控制 RUN_STATE_GUARD 的允许集合（implementation 默认
+    planned/prepared；issue 04 的 resume 传 RUN_STATES —— 断点恢复允许
+    任意状态进入编排，是否执行某阶段由 task_resume 的产物证据判定决定）。
 
     全部为任务级 fail-closed 检查（缺陷走 fail()）；返回 ctx 供阶段 1/2
     worker 使用（stage worker 绝不触碰 task_status.json —— 单一写者）。
@@ -210,7 +218,8 @@ def prepare_task_level(root: Path, task: dict, manifest: dict,
     if prev_staged and prev_staged != staged_files:
         fail("SOURCE_HASH_DRIFT",
              "staged 文件登记与已封存快照不一致（源文件内容或路径变化）",
-             "失败二分：输入事实改变 → supersede（issue 04）；尚无 run 产物时"
+             "失败二分：输入事实改变 → supersede（resume_task.py --supersede "
+             "--map 旧run=新run 标记废弃并链接新版本）；尚无 run 产物时"
              "删除 task_manifest.json/task_status.json 重新 --init")
 
     # ── 3. 任务级 outline（每文件一次；已登记且文件未变 → 零 officecli 复用） ──
@@ -280,17 +289,17 @@ def prepare_task_level(root: Path, task: dict, manifest: dict,
         for key in unique_keys
     }
 
-    # ── RUN_STATE_GUARD（任务级前置）：prepare 只允许重建 planned/prepared ──
+    # ── RUN_STATE_GUARD（任务级前置）：prepare 只允许重建 allowed_states ──
     status_runs = status["runs"]
     guard_defects = []
     for rid, entry_state in status_runs.items():
         state = entry_state.get("state")
-        if state not in PREPARE_ALLOWED_STATES + (SUPERSEDED_STATE,):
+        if state not in tuple(allowed_states) + (SUPERSEDED_STATE,):
             guard_defects.append({
                 "code": "RUN_STATE_GUARD",
                 "at": f"runs/{rid}",
-                "message": f"run {rid} 已推进到 {state}（prepare 只允许 "
-                           f"{'/'.join(PREPARE_ALLOWED_STATES)} 的 run 重建）",
+                "message": f"run {rid} 已推进到 {state}（本入口只允许重建 "
+                           f"{'/'.join(allowed_states)} 状态的 run）",
                 "corrective_action": "保留现有产物；恢复语义由 resume_task"
                                      "（issue 04）承担",
             })
@@ -349,12 +358,12 @@ def finalize_cache_facts(ctx: dict) -> None:
     if prev_refs and prev_refs != ctx["cache_refs"]:
         fail("CACHE_REF_DRIFT",
              "缓存键引用与已封存快照不一致（officecli 升级或源 hash 漂移）",
-             "失败二分：输入事实改变 → supersede（issue 04）；否则删除缓存与"
-             "快照后重新 --init/--prepare")
+             "失败二分：输入事实改变 → supersede（resume_task.py "
+             "--supersede）；否则删除缓存与快照后重新 --init/--prepare")
     if prev_fps and prev_fps != fingerprints:
         fail("FINGERPRINT_DRIFT",
              "结构指纹与已封存快照不一致",
-             "输入事实改变 → supersede（issue 04）")
+             "输入事实改变 → supersede（resume_task.py --supersede）")
 
     # 封存快照补全（--init 骨架 → prepare 事实；只授权一次写）
     if not (manifest.get("staged_files") or []):

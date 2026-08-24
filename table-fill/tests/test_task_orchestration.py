@@ -1,5 +1,6 @@
 """Tests for the Task Artifact Model — issue 01 (spec S2) + Shared Flatten
-Cache (issue 02, spec S3/S4/S5) + Stage Orchestrator (issue 03, spec S6).
+Cache (issue 02, spec S3/S4/S5) + Stage Orchestrator (issue 03, spec S6) +
+Lifecycle / Resume / Supersede (issue 04, spec S7).
 
 Issue 01 coverage (two pre-agreed seams from spec Testing Decision #3):
   1. task_schema.py pure functions (import seam): validate_task_yaml /
@@ -39,6 +40,32 @@ Issue 03 coverage (scheduler core = pure orchestration seam, fake workers,
   13. prepare_task.py --run guards (no Office): needs --init first, stale
       manifest fails closed — same prelude contract as --prepare.
 
+Issue 04 coverage (lifecycle / resume / supersede; checkpoint determination
+= artifact existence + SHA-256, NO Office — spec S7 / Testing Decision #2):
+  14. task_resume.gather_run_facts / classify_run_facts — the spec S7
+      scenario matrix: no artifacts→planned; manifest valid + materialized
+      hash match→prepared; plan fill_spec_sha256 + input_hashes→compiled;
+      draft+receipt→drafted; **draft w/o receipt or hash mismatch (execute
+      crash window)→execute_retry**; pending trio valid→gated (no bypass);
+      final receipt→promoted; superseded→skip (--rebuild re-enters);
+      receipt binding drift→blocked + supersede suggestion;
+      materialized drift→planned (re-materialize).
+  15. task_resume.schedule_resume — decisions → stage plan (barrier order,
+      empty stages dropped, terminal states never scheduled).
+  16. task_resume.resume_with_ctx — fake workers: resume continues from the
+      actual checkpoint at every level, skips promoted/superseded, does not
+      re-run pending gates, gate stage runs only for drafted+ runs whose
+      own execute passed (failure isolation), status advances at stage
+      boundaries only.
+  17. resume_task.py CLI — guards (manifest required, stale manifest blocks
+      with supersede suggestion) + full --supersede flow (re-derive +
+      mark superseded + superseded_by link) + supersede precondition
+      defects (unknown old/new, already superseded, unmapped changed run,
+      removed run, chain/duplicate maps).
+  18. Source hash drift blocks resume prelude (SOURCE_HASH_DRIFT) with
+      supersede suggestion — acceptance #3 (in-process seam, officecli
+      probes patched).
+
 No Office involvement: cache/meta/digest fixtures are synthesized text;
 classify_columns.py / structure_digest.py are pure text subprocesses.
 
@@ -50,6 +77,7 @@ Run with:
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import shutil
 import subprocess
@@ -58,7 +86,9 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS_DIR = SKILL_ROOT / "scripts"
@@ -69,15 +99,26 @@ import task_schema  # noqa: E402
 import flatten_cache  # noqa: E402
 import task_prepare  # noqa: E402
 import task_scheduler  # noqa: E402
+import task_resume  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "_fixtures" / "task_orchestration"
 PREPARE_TASK = _SCRIPTS_DIR / "prepare_task.py"
+RESUME_TASK = _SCRIPTS_DIR / "resume_task.py"
 VALID_RUN_IDS = {"r32-cooling", "r32-heating", "r410a-cooling"}
 
 
 def run_cli(task_root: Path, mode: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(PREPARE_TASK), "--task-root", str(task_root), mode],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60,
+    )
+
+
+def run_resume_cli(task_root: Path, *args: str) -> subprocess.CompletedProcess:
+    """resume_task.py 的公共 CLI seam（无 Office 前置守卫 / --supersede）。"""
+    return subprocess.run(
+        [sys.executable, str(RESUME_TASK), "--task-root", str(task_root), *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=60,
     )
@@ -1217,6 +1258,1103 @@ class TestPrepareTaskCLIRun(unittest.TestCase):
             shutil.rmtree(empty, ignore_errors=True)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("TASK_YAML_NOT_FOUND", proc.stderr)
+
+
+# ── issue 04: Lifecycle / Resume / Supersede（spec S7） ─────────────────────
+
+def write_run_at(root: Path, rid: str, level: str, *,
+                 status_state: str | None = None) -> Path:
+    """在合成任务根下按断点层级生成一个 run 目录（纯文件系统 + 真实 SHA-256，
+    无 Office）。level ∈ planned / prepared / compiled / drafted /
+    crash_noreceipt / crash_receipt_mismatch / gated / confirmed / promoted /
+    binding_spec_changed / binding_plan_changed / materialized_modified。
+    返回 run_dir。"""
+    run_dir = root / "runs" / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    staged = run_dir / "parameter_book.xlsx"
+    staged.write_bytes(b"source-bytes")
+    tpl = run_dir / "filling_template.xlsx"
+    tpl.write_bytes(b"template-bytes")
+
+    if level in ("prepared", "compiled", "drafted", "crash_noreceipt",
+                 "crash_receipt_mismatch", "gated", "confirmed", "promoted",
+                 "binding_spec_changed", "binding_plan_changed",
+                 "materialized_modified"):
+        csv = run_dir / "parameter_book_R32_flat.csv"
+        csv.write_bytes(b"header\n1,2,3\n")
+        meta = run_dir / "parameter_book_R32_flat_meta.json"
+        meta.write_text('{"schema_version": 1, "row_gaps": []}',
+                        encoding="utf-8")
+        digest = run_dir / "parameter_book_R32_flat_digest.md"
+        digest.write_text("digest\n", encoding="utf-8")
+        manifest = {
+            "schema_version": 2,
+            "workdir": str(run_dir),
+            "task": "egypt-params-2026a",
+            "files": [
+                {"staged": "parameter_book.xlsx",
+                 "source": "sources/parameter_book.xlsx",
+                 "sha256": task_schema.file_sha256(staged)},
+                {"staged": "filling_template.xlsx",
+                 "source": "templates/filling_template.xlsx",
+                 "sha256": task_schema.file_sha256(tpl)},
+            ],
+            "outlines": {},
+            "flattened": [{
+                "name": "parameter_book_R32_flat", "file": "parameter_book.xlsx",
+                "sheet": "R32参数", "csv": csv.name, "meta": meta.name,
+                "digest": digest.name,
+                "sha256": task_schema.file_sha256(csv)},
+            ],
+            "target": {"file": "filling_template.xlsx", "sheet": "Sheet1"},
+            "fingerprints": {}, "row_gaps": {}, "style_granularity": {},
+        }
+        (run_dir / "prepare_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if level in ("compiled", "drafted", "crash_noreceipt",
+                 "crash_receipt_mismatch", "gated", "confirmed", "promoted",
+                 "binding_spec_changed", "binding_plan_changed"):
+        spec = run_dir / "fill_spec.yaml"
+        spec.write_text("fill_spec: level\n", encoding="utf-8")
+        plan = {
+            "schema_version": "2.5",
+            "fill_spec_sha256": task_schema.file_sha256(spec),
+            "target": "filling_template.xlsx", "target_sheet": "Sheet1",
+            "input_hashes": {"parameter_book.xlsx":
+                             task_schema.file_sha256(staged),
+                             "filling_template.xlsx":
+                             task_schema.file_sha256(tpl)},
+            "fingerprints": {}, "blocks": [], "operations": [],
+        }
+        (run_dir / "execution_plan.json").write_text(
+            json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    if level in ("drafted", "crash_noreceipt", "crash_receipt_mismatch",
+                 "gated", "confirmed", "promoted", "binding_spec_changed",
+                 "binding_plan_changed"):
+        draft = run_dir / "validated_draft.xlsx"
+        draft.write_bytes(b"draft-bytes")
+        receipt = {
+            "schema_version": "2.5",
+            "fill_spec_sha256": task_schema.file_sha256(spec),
+            "execution_plan_sha256":
+                task_schema.file_sha256(run_dir / "execution_plan.json"),
+            "draft_sha256": (task_schema.file_sha256(draft)
+                             if level != "crash_receipt_mismatch"
+                             else "0" * 64),
+            "draft_path": str(draft),
+        }
+        if level != "crash_noreceipt":
+            (run_dir / "draft_receipt.json").write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+
+    # execute 之后输入事实改变：receipt 绑定的是“变更前”的 spec/plan
+    if level == "binding_spec_changed":
+        spec.write_text("fill_spec: level_changed\n", encoding="utf-8")
+    if level == "binding_plan_changed":
+        plan_path = run_dir / "execution_plan.json"
+        plan_path.write_text('{"schema_version": "2.5", "regenerated": true}',
+                             encoding="utf-8")
+
+    if level == "gated":
+        trio = {
+            "fill_spec_sha256":
+                task_schema.file_sha256(run_dir / "fill_spec.yaml"),
+            "execution_plan_sha256":
+                task_schema.file_sha256(run_dir / "execution_plan.json"),
+            "draft_sha256":
+                task_schema.file_sha256(run_dir / "validated_draft.xlsx"),
+        }
+        (run_dir / ".gate3_pending").write_text(json.dumps(
+            {"presented_at": "2026-08-23T00:00:00Z", "hashes": trio},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if level == "confirmed":
+        trio = {
+            "fill_spec_sha256":
+                task_schema.file_sha256(run_dir / "fill_spec.yaml"),
+            "execution_plan_sha256":
+                task_schema.file_sha256(run_dir / "execution_plan.json"),
+            "draft_sha256":
+                task_schema.file_sha256(run_dir / "validated_draft.xlsx"),
+        }
+        (run_dir / ".gate3_confirmed").write_text(json.dumps(
+            {"confirmed_at": "2026-08-23T00:01:00Z", "hashes": trio},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if level == "promoted":
+        (run_dir / "final_receipt.json").write_text(
+            json.dumps({"schema_version": 2}), encoding="utf-8")
+
+    if level == "materialized_modified":
+        # 物化 CSV 被改动 → manifest 登记的 sha256 不再匹配
+        csv = run_dir / "parameter_book_R32_flat.csv"
+        csv.write_bytes(b"tampered-bytes")
+
+    return run_dir
+
+
+def make_status(task_ids, states: dict):
+    """合成 task_status.json 形态（runs: {id: {state, superseded_by}}）。"""
+    return {
+        "schema_version": 1,
+        "task": {"id": "egypt-params-2026a", "yaml": "task.yaml",
+                 "yaml_sha256": "ab" * 32},
+        "runs": {rid: {"state": states.get(rid, "planned"),
+                       "superseded_by": None} for rid in sorted(task_ids)},
+        "updated_at": "2026-08-23T00:00:00Z",
+    }
+
+
+class TestClassifyRunFacts(unittest.TestCase):
+    """spec S7 断点判定场景矩阵（验收：矩阵全部通过，含 execute crash
+    window 用例）。status 只提供 superseded 标记，其余全部由产物证据裁决 ——
+    status 不是真值源。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_classify_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def classify(self, rid, level, *, status_state=None, rebuild=False):
+        run_dir = write_run_at(self.root, rid, level)
+        facts = task_resume.gather_run_facts(run_dir)
+        decision = task_resume.classify_run_facts(
+            facts, status_state=status_state, rebuild=rebuild)
+        return decision, run_dir, facts
+
+    def test_no_artifacts_planned_stage1(self):
+        """无产物 → planned → 阶段 1 起."""
+        decision, _, _ = self.classify("r1", "planned")
+        self.assertEqual(decision["status"], "planned")
+        self.assertEqual(decision["needs"], ["source_prepare", "run_prepare",
+                                             "compile", "execute", "gate"])
+
+    def test_manifest_valid_prepared(self):
+        """manifest 有效 + 物化产物 hash 匹配 → prepared → 跳过阶段 2."""
+        decision, _, _ = self.classify("r1", "prepared")
+        self.assertEqual(decision["status"], "prepared")
+        self.assertEqual(decision["needs"], ["compile", "execute", "gate"])
+
+    def test_drifted_materialization_planned(self):
+        """物化产物 hash 与 manifest 不符 → 降级 planned（重新物化）。"""
+        decision, _, _ = self.classify("r1", "materialized_modified")
+        self.assertEqual(decision["status"], "planned")
+
+    def test_plan_valid_compiled(self):
+        """plan 的 fill_spec_sha256 匹配 + input_hashes 绑定有效 → compiled
+        → 跳过阶段 3."""
+        decision, _, _ = self.classify("r1", "compiled")
+        self.assertEqual(decision["status"], "compiled")
+        self.assertEqual(decision["needs"], ["execute", "gate"])
+
+    def test_spec_changed_before_compile_prepared(self):
+        """fill_spec 在 compile 前被改 → plan 绑定失效 → 降级 prepared
+        （重新 compile，输入事实此时仍可重试）。"""
+        root = Path(tempfile.mkdtemp(prefix="task_classify2_"))
+        try:
+            run_dir = write_run_at(root, "r1", "compiled")
+            spec = run_dir / "fill_spec.yaml"
+            spec.write_text("fill_spec: edited\n", encoding="utf-8")
+            decision = task_resume.classify_run_facts(
+                task_resume.gather_run_facts(run_dir))
+            self.assertEqual(decision["status"], "prepared")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_draft_with_receipt_drafted(self):
+        """draft 存在 + receipt.draft_sha256 匹配 → drafted → 直接进 gate."""
+        decision, _, _ = self.classify("r1", "drafted")
+        self.assertEqual(decision["status"], "drafted")
+        self.assertEqual(decision["needs"], ["gate"])
+
+    def test_crash_window_no_receipt_execute_retry(self):
+        """**execute crash window**：draft 存在但 receipt 缺失 → 重跑 execute."""
+        decision, _, _ = self.classify("r1", "crash_noreceipt")
+        self.assertEqual(decision["status"], "execute_retry")
+        self.assertEqual(decision["needs"], ["execute", "gate"])
+
+    def test_crash_window_receipt_mismatch_execute_retry(self):
+        """**execute crash window**：draft 存在但 receipt.draft_sha256 不匹配
+        → 重跑 execute."""
+        decision, _, _ = self.classify("r1", "crash_receipt_mismatch")
+        self.assertEqual(decision["status"], "execute_retry")
+        self.assertEqual(decision["needs"], ["execute", "gate"])
+
+    def test_gated_pending_valid_waits_no_bypass(self):
+        """.gate3_pending 有效（hash 三元组匹配）→ gated → 等待确认，不绕过
+        （needs 为空，不重跑任何阶段）。"""
+        decision, _, _ = self.classify("r1", "gated")
+        self.assertEqual(decision["status"], "gated")
+        self.assertEqual(decision["needs"], [])
+        self.assertIn("等待人工确认", decision["reason"])
+
+    def test_pending_drifted_reexecutes(self):
+        """pending 失效（三元组不匹配：draft 在呈现后被改动）→ receipt 证据
+        失效 → execute_retry 重跑（不绕过、不把未验证的 draft 重新呈现）。"""
+        root = Path(tempfile.mkdtemp(prefix="task_classify3_"))
+        try:
+            run_dir = write_run_at(root, "r1", "gated")
+            # draft 在呈现后被改动 → 三元组漂移 + receipt.draft_sha256 失效
+            draft = run_dir / "validated_draft.xlsx"
+            draft.write_bytes(b"changed-draft")
+            decision = task_resume.classify_run_facts(
+                task_resume.gather_run_facts(run_dir))
+            self.assertEqual(decision["status"], "execute_retry")
+            self.assertEqual(decision["needs"], ["execute", "gate"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_pending_without_draft_reexecutes(self):
+        """pending 存在但 draft 缺失（三元组无法成立）→ 不视为 gated，回落到
+        compiled → 重跑 execute + gate。"""
+        root = Path(tempfile.mkdtemp(prefix="task_classify3b_"))
+        try:
+            run_dir = write_run_at(root, "gated", "gated")
+            (run_dir / "validated_draft.xlsx").unlink()
+            decision = task_resume.classify_run_facts(
+                task_resume.gather_run_facts(run_dir))
+            self.assertEqual(decision["status"], "compiled")
+            self.assertEqual(decision["needs"], ["execute", "gate"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_confirmed_valid_waits_promote(self):
+        """.gate3_confirmed 有效且未 promote → confirmed（promote 由 gate_task
+        展开；resume 不自动 promote）。"""
+        decision, _, _ = self.classify("r1", "confirmed")
+        self.assertEqual(decision["status"], "confirmed")
+        self.assertEqual(decision["needs"], [])
+        self.assertIn("gate_task", decision["reason"])
+
+    def test_final_receipt_promoted(self):
+        """final_receipt 存在 → promoted → 跳过."""
+        decision, _, _ = self.classify("r1", "promoted")
+        self.assertEqual(decision["status"], "promoted")
+        self.assertEqual(decision["needs"], [])
+        self.assertIn("跳过", decision["reason"])
+
+    def test_superseded_skipped_unless_rebuild(self):
+        """superseded → 跳过；显式 rebuild → 按产物证据重入主路径."""
+        run_dir = write_run_at(self.root, "r1", "planned")
+        decision = task_resume.classify_run_facts(
+            task_resume.gather_run_facts(run_dir), status_state="superseded")
+        self.assertEqual(decision["status"], "superseded")
+        self.assertEqual(decision["needs"], [])
+        decision_rb = task_resume.classify_run_facts(
+            task_resume.gather_run_facts(run_dir), status_state="superseded",
+            rebuild=True)
+        self.assertEqual(decision_rb["status"], "planned")
+
+    def test_receipt_binding_drift_blocked_supersede(self):
+        """execute 后 spec 被改（receipt 绑定失效）→ 阻塞并建议 supersede,
+        不继续旧 run."""
+        for level in ("binding_spec_changed", "binding_plan_changed"):
+            with self.subTest(level=level):
+                decision, _, _ = self.classify("r1", level)
+                self.assertEqual(decision["status"], "blocked")
+                self.assertEqual(decision["needs"], [])
+                self.assertEqual(decision["blocked"]["code"],
+                                 "RUN_INPUT_CHANGED")
+                self.assertIn("supersede",
+                              decision["blocked"]["corrective_action"])
+
+    def test_status_only_superseded_flag_not_truth(self):
+        """status 只是生命周期索引：artifacts 说 drafted 而 status 说 planned
+        时，判定必须由产物裁决（drafted），status 字段不参与判定。"""
+        root = Path(tempfile.mkdtemp(prefix="task_classify4_"))
+        try:
+            run_dir = write_run_at(root, "r1", "drafted")
+            decision = task_resume.classify_run_facts(
+                task_resume.gather_run_facts(run_dir),
+                status_state="planned")
+            self.assertEqual(decision["status"], "drafted")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_promoted_wins_over_pending(self):
+        """final_receipt 优先于 gate marker（已交付的 run 不再被 gate
+        等待态吸附）。"""
+        root = Path(tempfile.mkdtemp(prefix="task_classify5_"))
+        try:
+            run_dir = write_run_at(root, "r1", "gated")
+            (run_dir / "final_receipt.json").write_text(
+                json.dumps({"schema_version": 2}), encoding="utf-8")
+            decision = task_resume.classify_run_facts(
+                task_resume.gather_run_facts(run_dir))
+            self.assertEqual(decision["status"], "promoted")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class TestScheduleResume(unittest.TestCase):
+    """判定集合 → 阶段计划（纯函数）：STAGES 顺序、空阶段不执行、终态/
+    等待态/阻塞态永不调度。"""
+
+    def decision(self, status):
+        return {"status": status, "needs": [],
+                "reason": "", "evidence": {}}
+
+    def test_planned_covers_all_stages_in_order(self):
+        """planned run 覆盖 resume 主路径全部阶段（source_prepare →
+        run_prepare → compile → execute → gate；resume 不含 promote ——
+        promote 由 gate_task 展开）。"""
+        schedule = task_resume.schedule_resume({"a": self.decision("planned")})
+        self.assertEqual(list(schedule), list(task_prepare.RUN_STAGES))
+        self.assertEqual(schedule["source_prepare"], ["a"])
+        self.assertEqual(schedule["gate"], ["a"])
+
+    def test_terminal_states_never_scheduled(self):
+        decisions = {rid: self.decision(s)
+                     for rid, s in [("g", "gated"), ("c", "confirmed"),
+                                    ("p", "promoted"), ("s", "superseded"),
+                                    ("b", "blocked")]}
+        self.assertEqual(task_resume.schedule_resume(decisions), {})
+
+    def test_prepared_skips_stage1_2(self):
+        schedule = task_resume.schedule_resume({"a": self.decision("prepared")})
+        self.assertEqual(list(schedule), ["compile", "execute", "gate"])
+
+    def test_drafted_only_gate(self):
+        schedule = task_resume.schedule_resume({"a": self.decision("drafted")})
+        self.assertEqual(list(schedule), ["gate"])
+        self.assertEqual(schedule["gate"], ["a"])
+
+    def test_execute_retry_reschedules_execute_and_gate(self):
+        schedule = task_resume.schedule_resume(
+            {"a": self.decision("execute_retry")})
+        self.assertEqual(list(schedule), ["execute", "gate"])
+
+    def test_mixed_schedule_preserves_run_order(self):
+        decisions = {"r1": self.decision("planned"),
+                     "r2": self.decision("drafted")}
+        schedule = task_resume.schedule_resume(decisions)
+        self.assertEqual(schedule["source_prepare"], ["r1"])
+        self.assertEqual(schedule["gate"], ["r1", "r2"])
+
+
+class TestResumePipeline(unittest.TestCase):
+    """resume_with_ctx 恢复编排（fake worker，无 Office）：模拟各阶段中断后
+    从实际断点继续；跳过 promoted/superseded；gated 不绕过；阶段失败 run
+    不进后续阶段（失败隔离）；status 阶段边界推进。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_resume_pipe_"))
+        (self.root / "runs").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_pipeline(self, levels: dict, states: dict, *, rebuild=False):
+        """levels: rid → checkpoint level（None = 不生成产物目录）；
+        states: rid → status state。返回 (report, log)；log 是 worker 调用
+        (stage, item) 记录，多 item 阶段的到达顺序不定（比较时自行排序）。"""
+        for rid, level in levels.items():
+            if level is not None:
+                write_run_at(self.root, rid, level)
+        status = make_status(list(levels), states)
+        ctx = {"root": self.root,
+               "runs_dir": self.root / "runs",
+               "status_runs": status["runs"],
+               # 阶段 1 的 item 域是缓存键（cache_build_worker 契约）；单键
+               # 即可驱动 planned run 的 source_prepare 阶段（fake worker）
+               "unique_keys": ["ck"]}
+        log: list = []
+
+        def worker_of(stage):
+            def worker(item):
+                log.append((stage, item))
+                return {"run": item, "status": "ok", "artifacts": {}}
+            return worker
+
+        with mock.patch.object(task_prepare, "finalize_cache_facts",
+                               return_value=None):
+            report = task_resume.resume_with_ctx(ctx, status,
+                                                 rebuild=rebuild,
+                                                 worker_of=worker_of)
+        return report, log
+
+    def test_planned_run_runs_all_stages_and_advances_status(self):
+        """无产物 run：5 阶段全部执行，status 推进到 gated（不自动越过
+        gate —— 编排止于 gate 呈现，不进入 promote）。"""
+        report, log = self.run_pipeline({"r1": "planned"},
+                                        {"r1": "planned"})
+        # 阶段 1 的 worker 收到的是缓存键（"ck"），不是 run id
+        self.assertEqual(log, [("source_prepare", "ck"),
+                               ("run_prepare", "r1"), ("compile", "r1"),
+                               ("execute", "r1"), ("gate", "r1")])
+        self.assertEqual(report["checkpoints"]["r1"]["status"], "planned")
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r1"]["state"], "gated")
+        self.assertTrue(report["gate_presented"])
+
+    def test_each_checkpoint_resumes_from_actual_breakpoint(self):
+        """模拟中断：prepared/compiled/drafted/crash window 各层级中断后，
+        恢复只执行断点之后的阶段（验收：resume 均从实际断点继续）。"""
+        cases = [
+            ("prepared", "prepared",
+             [("compile", "r1"), ("execute", "r1"), ("gate", "r1")]),
+            ("compiled", "compiled",
+             [("execute", "r1"), ("gate", "r1")]),
+            ("crash_noreceipt", "compiled",
+             [("execute", "r1"), ("gate", "r1")]),
+            ("crash_receipt_mismatch", "compiled",
+             [("execute", "r1"), ("gate", "r1")]),
+            ("drafted", "drafted", [("gate", "r1")]),
+        ]
+        for level, state, expected in cases:
+            with self.subTest(level=level):
+                report, log = self.run_pipeline({"r1": level},
+                                                {"r1": state})
+                self.assertEqual(log, expected)
+                self.assertEqual(report["checkpoints"]["r1"]["needs"],
+                                 [s for s, _ in expected])
+
+    def test_promoted_and_superseded_skipped(self):
+        """promoted / superseded run 跳过（不执行任何阶段）。"""
+        report, log = self.run_pipeline(
+            {"r1": "promoted", "r2": "planned"},
+            {"r1": "promoted", "r2": "superseded"})
+        # r1 有产物但 status 标 superseded → 跳过；r2 promoted → 跳过
+        self.assertEqual(report["skipped"]["promoted"], ["r1"])
+        self.assertEqual(report["skipped"]["superseded"], ["r2"])
+        self.assertEqual(log, [])
+
+    def test_gated_pending_not_bypassed(self):
+        """.gate3_pending 有效 → 等待确认：不执行任何阶段、不重新 --set、
+        不自动 promote（fail-closed）。"""
+        report, log = self.run_pipeline({"r1": "gated"}, {"r1": "gated"})
+        self.assertEqual(log, [])
+        self.assertEqual(report["gated_pending"], ["r1"])
+        self.assertFalse(report["gate_presented"])
+
+    def test_confirmed_run_left_for_gate_task(self):
+        """.gate3_confirmed 有效 → confirmed：resume 不触碰（promote 由
+        gate_task 展开）。"""
+        report, log = self.run_pipeline({"r1": "confirmed"},
+                                        {"r1": "drafted"})
+        self.assertEqual(log, [])
+        self.assertEqual(report["confirmed"], ["r1"])
+
+    def test_blocked_run_not_continued_supersede_suggested(self):
+        """.blocked (输入事实改变) → 不调度任何阶段，整体报告 supersede 建议."""
+        report, log = self.run_pipeline({"r1": "binding_spec_changed"},
+                                        {"r1": "compiled"})
+        self.assertEqual(log, [])
+        self.assertEqual(len(report["blocked"]), 1)
+        self.assertEqual(report["blocked"][0]["code"], "RUN_INPUT_CHANGED")
+        self.assertIn("supersede", report["blocked"][0]["corrective_action"])
+
+    def test_mixed_task_skips_and_continues(self):
+        """.混合任务：planned/prepared/compiled/crash 只跑所需阶段；gated 等
+        待；promoted/superseded 跳过。"""
+        levels = {"r-p": "planned", "r-pr": "prepared", "r-c": "compiled",
+                  "r-d": "drafted", "r-crash": "crash_noreceipt",
+                  "r-g": "gated", "r-f": "confirmed", "r-m": "promoted",
+                  "r-s": None, "r-b": "binding_plan_changed"}
+        states = {"r-p": "planned", "r-pr": "prepared", "r-c": "compiled",
+                  "r-d": "drafted", "r-crash": "compiled", "r-g": "gated",
+                  "r-f": "drafted", "r-m": "promoted", "r-s": "superseded",
+                  "r-b": "compiled"}
+        report, log = self.run_pipeline(levels, states)
+        expected = [
+            ("source_prepare", "ck"),
+            ("run_prepare", "r-p"),
+            ("compile", "r-p"), ("compile", "r-pr"),
+            ("execute", "r-p"), ("execute", "r-pr"), ("execute", "r-c"),
+            ("execute", "r-crash"),
+            ("gate", "r-p"), ("gate", "r-pr"), ("gate", "r-c"),
+            ("gate", "r-crash"), ("gate", "r-d"),
+        ]
+        self.assertEqual(sorted(log), sorted(expected))
+        self.assertEqual(set(report["skipped"]["promoted"]), {"r-m"})
+        self.assertEqual(set(report["skipped"]["superseded"]), {"r-s"})
+        self.assertEqual(report["gated_pending"], ["r-g"])
+        self.assertEqual(report["confirmed"], ["r-f"])
+        self.assertEqual([b["run"] for b in report["blocked"]], ["r-b"])
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        for rid in ("r-p", "r-pr", "r-c", "r-crash", "r-d"):
+            self.assertEqual(status_file["runs"][rid]["state"], "gated")
+        self.assertEqual(status_file["runs"]["r-g"]["state"], "gated")
+        self.assertEqual(status_file["runs"]["r-f"]["state"], "drafted")
+        self.assertEqual(status_file["runs"]["r-m"]["state"], "promoted")
+        self.assertEqual(status_file["runs"]["r-s"]["state"], "superseded")
+        self.assertEqual(status_file["runs"]["r-b"]["state"], "compiled")
+
+    def test_rebuild_reactivates_superseded_run(self):
+        """验收：superseded → 默认跳过，显式 --rebuild 重新进入主路径且
+        状态索引能随阶段推进（不会因 superseded 索引卡在 apply 前驱集外）。"""
+        # 默认：跳过
+        report_skip, log_skip = self.run_pipeline(
+            {"r1": "planned"}, {"r1": "superseded"})
+        self.assertEqual(log_skip, [])
+        self.assertEqual(report_skip["skipped"]["superseded"], ["r1"])
+        # --rebuild：状态索引复位 planned → 五阶段全部执行 → 推进到 gated
+        report_rb, log_rb = self.run_pipeline(
+            {"r1": "planned"}, {"r1": "superseded"}, rebuild=True)
+        self.assertEqual(log_rb, [("source_prepare", "ck"),
+                                   ("run_prepare", "r1"), ("compile", "r1"),
+                                   ("execute", "r1"), ("gate", "r1")])
+        self.assertEqual(report_rb["skipped"]["superseded"], [])
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r1"]["state"], "gated")
+        self.assertIsNone(status_file["runs"]["r1"]["superseded_by"])
+
+    def test_rebuild_resumes_from_artifact_evidence(self):
+        """--rebuild 的 superseded run 按产物证据接续（如已 drafted → 只补
+        gate 呈现，不重跑前序阶段），索引复位到 drafted 后可正常推进。"""
+        report, log = self.run_pipeline(
+            {"r1": "drafted"}, {"r1": "superseded"}, rebuild=True)
+        self.assertEqual(log, [("gate", "r1")])
+        self.assertEqual(report["checkpoints"]["r1"]["status"], "drafted")
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r1"]["state"], "gated")
+
+    def test_gated_index_does_not_suppress_crash_window(self):
+        """status 索引停在 gated 但产物证据是 crash window（pending 漂移后
+        draft 无 receipt）→ execute + gate 仍被调度（证据裁决，不因索引
+        等待）；gate 重新呈现后索引保持 gated（等待确认，不绕过）。"""
+        report, log = self.run_pipeline(
+            {"r1": "crash_noreceipt"}, {"r1": "gated"})
+        self.assertEqual(log, [("execute", "r1"), ("gate", "r1")])
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r1"]["state"], "gated")
+
+    def test_failed_execute_run_excluded_from_gate(self):
+        """阶段失败隔离：execute 失败的 run 不进 gate 阶段（不会对无有效
+        draft 的 run 执行 --set），同阶段其他 run 不受影响。"""
+        status = make_status(["r1", "r2"], {"r1": "compiled",
+                                            "r2": "compiled"})
+        write_run_at(self.root, "r1", "compiled")
+        write_run_at(self.root, "r2", "compiled")
+        ctx = {"root": self.root, "runs_dir": self.root / "runs",
+               "status_runs": status["runs"]}
+        log: list = []
+
+        def worker_of(stage):
+            def worker(item):
+                log.append((stage, item))
+                if stage == "execute" and item == "r2":
+                    raise task_scheduler.StageError(
+                        "EXECUTE_FAILED", "模拟执行失败", "修复后重试")
+                return {"run": item, "status": "ok", "artifacts": {}}
+            return worker
+
+        with mock.patch.object(task_prepare, "finalize_cache_facts",
+                               return_value=None):
+            report = task_resume.resume_with_ctx(ctx, status,
+                                                 worker_of=worker_of)
+        self.assertEqual(sorted(log), [("execute", "r1"), ("execute", "r2"),
+                                       ("gate", "r1")])
+        codes = [f["code"] for f in report["failures"]]
+        self.assertIn("EXECUTE_FAILED", codes)
+        self.assertEqual([f["run"] for f in report["failures"]], ["r2"])
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r1"]["state"], "gated")
+        self.assertEqual(status_file["runs"]["r2"]["state"], "compiled")
+
+
+class TestSupersedePure(unittest.TestCase):
+    """supersede 的纯函数层：mapping 校验矩阵 + 状态演进（不重置未涉 run）。"""
+
+    def setUp(self):
+        task, defect = task_schema.parse_task_yaml(
+            (FIX / "task.yaml").read_text(encoding="utf-8"))
+        assert defect is None
+        self.task = task
+        # 新版本 run 声明（supersede 前置：先入 task.yaml 再 mapping）
+        self.task_with_v2 = json.loads(json.dumps(task))
+        self.task_with_v2["runs"].append({
+            "id": "r32-heating_v2",
+            "source": {"file": "sources/parameter_book.xlsx",
+                       "sheets": ["R32参数"]},
+            "target": {"template": "templates/filling_template.xlsx",
+                       "sheet": "Sheet1",
+                       "output": "out_r32_heating_v2.xlsx"},
+        })
+        self.status = task_schema.derive_task_status(
+            self.task, "ab" * 32, updated_at="2026-08-23T00:00:00Z")
+        self.manifest = task_schema.derive_task_manifest(
+            self.task, "ab" * 32, frozen_at="2026-08-23T00:00:00Z")
+        # 模拟推进：r32-cooling 已 gated（不得被 supersede 重置）
+        self.status["runs"]["r32-cooling"] = {"state": "gated",
+                                              "superseded_by": None}
+
+    def codes(self, mappings, task=None):
+        return [d["code"] for d in task_resume.validate_supersede(
+            task or self.task_with_v2, self.manifest, self.status, mappings)]
+
+    def test_valid_mapping_passes(self):
+        codes = self.codes([("r32-heating", "r32-heating_v2")])
+        self.assertEqual(codes, [])
+
+    def test_self_link_rejected(self):
+        self.assertIn("MAPPING_SELF_LINK",
+                      self.codes([("r32-heating", "r32-heating")]))
+
+    def test_unknown_old_rejected(self):
+        self.assertIn("RUN_NOT_FOUND",
+                      self.codes([("ghost", "r32-heating_v2")]))
+
+    def test_undeclared_new_rejected(self):
+        """new 未在 task.yaml 声明 → 拒绝（新版本必须先入声明）。"""
+        self.assertIn("RUN_NOT_FOUND",
+                      self.codes([("r32-heating", "not-declared-v2")]))
+
+    def test_already_superseded_rejected(self):
+        self.status["runs"]["r32-heating"] = {"state": "superseded",
+                                              "superseded_by": "old-v2"}
+        self.assertIn("RUN_ALREADY_SUPERSEDED",
+                      self.codes([("r32-heating", "r32-heating_v2")]))
+
+    def test_chain_and_duplicates_rejected(self):
+        self.assertIn("MAPPING_CHAIN", self.codes(
+            [("r32-heating", "r32-cooling"),
+             ("r32-cooling", "r410a-cooling")]))
+        self.assertIn("MAPPING_DUPLICATE_NEW", self.codes(
+            [("r32-heating", "r32-heating_v2"),
+             ("r410a-cooling", "r32-heating_v2")]))
+        self.assertIn("MAPPING_DUPLICATE_OLD", self.codes(
+            [("r32-heating", "r32-heating_v2"),
+             ("r32-heating", "r32-heating_v3")]))
+
+    def test_removed_old_run_rejected(self):
+        """旧 run 从 task.yaml 删除 → 拒绝（superseded 状态在 status 延续，
+        旧声明必须保留）。"""
+        task = json.loads(json.dumps(self.task_with_v2))
+        task["runs"] = [r for r in task["runs"] if r["id"] != "r32-cooling"]
+        defects = task_resume.validate_supersede(
+            task, self.manifest, self.status,
+            [("r32-heating", "r32-heating_v2")])
+        self.assertIn("RUN_REMOVED_FROM_TASK_YAML",
+                      [d["code"] for d in defects])
+        # 同时声明被改动的 r32-heating 已 mapping → 无 UNMAPPED
+        self.assertNotIn("UNMAPPED_RUN_CHANGED",
+                         [d["code"] for d in defects])
+
+    def test_unmapped_changed_run_rejected(self):
+        """声明被改动（含源 sheet）且未 mapping 的 run → 拒绝
+        （防“改了声明但不标记废弃”的静默错误）。"""
+        task = json.loads(json.dumps(self.task_with_v2))
+        for run in task["runs"]:
+            if run["id"] == "r32-cooling":
+                run["source"]["sheets"] = ["R32参数"]
+        defects = task_resume.validate_supersede(
+            task, self.manifest, self.status,
+            [("r32-heating", "r32-heating_v2")])
+        self.assertIn("UNMAPPED_RUN_CHANGED", [d["code"] for d in defects])
+        self.assertEqual(defects[0]["at"], "task.yaml/runs/r32-cooling")
+
+    def test_cosmetic_template_family_change_not_blocking(self):
+        """template_family（仅记录，D6 不实现）改动不视为业务声明变化。"""
+        task = json.loads(json.dumps(self.task_with_v2))
+        for run in task["runs"]:
+            if run["id"] == "r32-cooling":
+                run["template_family"] = "changed 记录"
+        codes = [d["code"] for d in task_resume.validate_supersede(
+            task, self.manifest, self.status,
+            [("r32-heating", "r32-heating_v2")])]
+        self.assertEqual(codes, [])
+
+    def test_supersede_status_preserves_untouched_runs(self):
+        """状态演进：旧 run superseded + superseded_by 链接新版本；task.yaml
+        新增 run 初始化 planned；未涉 run 状态原样（gated 不被重置）；task
+        绑定指纹刷新。"""
+        task = json.loads(json.dumps(self.task))
+        task["runs"].append({
+            "id": "r32-heating_v2",
+            "source": {"file": "sources/parameter_book.xlsx",
+                       "sheets": ["R32参数"]},
+            "target": {"template": "templates/filling_template.xlsx",
+                       "sheet": "Sheet1",
+                       "output": "out_r32_heating_v2.xlsx"},
+        })
+        new_status = task_resume.supersede_status(
+            self.status, task, "cd" * 32,
+            [("r32-heating", "r32-heating_v2")])
+        self.assertEqual(new_status["runs"]["r32-heating"]["state"],
+                         "superseded")
+        self.assertEqual(new_status["runs"]["r32-heating"]["superseded_by"],
+                         "r32-heating_v2")
+        self.assertEqual(new_status["runs"]["r32-heating_v2"]["state"],
+                         "planned")
+        self.assertEqual(new_status["runs"]["r32-cooling"]["state"], "gated")
+        self.assertEqual(
+            new_status["task"]["yaml_sha256"], "cd" * 32)
+        # 与 task.yaml 的一一对应契约保持（check_status 应通过）
+        problems = task_schema.check_status(task, new_status, "cd" * 32)
+        self.assertEqual(problems, [])
+
+
+class TestResumeTaskCLI(unittest.TestCase):
+    """resume_task.py 公共 CLI seam（无 Office）：前置守卫 + --supersede
+    全流程 + 前置缺陷矩阵。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_resume_cli_"))
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def yaml_hash(self):
+        return task_schema.file_sha256(self.root / "task.yaml")
+
+    def add_v2_run_to_yaml(self, rid="r32-heating",
+                           new_id="r32-heating_v2"):
+        """在 task.yaml 追加一个新版本 run 声明（旧 run 保留）。"""
+        with (self.root / "task.yaml").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n  - id: {new_id}\n"
+                     "    source:\n"
+                     "      file: sources/parameter_book.xlsx\n"
+                     "      sheets: [R32参数]\n"
+                     "    target:\n"
+                     "      template: templates/filling_template.xlsx\n"
+                     "      sheet: Sheet1\n"
+                     f"      output: out_{new_id}.xlsx\n")
+
+    def test_resume_without_init_exit3(self):
+        proc = run_resume_cli(self.root, "--resume")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_resume_stale_manifest_blocks_with_supersede_suggestion(self):
+        """task.yaml 修改 → 冻结快照不一致 → resume 阻塞（fail-closed，不静默
+        重派生）；corrective 指向 supersede。"""
+        run_cli(self.root, "--init")
+        with (self.root / "task.yaml").open("a", encoding="utf-8") as fh:
+            fh.write("\n# 输入事实变化 — 快照已冻结\n")
+        proc = run_resume_cli(self.root, "--resume")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("MANIFEST_STALE", proc.stderr)
+        err = json.loads(proc.stderr)
+        action = err["defects"][0]["corrective_action"]
+        self.assertIn("supersede", action)
+
+    def test_resume_without_task_yaml_exit1(self):
+        empty = Path(tempfile.mkdtemp(prefix="task_resume_empty_"))
+        try:
+            proc = run_resume_cli(empty, "--resume")
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("TASK_YAML_NOT_FOUND", proc.stderr)
+
+    def test_resume_requires_init_derived_files(self):
+        """--init 未跑（只有 task.yaml）→ exit 3 指向 --init。"""
+        proc = run_resume_cli(self.root, "--resume")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_MANIFEST_MISSING", proc.stderr)
+
+    def test_supersede_full_flow(self):
+        """验收 ✓ 全流程：声明新版本 → --supersede --map → 重派生快照 +
+        状态演进；随后 --init/--validate 一致通过。"""
+        run_cli(self.root, "--init")
+        self.add_v2_run_to_yaml()
+        proc = run_resume_cli(
+            self.root, "--supersede", "--map", "r32-heating=r32-heating_v2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["status"], "PASS")
+        self.assertEqual(out["code"], "TASK_SUPERSEDED")
+        self.assertEqual(out["superseded"][0]["old"], "r32-heating")
+        self.assertEqual(out["superseded"][0]["new"], "r32-heating_v2")
+
+        manifest = json.loads((self.root / "task_manifest.json")
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(manifest["task"]["yaml_sha256"], self.yaml_hash())
+        self.assertIn("r32-heating_v2", manifest["runs"])
+        self.assertIn("r32-heating", manifest["runs"])  # 旧声明保留
+        self.assertEqual(manifest["staged_files"], [])  # 新快照等 prepare 补全
+        self.assertGreater(manifest["frozen_at"], "2026-08-23")  # 重新封存
+
+        status = json.loads((self.root / "task_status.json")
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(status["runs"]["r32-heating"]["state"],
+                         "superseded")
+        self.assertEqual(status["runs"]["r32-heating"]["superseded_by"],
+                         "r32-heating_v2")
+        self.assertEqual(status["runs"]["r32-heating_v2"]["state"],
+                         "planned")
+        self.assertEqual(status["runs"]["r32-cooling"]["state"], "planned")
+        self.assertEqual(status["task"]["yaml_sha256"], self.yaml_hash())
+
+        # 一致性保持：--init / --validate 均通过（run id 一一对应 + 合法状态）
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = run_cli(self.root, "--validate")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_supersede_twice_rejected(self):
+        run_cli(self.root, "--init")
+        self.add_v2_run_to_yaml()
+        ok = run_resume_cli(self.root, "--supersede", "--map",
+                            "r32-heating=r32-heating_v2")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        again = run_resume_cli(self.root, "--supersede", "--map",
+                               "r32-heating=r32-heating_v2")
+        self.assertEqual(again.returncode, 3, again.stderr)
+        self.assertIn("RUN_ALREADY_SUPERSEDED", again.stderr)
+
+    def test_supersede_precondition_defects(self):
+        run_cli(self.root, "--init")
+        cases = [
+            (["--map", "ghost=ghost_v2"], "RUN_NOT_FOUND"),      # old 不存在
+            (["--map", "r32-heating=nope"], "RUN_NOT_FOUND"),    # new 未声明
+            (["--map", "r32-heating=r32-heating"], "MAPPING_SELF_LINK"),
+        ]
+        for args, code in cases:
+            with self.subTest(code=code):
+                proc = run_resume_cli(self.root, "--supersede", *args)
+                self.assertEqual(proc.returncode, 3, proc.stderr)
+                self.assertIn(code, proc.stderr)
+
+    def test_supersede_unmapped_changed_run_rejected(self):
+        """声明被改动且未 mapping 的 run → 整体拒绝（先改声明后 supersede
+        其他 run 时，被改 run 必须一并 mapping）；拒绝时不写任何文件。"""
+        run_cli(self.root, "--init")
+        original_hash = self.yaml_hash()  # --init 时封存的绑定指纹
+        self.add_v2_run_to_yaml()
+        yaml_path = self.root / "task.yaml"
+        text = yaml_path.read_text(encoding="utf-8")
+        yaml_path.write_text(text.replace("sheets: [R32参数, R410A参数]",
+                                          "sheets: [R32参数]"),
+                             encoding="utf-8")
+        proc = run_resume_cli(self.root, "--supersede", "--map",
+                              "r32-heating=r32-heating_v2")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("UNMAPPED_RUN_CHANGED", proc.stderr)
+        # 拒绝时不得写入任何文件：manifest 指纹仍绑定旧 task.yaml，status 原样
+        manifest = json.loads((self.root / "task_manifest.json")
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(manifest["task"]["yaml_sha256"], original_hash)
+        status = json.loads((self.root / "task_status.json")
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(status["runs"]["r32-heating"]["state"], "planned")
+
+    def test_supersede_removed_run_rejected(self):
+        """旧 run 从 task.yaml 删除 → 拒绝（保留旧声明是 superseded 契约）。"""
+        run_cli(self.root, "--init")
+        self.add_v2_run_to_yaml()
+        yaml_path = self.root / "task.yaml"
+        lines = yaml_path.read_text(encoding="utf-8").splitlines()
+        # 删除 r32-cooling 声明块（固定行距，见 fixture task.yaml）
+        start = next(i for i, ln in enumerate(lines)
+                     if "id: r32-cooling" in ln)
+        end = next(i for i, ln in enumerate(lines)
+                   if "id: r32-heating" in ln)
+        del lines[start:end]
+        yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = run_resume_cli(self.root, "--supersede", "--map",
+                              "r32-heating=r32-heating_v2")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("RUN_REMOVED_FROM_TASK_YAML", proc.stderr)
+
+    def test_supersede_without_map_exit3(self):
+        run_cli(self.root, "--init")
+        proc = run_resume_cli(self.root, "--supersede")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("MAPPING_REQUIRED", proc.stderr)
+
+    def test_supersede_bad_map_format_exit3(self):
+        run_cli(self.root, "--init")
+        proc = run_resume_cli(self.root, "--supersede", "--map", "noequals")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("MAPPING_FORMAT", proc.stderr)
+
+    def test_supersede_without_init_exit3(self):
+        proc = run_resume_cli(self.root, "--supersede", "--map",
+                              "r32-heating=r32-heating_v2")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("TASK_DERIVED_MISSING", proc.stderr)
+
+
+class TestResumeDriftBlocked(unittest.TestCase):
+    """验收：源文件 hash 变化 → resume 前置阻塞（SOURCE_HASH_DRIFT）并给出
+    supersede 建议，不继续旧 run（in-process seam，officecli 探测打桩）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_resume_drift_"))
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+        run_cli(self.root, "--init")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_source_hash_drift_blocks_and_suggests_supersede(self):
+        from prepare_task import _load_derived
+
+        task, _y, manifest, status = _load_derived(
+            self.root, require_existing=True)
+        with _Patches(_probe_patches()):
+            ctx = task_prepare.prepare_task_level(
+                self.root, task, manifest, status,
+                allowed_states=task_schema.RUN_STATES)
+        # 模拟 finalize_cache_facts 的 staged_files 封存（漂移检查只依赖
+        # staged_files；cache refs/指纹补全属于 prepare 阶段，此处不涉及）
+        manifest["staged_files"] = ctx["staged_files"]
+        (self.root / task_schema.TASK_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+        # 源文件内容变化（模拟用户更新数据源）
+        source = self.root / "sources" / "parameter_book.xlsx"
+        with source.open("ab") as fh:
+            fh.write(b"source-changed")
+
+        err = io.StringIO()
+        with _Patches(_probe_patches()), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                task_prepare.prepare_task_level(
+                    self.root, task, manifest, status,
+                    allowed_states=task_schema.RUN_STATES)
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("SOURCE_HASH_DRIFT", err.getvalue())
+        self.assertIn("supersede", err.getvalue())
+
+    def test_unchanged_inputs_resume_prelude_passes(self):
+        """输入未变时 resume 前置通过（无漂移），无 SystemExit。"""
+        from prepare_task import _load_derived
+
+        task, _y, manifest, status = _load_derived(
+            self.root, require_existing=True)
+        with _Patches(_probe_patches()):
+            ctx = task_prepare.prepare_task_level(
+                self.root, task, manifest, status,
+                allowed_states=task_schema.RUN_STATES)
+        manifest["staged_files"] = ctx["staged_files"]
+        (self.root / task_schema.TASK_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        with _Patches(_probe_patches()):
+            ctx2 = task_prepare.prepare_task_level(
+                self.root, task, manifest, status,
+                allowed_states=task_schema.RUN_STATES)
+        self.assertEqual(ctx2["task_id"], "egypt-params-2026a")
+
+
+class _Patches:
+    """批量 mock patch 上下文（无依赖第三方 mock 库）。"""
+
+    def __init__(self, patches):
+        self._patches = patches
+
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.stop()
+        return False
+
+
+def _probe_patches():
+    """officecli 探测打桩（prelude 的 check_resident/版本探测/outline 探测）：
+    让 prepare_task_level 在无 officecli 环境跑通（真实 staging/hash，只打桩
+    officecli 触点）。fake outline 按 staged 文件名给出 fixture 的真实 sheet。"""
+
+    def fake_outline(path):
+        name = Path(path).name
+        if name.startswith("parameter_book"):
+            sheets = [{"name": "R32参数"}, {"name": "R410A参数"}]
+        else:
+            sheets = [{"name": "Sheet1"}]
+        return {"data": {"sheets": sheets}}
+
+    return [
+        mock.patch.object(task_prepare.preflight, "check_resident_cleanup"),
+        mock.patch.object(task_prepare.flatten_cache, "officecli_version",
+                          return_value="1.0.144-test"),
+        mock.patch.object(task_prepare, "officecli_outline",
+                          side_effect=fake_outline),
+    ]
+
+
+def _seed_cache_hits(root: Path, ctx: dict) -> None:
+    """为 ctx 的全部唯一缓存键预建白名单三产物（cache_hit 只查存在性）：
+    阶段 1 全命中、零 officecli（顶层契约：物化产物由测试确定）。meta 带一
+    个非空列，使 classify_columns 产出非空 column_classifications（空列 section
+    会被 PyYAML 解析为 None，触发 structure_digest 既有的空节遍历缺失）。"""
+    for key in ctx["unique_keys"]:
+        entry = flatten_cache.cache_entry_dir(root, key)
+        entry.mkdir(parents=True, exist_ok=True)
+        (entry / "flat.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+        (entry / "meta.json").write_text(json.dumps({
+            "schema_version": 1, "file": "seeded.xlsx", "sheet": "seeded",
+            "dimensions": {"rows": 2, "cols": 2, "data_rows": 1},
+            "columns": [{"col": "A", "nonempty": 1, "numeric_ratio": 1.0,
+                         "unique": 1, "samples": ["1"]}],
+            "row_gaps": [], "style_granularity": {}},
+            ensure_ascii=False), encoding="utf-8")
+        (entry / "digest.md").write_text("seeded digest\n", encoding="utf-8")
+
+
+class TestResumeRealWorkers(unittest.TestCase):
+    """真实默认 worker 路径（无 Office）：阶段 1 的 item 域是缓存键而非 run
+    id（cache_build_worker 契约）；命中路径零 officecli。验收 #2 的生产路径
+    段 —— 恢复编排在真实 worker 下从断点继续（阶段 1/2 真跑，compile 因缺
+    fill_spec 聚合 FILL_SPEC_MISSING，绝不出现 WORKER_RAISED 的键寻址崩溃）。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="task_resume_real_"))
+        shutil.copytree(FIX, self.root, dirs_exist_ok=True)
+        proc = run_cli(self.root, "--init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        from prepare_task import _load_derived
+        self._load_derived = _load_derived
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_stage1_items_are_cache_keys_not_run_ids(self):
+        """planned run（无产物）走真实 worker：阶段 1 用缓存键调度（全命中），
+        阶段 2 真实物化成功；compile 缺 fill_spec 聚合 FILL_SPEC_MISSING，
+        没有任何 WORKER_RAISED（run id 误入缓存键域会在这里崩溃）。"""
+        task, _y, manifest, status = self._load_derived(
+            self.root, require_existing=True)
+        with _Patches(_probe_patches()):
+            ctx = task_prepare.prepare_task_level(
+                self.root, task, manifest, status,
+                allowed_states=task_schema.RUN_STATES)
+            _seed_cache_hits(self.root, ctx)
+            report = task_resume.resume_with_ctx(ctx, status,
+                                                 progress=lambda _: None)
+
+        by_stage = {sr["stage"]: sr for sr in report["stages"]}
+        # 阶段 1：item 域 = 唯一缓存键（3 个），全命中 → 零 officecli
+        self.assertEqual(report["checkpoints"]["r32-cooling"]["status"],
+                         "planned")
+        sr1 = by_stage["source_prepare"]
+        self.assertEqual(sr1["items"], 3)
+        self.assertEqual(len(sr1["ok"]), 3)
+        self.assertEqual(sum(1 for r in sr1["ok"]
+                             if r["artifacts"].get("hit")), 3)
+        # 阶段 2：真实 run_prepare_worker 成功（物化 = 纯文本 subprocess）
+        sr2 = by_stage["run_prepare"]
+        self.assertEqual(len(sr2["ok"]), 3)
+        self.assertTrue(all(
+            (self.root / "runs" / rid / "prepare_manifest.json").is_file()
+            for rid in VALID_RUN_IDS))
+        # 阶段 3：缺 fill_spec → FILL_SPEC_MISSING（不是键寻址崩溃）
+        codes = {f["code"] for f in report["failures"]}
+        self.assertEqual(codes, {"FILL_SPEC_MISSING"})
+        self.assertNotIn("WORKER_RAISED", codes)
+        # 阶段边界状态推进：prepared（compile 失败前）
+        status_file = json.loads(
+            (self.root / "task_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status_file["runs"]["r32-cooling"]["state"],
+                         "prepared")
 
 
 if __name__ == "__main__":
