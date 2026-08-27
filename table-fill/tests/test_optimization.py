@@ -4952,6 +4952,46 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertTrue(p.is_file(), "缺 references/CAPABILITY_EVIDENCE.md")
         return p.read_text(encoding="utf-8")
 
+    def _skill_routing_section(self) -> str:
+        """SKILL.md §1.5 Task Shape Check (Routing V2) 区域 (防跨章节误伤)."""
+        text = self._skill_md_text()
+        m = re.search(r"^### 1\.5 Task Shape Check.*?(?=^### 2\. )",
+                      text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "SKILL.md 缺 §1.5 Task Shape Check 段")
+        return m.group(0)
+
+    def _capability_evidence_section0(self) -> str:
+        """CAPABILITY_EVIDENCE.md §0 (能力适用性 × 执行选择) 区域."""
+        text = self._capability_evidence_text()
+        m = re.search(r"^## 0\..*?(?=^## 1\.)", text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "CAPABILITY_EVIDENCE.md 缺 §0 区域")
+        return m.group(0)
+
+    def _table_rows_after(self, text: str,
+                          header_cells: tuple[str, ...]) -> list[list[str]]:
+        """定位以指定表头单元格开头的 markdown 表格, 返回其数据行单元格
+        列表 (剥掉反引号与首尾空白, 跳过 --- 分隔行); 表后第一个非表行停止."""
+        header_re = r"^\|\s*" + r"\s*\|\s*".join(
+            re.escape(h) for h in header_cells) + r"\s*\|"
+        m = re.search(header_re, text, re.MULTILINE)
+        self.assertIsNotNone(
+            m, f"缺表头行: {' | '.join(header_cells)}")
+        rows: list[list[str]] = []
+        for line in text[m.end():].splitlines():
+            line = line.rstrip()
+            if not line:
+                continue  # 表头后首个换行产生的空串, 跳过
+            if not line.startswith("|"):
+                break
+            if re.fullmatch(
+                    r"\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|", line):
+                continue  # 分隔行
+            cells = [c.strip().strip("`") for c in
+                     line.strip().strip("|").split("|")]
+            rows.append(cells)
+        return rows
+
     def test_skill_md_capability_resolution_trigger(self):
         """SKILL.md 撰写规程: Capability Question 按需触发指针 + 三态 + 两项
         预算 + TASK MODE 禁区 + Run Verification 不可跳过 (防新停止规则被误删)."""
@@ -5002,6 +5042,236 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("Standard Evidence Paths", evidence)
         self.assertIn("Extra Capability Probe", evidence)
         self.assertIn("Bounded Rescue", evidence)
+
+    # ── issue 04 (task-shape-routing) + issue 03 (routing-v2):
+    #    路由术语一致性 + Routing V2 架构不变量守卫 ──
+
+    def test_skill_md_task_shape_routing_terms(self):
+        """SKILL.md 含 Routing V2 分流路由术语 (§1.5, tickets 01/03 落地):
+        Task Shape Check / grid_record / form_content / mixed / uncertain /
+        officecli_native / combined / obvious_grid / task_shape /
+        task_shape.json / NOT_APPLICABLE — 防章节被误删或路由词被误改回 V1."""
+        text = self._skill_md_text()
+        for word in ("Task Shape Check", "grid_record", "form_content",
+                     "mixed", "uncertain", "officecli_native", "combined",
+                     "obvious_grid", "task_shape", "task_shape.json",
+                     "NOT_APPLICABLE", "officecli native"):
+            self.assertIn(word, text, f"SKILL.md 缺任务形态路由词 {word!r}")
+
+    def test_capability_evidence_task_shape_matrix_terms(self):
+        """CAPABILITY_EVIDENCE.md §0 重构为两张正交表 (issue 02/03, R2-Q6):
+        能力语义表 (0.1) 恰好两行基础 workload, FillSpec Model 列 =
+        APPLICABLE / NOT_APPLICABLE (grid 行 APPLICABLE, non-grid 行
+        NOT_APPLICABLE; mixed 不占行); 路由决策表 (0.2) 四行且含 combined;
+        旧式 1:1 单矩阵不得回归 — §0 无 Executor 列名、能力表行不绑
+        fillspec/officecli_native 路由词."""
+        section0 = self._capability_evidence_section0()
+        # 旧职责适用部分: §0 仍携带两层语义词 (产品层 SUPPORTED / 引擎层
+        # NOT_APPLICABLE / 路由 fillspec·officecli_native / Task Shape 联动)
+        for word in ("Task Shape", "SUPPORTED", "NOT_APPLICABLE", "fillspec",
+                     "officecli_native"):
+            self.assertIn(word, section0,
+                          f"CAPABILITY_EVIDENCE.md §0 缺两表语义词 {word!r}")
+        # 旧式 1:1 矩阵回归禁止: 无 Executor 列名 (列曾把 shape 绑死执行器)
+        self.assertNotIn("Executor", section0,
+                         "§0 不得回归旧单矩阵的 Executor 列 (1:1 绑定)")
+        # 0.1 能力语义表 code block = 表头 + 恰好两行
+        m = re.search(r"### 0\.1.*?```text\n(.*?)```", section0, re.DOTALL)
+        self.assertIsNotNone(m, "§0 缺 0.1 能力语义表 code block")
+        block = m.group(1).strip().splitlines()
+        self.assertEqual(len(block), 3,
+                         "能力语义表必须为表头 + 恰好两行基础 workload")
+        self.assertIn("FillSpec Model", block[0], "能力表缺 FillSpec Model 列")
+        self.assertIn("table-fill Product", block[0])
+        grid_row = block[1]
+        self.assertIn("Grid / record transformation", grid_row)
+        self.assertIn("APPLICABLE", grid_row,
+                      "grid 行 FillSpec Model 列必须是 APPLICABLE (不是 SUPPORTED)")
+        self.assertIn("SUPPORTED", grid_row, "grid 行产品层仍 SUPPORTED")
+        self.assertNotIn("fillspec", grid_row,
+                         "能力表行不得绑执行路由 (旧 1:1 矩阵写法)")
+        non_grid_row = block[2]
+        self.assertIn("Non-grid Office operation", non_grid_row)
+        self.assertIn("NOT_APPLICABLE", non_grid_row,
+                      "non-grid 行 FillSpec Model 列必须是 NOT_APPLICABLE")
+        self.assertIn("SUPPORTED", non_grid_row)
+        self.assertNotIn("officecli_native", non_grid_row,
+                         "能力表行不得绑执行路由 (旧 1:1 矩阵写法)")
+        self.assertIn("不占行", section0,
+                      "§0 必须声明 mixed 不占能力表行")
+        # 0.2 路由决策表: 四行 (Fast Path / Direct / Non-Grid / Combined)
+        rows = self._table_rows_after(
+            section0, ("Workload situation", "route", "典型 evidence"))
+        self.assertEqual(len(rows), 4, "路由决策表必须恰好四行")
+        routes = [r[1] for r in rows]
+        self.assertIn("combined", routes,
+                      "路由决策表必须含 combined (第 4 行 Combined 分支)")
+        self.assertTrue(all(r in ("fillspec", "officecli_native", "combined")
+                            for r in routes),
+                        f"路由决策表 route 值越界: {routes!r}")
+
+    def test_capability_evidence_form_content_not_unsupported_drift_guard(self):
+        """防措辞回退 (issue 02/03, R2-Q6): form_content 不再占能力表行,
+        但任何把 form_content 标成 UNSUPPORTED / Known Rejected 的语境仍是
+        红线 — 对 §0 中含 form_content 的每一行做行作用域负断言 (0.6 纪律句
+        本身含反例词但不同现一行, 防自伤); 且 0.6 措辞纪律声明必须存在:
+        NOT_APPLICABLE ≠ UNSUPPORTED / ≠ Known Rejected."""
+        section0 = self._capability_evidence_section0()
+        for line in section0.splitlines():
+            if "form_content" not in line:
+                continue
+            self.assertNotIn("UNSUPPORTED", line,
+                             f"含 form_content 的行不得标 UNSUPPORTED: {line!r}")
+            self.assertNotIn("Known Rejected", line,
+                             f"含 form_content 的行不得标 Known Rejected: {line!r}")
+        m = re.search(r"### 0\.6 措辞纪律", section0)
+        self.assertIsNotNone(m, "§0 缺 0.6 措辞纪律段")
+        stripped = re.sub(r"[\s`]", "", section0[m.end():])
+        self.assertIn("NOT_APPLICABLE≠UNSUPPORTED", stripped,
+                      "0.6 缺 NOT_APPLICABLE ≠ UNSUPPORTED 声明")
+        self.assertIn("NOT_APPLICABLE≠KnownRejected", stripped,
+                      "0.6 缺 NOT_APPLICABLE ≠ Known Rejected 声明")
+
+    def test_skill_md_routing_shape_domain_four_values(self):
+        """§1.5 值域表 shape 维度恰好四值: grid_record / form_content /
+        mixed / uncertain (R2-Q1: shape 新增且仅新增 mixed, V1 三态 → V2
+        四态; direct 永不作为 shape)."""
+        section = self._skill_routing_section()
+        rows = self._table_rows_after(
+            section, ("task_shape", "含义", "合法 route", "典型 evidence"))
+        self.assertEqual(len(rows), 4, "task_shape 值域表必须恰好四行")
+        shapes = {r[0] for r in rows}
+        self.assertEqual(
+            shapes, {"grid_record", "form_content", "mixed", "uncertain"},
+            "task_shape 值域表缺值或混入非法 shape 值")
+        self.assertIn("永不作为 shape", section,
+                      "§1.5 缺 direct 永不作为 shape 锚点句")
+
+    def test_skill_md_routing_route_domain_three_values_no_hybrid(self):
+        """§1.5 route 值域恰好三值: fillspec / officecli_native / combined
+        (R2-Q1: 用 combined 而非 hybrid); 值域表 '合法 route' 列各分支绑定
+        正确 (grid_record → fillspec/officecli_native, form_content →
+        officecli_native, mixed → combined, uncertain 不落 route);
+        hybrid 不得作为 route 值出现在 §1.5 路由语境."""
+        section = self._skill_routing_section()
+        rows = self._table_rows_after(
+            section, ("task_shape", "含义", "合法 route", "典型 evidence"))
+        by_shape = {r[0]: r[2] for r in rows}
+        self.assertIn("fillspec", by_shape["grid_record"],
+                      "grid_record 合法 route 缺 fillspec (Fast Path)")
+        self.assertIn("officecli_native", by_shape["grid_record"],
+                      "grid_record 合法 route 缺 officecli_native (Direct)")
+        self.assertEqual(by_shape["form_content"], "officecli_native",
+                         "form_content 合法 route 必须是 officecli_native")
+        self.assertEqual(by_shape["mixed"], "combined",
+                         "mixed 合法 route 必须是 combined (改回 hybrid 变红)")
+        self.assertIn("不落执行", by_shape["uncertain"],
+                      "uncertain 是临时判定态, 不落执行 route")
+        stripped = re.sub(r"[\s`]", "", section)
+        self.assertIn("route值域仅fillspec/officecli_native/combined",
+                      stripped, "§1.5 缺 route 值域仅三值定义句")
+        self.assertNotIn("hybrid", stripped,
+                         "hybrid 不得作为 route 值出现在 §1.5 路由语境")
+
+    def test_capability_evidence_route_domain_three_values_no_hybrid(self):
+        """§0.2 路由决策表 route 值域恰好三值: fillspec / officecli_native /
+        combined (R2-Q1); route 定义句声明仅三值; 0.6 消歧陈述 (combined ≠
+        hybrid, 点名 FILLSPEC "hybrid overflow") 是 hybrid 唯一合法语境 —
+        路由决策表行与定义句不得含 hybrid (最小作用域, 防误伤消歧句)."""
+        section0 = self._capability_evidence_section0()
+        rows = self._table_rows_after(
+            section0, ("Workload situation", "route", "典型 evidence"))
+        routes = {r[1] for r in rows}
+        self.assertEqual(
+            routes, {"fillspec", "officecli_native", "combined"},
+            "路由决策表 route 值域必须恰为 fillspec / officecli_native / combined")
+        rows_text = "\n".join("|".join(r) for r in rows)
+        self.assertNotIn("hybrid", rows_text,
+                         "路由决策表行不得出现 hybrid (消歧句在 0.6, 不在此域)")
+        stripped = re.sub(r"[\s`]", "", section0)
+        self.assertIn("route值域仅fillspec/officecli_native/combined",
+                      stripped, "§0 缺 route 值域仅三值定义句")
+        # 0.6 消歧陈述存在 — hybrid 在路由文档的唯一合法语境被保留
+        m = re.search(r"### 0\.6 措辞纪律", section0)
+        self.assertIsNotNone(m, "§0 缺 0.6 措辞纪律段")
+        disc = re.sub(r"[\s`]", "", section0[m.end():])
+        self.assertIn("combined≠hybrid", disc,
+                      "0.6 缺 combined ≠ hybrid 消歧陈述")
+        self.assertIn("hybridoverflow", disc,
+                      "0.6 消歧陈述须点名 FILLSPEC hybrid overflow")
+
+    def test_skill_md_routing_legal_shape_route_combinations(self):
+        """防 shape×route 1:1 绑定回退 (R2-Q1/Q3/Q4): 路由分流 ASCII 块同时
+        含 Direct 组合 grid_record + officecli_native 与 Combined 组合
+        mixed + combined; §1.5 声明两维度不再 1:1 绑定 (删任一合法组合分支
+        或改回 1:1 矩阵时变红)."""
+        section = self._skill_routing_section()
+        ascii_m = re.search(r"```text\n(.*?)```", section, re.DOTALL)
+        self.assertIsNotNone(ascii_m, "§1.5 缺路由分流 ASCII 块")
+        stripped = re.sub(r"[\s`]", "", ascii_m.group(1))
+        self.assertIn("grid_record+officecli_native", stripped,
+                      "路由 ASCII 缺 Direct 组合 (grid_record + officecli_native)")
+        self.assertIn("mixed+combined", stripped,
+                      "路由 ASCII 缺 Combined 组合 (mixed + combined)")
+        self.assertIn("form_content+officecli_native", stripped,
+                      "路由 ASCII 缺 Non-Grid 组合 (form_content + officecli_native)")
+        whole = re.sub(r"[\s`]", "", section)
+        self.assertIn("不再1:1绑定", whole,
+                      "§1.5 缺 shape×route 正交声明 (不再 1:1 绑定)")
+
+    def test_capability_evidence_applicability_not_justification(self):
+        """§0 声明 Applicability ≠ Justification (issue 02/03, R2-Q6 入文):
+        0.3 正式定义段同时给出 Applicability (适用性) 与 Justification
+        (启动理由), 并含 '不相等' 反例示例 (3~5 固定 cell: APPLICABLE 但
+        NOT JUSTIFIED → Direct) — 防适用性/正当性被揉回单一矩阵."""
+        section0 = self._capability_evidence_section0()
+        m = re.search(
+            r"### 0\.3 Applicability ≠ Justification.*?(?=^### 0\.4)",
+            section0, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(
+            m, "§0 缺 0.3 Applicability ≠ Justification 正式定义段")
+        sec = m.group(0)
+        for word in ("Applicability", "Justification", "适用性", "启动理由"):
+            self.assertIn(word, sec, f"0.3 定义段缺 {word!r}")
+        stripped = re.sub(r"[\s`]", "", section0)
+        self.assertIn("Applicability≠Justification", stripped,
+                      "§0 缺 Applicability ≠ Justification 声明")
+        self.assertIn("NOTJUSTIFIED", stripped,
+                      "0.3 缺 NOT JUSTIFIED 反例示例")
+
+    def test_skill_md_obvious_grid_fast_path(self):
+        """Level 0 Obvious Grid Fast Path 锚点 (issue 01/03, R2-Q2):
+        §1.5 含 evidence code obvious_grid、Obvious Grid 分支与 '立即进 MOD'
+        stop-rule 词 (删 Fast Path evidence 或整段时变红)."""
+        section = self._skill_routing_section()
+        stripped = re.sub(r"[\s`]", "", section)
+        self.assertIn("obvious_grid", stripped,
+                      "§1.5 缺 obvious_grid evidence code (Fast Path)")
+        self.assertIn("ObviousGrid", stripped, "§1.5 缺 Obvious Grid 分支")
+        self.assertIn("FastPath", stripped, "§1.5 缺 Fast Path 表述")
+        self.assertIn("立即进MOD", stripped,
+                      "§1.5 缺立即进 MOD stop-rule 词")
+
+    def test_skill_md_combined_final_gate_order(self):
+        """Combined 最小契约 (issue 01/03, R2-Q4): 单一 Final Gate 延后至
+        全部写操作完成 — 契约块含 单一 Final Gate, OfficeCLI finishing 步骤
+        在 Gate 之前; 正文声明 'officecli finishing 在 Gate 之前执行'.
+        (finishing 与 Gate 的相对顺序被颠倒时变红.)"""
+        section = self._skill_routing_section()
+        m = re.search(r"#### Combined 最小契约.*?```text\n(.*?)```",
+                      section, re.DOTALL)
+        self.assertIsNotNone(m, "§1.5 缺 Combined 最小契约块")
+        block = re.sub(r"[\s`]", "", m.group(1))
+        self.assertIn("单一FinalGate", block,
+                      "Combined 契约缺 单一 Final Gate")
+        self.assertIn("OfficeCLIfinishing", block,
+                      "Combined 契约缺 OfficeCLI finishing 步骤")
+        self.assertLess(block.index("OfficeCLIfinishing"),
+                        block.index("单一FinalGate"),
+                        "finishing 必须先于 Final Gate (单一 Final Gate 延后至全部写操作完成)")
+        stripped = re.sub(r"[\s`]", "", section)
+        self.assertIn("finishing在Gate之前执行", stripped,
+                      "§1.5 缺 finishing 在 Gate 之前执行的顺序关键句")
 
     def test_old_universal_probe_and_escape_hatch_removed(self):
         """旧流程被原子替换 (migrate facts, replace process): 普遍 probe、

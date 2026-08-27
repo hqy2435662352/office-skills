@@ -9,6 +9,15 @@ from this file — if two files disagree, the spec wins.
 **禁止**: 逐行复制源数据到 spec; 手写 batch JSON; 手写 checks; 在 mapping.md
 中维护第二份事实。
 
+## Non-goal（执行模型边界）
+
+FillSpec models structured grid/record transformations; layout/content
+composition into fixed form regions is outside the FillSpec execution model.
+表单版式组合（多格→一格内容块、图片、行高、wrapText 版面适配）走 officecli
+native 路径（见 CAPABILITY_EVIDENCE.md 任务形态矩阵）。本 spec 不为上述形态
+扩展 props 白名单 / schema；现有编译期拒绝码（SPEC_SOURCE_CSV 等）已足够表达
+这一边界。
+
 ## 完整示例 (xlsx → xlsx 迁移)
 
 ```yaml

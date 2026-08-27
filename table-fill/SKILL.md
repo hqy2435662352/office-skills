@@ -1,6 +1,11 @@
 ---
 name: table-fill
 description: >
+  table-fill is the unified intent entry for spreadsheet-to-template fill; after
+  Prepare it routes by task shape — obvious grid/record transformation takes the
+  FillSpec fast path, fixed-form/layout content filling goes the officecli-native
+  path, with bounded direct grid edits and mixed workloads routing as exceptions.
+
   Use this skill whenever the user asks to fill, populate, map, or transfer data
   between spreadsheet tables — in any direction (xlsx→pptx, xlsx→xlsx, pptx→pptx,
   pptx→xlsx; PPTX targets: column value fills + DOM-path sets — formulas/merges/
@@ -66,6 +71,7 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 | `mapping.md` | Derived | Compiler 生成的人类审查视图 (编辑 spec, 从不编辑它) |
 | `validated_draft.*` | Derived Result | 已执行并通过验证的候选交付文件 |
 | `draft_receipt.json` | Evidence | 输入哈希 (执行时重算 + 绑定比对) / Spec/Plan/Draft 哈希 + 验证结果 |
+| `task_shape.json` | Agent 判定 | Task Shape Check (Routing V2) 分流判定, 三字段: `task_shape` (值域 `grid_record`/`form_content`/`mixed`/`uncertain`) + `route` (`fillspec`/`officecli_native`/`combined`) + `evidence` (短 snake_case code, 最小充分); 与 `prepare_manifest.json` 机器事实分层，不含 confidence/hash/QA/execution history |
 | `.gate3_pending` | Skill-only Marker | 流程提示, 不是可信授权状态 |
 | final output | Delivery | Validated Draft 的提升副本 (哈希一致) |
 
@@ -106,6 +112,146 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
   flatten 不需手工重跑; 唯一动作 = 更新 spec 的 target_structure 指纹
   (抄 repair 输出 JSON 的 `fingerprints.target_structure`, 或 `--patch-spec`
   一步完成) + 重编译 (见 FILLSPEC Q16)。
+
+### 1.5 Task Shape Check (Prepare B 后、MOD 前) — Routing V2
+
+Prepare Stage B (flatten+digest) 完成后、MOD 提名之前, 先按 **任务形态** 路由
+(Routing V2: **Level 0 Obvious Grid Fast Path** + **Exception Routing**)。判定
+输入永远三项: **任务指令 × 源 digest × 目标 digest** (不是只看文件长什么样)。
+对明确信号**一眼可判** — 读毕 digest 即答, **零新脚本、零额外 LLM 调用、零常规
+额外探测** (不追加 picture scan / HTML render / 额外 query / 第二模型调用)。同一
+文件对不同任务可走不同路径 (如"填 50 条产品明细"→ grid_record; "只填封面客户
+资料"→ form_content)。
+
+```text
+Prepare B (读毕 digest, Agent 本来就要读)
+   ├─ Obvious Grid (稳定 header + 重复 record 行 + 可克隆数据区)
+   │     └─► Level 0 FAST PATH: grid_record/fillspec, evidence=["obvious_grid"],
+   │          立即进 MOD — 0 新增动作, 禁止继续 routing 分析
+   └─ 仅出现明确异常信号 → Exception Routing:
+         ├─ Direct   : grid_record + officecli_native (bounded/explicit 写集)
+         ├─ Non-Grid : form_content + officecli_native (087 类)
+         └─ Combined : mixed + combined (否则进 uncertain)
+```
+
+`task_shape` (workload 本质) 与 `route` (执行选择) 是两个正交维度, 不再 1:1
+绑定 — **Applicability ≠ Justification** (FillSpec 能表达 ≠ 这次该用)。值域:
+
+| task_shape | 含义 | 合法 route | 典型 evidence |
+|---|---|---|---|
+| `grid_record` | 稳定 header + 重复 record 行; 目标可克隆/可重复数据区; 映射以列↔列为主; 输出行数由源记录数驱动 | `fillspec` (Fast Path) / `officecli_native` (Direct) | `obvious_grid` / `bounded_explicit_edit`+`no_material_grid_benefit` |
+| `form_content` | 固定内容区 (merged form regions), 无可克隆数据行模板; 源内容需跨格/跨行组合 | `officecli_native` | `content_composition` / `layout_or_object_work` |
+| `mixed` | substantial grid workload + 明显可分离 non-grid workload | `combined` | `substantial_grid_workload`+`separable_non_grid_workload` |
+| `uncertain` | 无明确信号 (临时判定态, 不是稳定类型) | — (不落执行 route) | `insufficient_routing_evidence` / `conflicting_workload_signals` / `task_intent_ambiguous` |
+
+`direct` **永不作为 shape 出现** — 它是执行决策, 不是 workload 本质。route 值域
+仅 `fillspec` / `officecli_native` / `combined`; `combined` 是 fillspec +
+officecli_native 的组合执行, **不是第三引擎**。evidence 一律短 snake_case code、
+最小充分证据 (不写长句论据)。
+
+#### Level 0 — Obvious Grid Fast Path (默认主路径, 不是 fallback)
+
+读毕 digest 即明显常规 Grid — 稳定 header + 重复 record 行 + 目标可克隆数据区,
+映射以列↔列为主, 输出行数由源记录数驱动 (如四案例 Case 1 复杂报价单) → **立即**
+`grid_record` + `fillspec`, evidence 固定 `["obvious_grid"]`, 直接进入原 **MOD
+Resolution → FillSpec → Compile** 流程 — 95% 任务运行路径零变化, 不追加任何
+探测。
+
+**禁止继续 routing 分析** (stop-rule): Fast Path 寄生在"读 digest"既有动作上,
+不是新分类步骤 — **不写 signal checklist、不分级打分、不长篇 reasoning**。
+**可观测动作不变式验收线**: 与本任务 V1 基线相比, **0 新增 LLM 调用 / officecli
+调用 / inspect / render / 脚本 / scoring / decomposition / feature extraction** —
+任何"为了确认是 Grid 才做"的追加动作都违反 Fast Path, 必须直进 MOD。
+
+仅出现**明确异常信号**才进 Exception Routing (正常 Grid 任务不需要任何异常
+判断, 也不做对称分类):
+
+#### Exception Routing
+
+- **Direct — `grid_record` + `officecli_native`**: grid 语义但 trivial, 不值得
+  启动完整 Grid pipeline (如 3~5 个固定 cell 映射, 甚至 30 cell 固定区域复制,
+  无 record-driven 语义)。**双必要条件**:
+  ① 目标写集合执行前 **bounded/explicit** — 自检句: **"OfficeCLI batch 本身
+  能不能成为完整执行计划"** (batch 即完整执行计划, 无需动态推导);
+  ② **无需 Grid 专业能力** — 不需要 record-driven iteration / dynamic rows、
+  clone / placeholder / inplace、lookup、formula / aggregate、group merge、
+  FillSpec 结构治理。**stop-rule 锚点句**: "Direct 必须明显成立; 若判断 Direct
+  需要复杂成本估算, 则停止路由优化, 走 Grid 主路径或 uncertain" — **明显便宜
+  ≠ 算出便宜**。触发层 single-cell 排除不变 (单格编辑不是 table-fill 任务,
+  见 description 触发排除)。
+- **Non-Grid — `form_content` + `officecli_native`**: 目标主体是固定内容区 /
+  版式组合 (087 类), 主要操作是文本/图片/版面内容填充而非重复 record 映射。
+  V1 form_content 工作流原样保留 (见下), 一等路径, **不是 fallback** — 禁止靠
+  FillSpec 失败反向发现 form_content。
+- **Combined — `mixed` + `combined`**: substantial grid workload + 明显可分离
+  non-grid workload (如 80 条产品明细 + Logo/客户名/备注/行高)。执行契约见
+  「Combined 最小契约」; 两个 workload 高度缠绕 → 进 uncertain, **不硬拆**。
+
+**uncertain (临时判定态)**: 既非明显 Grid、也无明确异常信号时 — 一次受限补观察
+(view html + ≤2 次定向 get/query) → 必须重判进入 Fast Path 或 Exception 分支;
+仍存在会实质改变执行模型的歧义才 ASK (evidence 用
+`insufficient_routing_evidence` / `conflicting_workload_signals` /
+`task_intent_ambiguous`, 临时态, 不扩设计)。
+
+#### Combined 最小契约 (mixed + combined)
+
+```text
+Prepare → mixed decomposition → Grid 数据/结构执行 + readback/结构验证
+→ OfficeCLI finishing (仅触及明确可分的 non-grid workload,
+   不得修改或失效 Grid-owned region / structural invariants)
+→ Unified QA (Grid 数据与结构仍正确 + finishing 正确 + validate/issues/html)
+→ 单一 Final Gate (锁最终 draft) → promote → delivery
+```
+
+- **Grid 治理机制不变**: Grid 段的 MOD / FillSpec / Compile / readback / 结构
+  验证规则原样适用; **Gate 语义从 Grid 完成门升级为最终 draft 完成门** —
+  officecli finishing 在 Gate 之前执行, **preserve promote 的哈希绑定** (Gate
+  锁定 finishing 后的最终 draft)。
+- **ownership: 一个 side effect 一个 executor owner** — Grid 段归 Grid 执行器,
+  finishing 归 officecli; 第一版仅为 Agent 执行约束 (**不建 DSL / ownership
+  文件, task_shape.json 不扩成 region manifest**)。
+- **启用前提**: ① Grid workload 确实值得 Grid; ② non-grid workload 清晰可分离;
+  两个 workload 高度缠绕 → 进 uncertain, 不硬拆。
+- **默认 Grid first** — 结构稳定后做固定坐标/layout 编辑更安全; 非绝对
+  (明显独立的 finishing 先做亦可, 但任何 finishing 不得修改或失效 Grid-owned
+  region / structural invariants)。
+- **统一 QA**: Grid 数据与结构仍正确 + finishing 正确 + validate/issues/html
+  一次做完; 单一 Final Gate 通过后才 promote / delivery。
+
+#### 四案例映射 (canonical examples)
+
+| Case | task_shape | route | evidence |
+|---|---|---|---|
+| 复杂报价单 (数十~数百 records + lookup/formula/clone/aggregate) | `grid_record` | `fillspec` | `["obvious_grid"]` |
+| 3~5 个固定 cell 映射 (甚至 30 cell 固定区域复制, 无 record-driven 语义) | `grid_record` | `officecli_native` | `["bounded_explicit_edit","no_material_grid_benefit"]` |
+| 087 (多格内容重组/图片/版式/固定 merged form) | `form_content` | `officecli_native` | `["content_composition","layout_or_object_work"]` |
+| 产品明细 80 records + Logo/客户名/备注/行高 | `mixed` | `combined` | `["substantial_grid_workload","separable_non_grid_workload"]` |
+
+**反例锚点 (防数量阈值思维)**: 只有 3 条记录但需要 lookup/clone/公式/group merge
+→ Grid (记录少 ≠ Direct, 数量不是路由依据); 200 行明显 Grid 不值得讨论 Direct —
+Fast Path 无疑问, 0 新增动作。
+
+每次 run (含 Fast Path) 落极简 `task_shape.json` (见下), 记录 `task_shape` +
+`route` + `evidence` 三字段。`form_content` 在 FillSpec 语境为 `NOT_APPLICABLE`
+(产品层 SUPPORTED, 引擎层 NOT_APPLICABLE — 不是 UNSUPPORTED, 不是 Known
+Rejected)。
+
+#### form_content 工作流 (officecli native 路径)
+
+1. **沿用共享 workdir / source protection / Prepare** — 与 grid 路径同一 workdir
+   与暂存保护, staged 文件只读, Prepare 已生成 digest。
+2. **落 `task_shape.json`** — 分流判定产物 (三字段, 见下)。
+3. **officecli native execution** — inspect → atomic edit → adjust, 经
+   `_officecli.officecli()` 适配器调用 (见不变量 6), 目标模板永不被修改 (编辑
+   副本)。
+4. **强制完成 officecli-xlsx QA checklist** — `validate` + `view issues` +
+   `view html` + 模板 QA (见 `officecli-xlsx/references/qa.md`)。此 checklist
+   从"建议做"升级为 form_content **交付前强制条件**: QA 未完成不得交付。
+5. **交付呈报** — QA 证据 + 关键内容格摘要 + 改动摘要。
+
+正常任务**不默认人审**。条件 ASK 仅限: 覆盖原文件、不可恢复删除、多种合理语义
+无法判断、明显版面溢出且无压缩策略。form_content 路径**不继承** execution_gate /
+promote / receipt / FillSpec plan/draft 哈希三元组 — 只为 QA 证据与交付呈报负责。
 
 ### 2. MOD Resolution — `mod_nominate.py` (条件中断)
 
@@ -555,6 +701,7 @@ python scripts/note_phase.py --workdir <dir> --phase <名称>
 ```
 <workdir>/                        ← ASCII workdir (C:\Temp\tablefill\<task>\)
 ├── prepare_manifest.json          ← Prepare 产物清单 + fingerprints
+├── task_shape.json                ← Task Shape Check 分流判定 (task_shape + route + evidence)
 ├── *_outline.txt / *_digest.md / *_flat.csv / *_meta.json / *_candidates.yaml
 ├── mod_resolution.json            ← MOD 裁决 (结构化)
 ├── fill_spec.yaml                 ← Canonical 业务语义 (LLM 撰写)

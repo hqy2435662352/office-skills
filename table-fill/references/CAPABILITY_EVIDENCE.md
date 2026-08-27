@@ -5,7 +5,164 @@ Table-Fill Task Mode 的能力求证详细政策源。**按需读取** — 正�
 参考的终局算法执行。主 Skill 只保留短算法与预算 (见 SKILL.md「撰写规程」);
 本文件是 三态 / Capability Question / Evidence Fit / Standard Evidence Paths /
 Extra Capability Probe / Bounded Rescue / continue·ADAPT·ASK·STOP / Run-local
-evidence / 模式切换 的唯一详细规则源。
+evidence / 模式切换 的唯一详细规则源。本文件第 0 节另持有**能力适用性 ×
+执行选择**两层正交语义 (能力语义表 + 路由决策表 + evidence 词表) — 它是
+产品级定位声明, 与第 1 节的机制能力三态正交, 两套语义不混用。
+
+## 0. 能力适用性 × 执行选择（两层正交语义）
+
+table-fill 是 spreadsheet-to-template fill 类任务的**统一意图入口**, 内部按
+任务形态分流为两条一等执行路径。本节拆**两张正交的表**:
+
+- **能力语义表** (0.1) — 回答"这条 workload 对某执行模型是否**适用**"
+  (`APPLICABLE` / `NOT_APPLICABLE`), 是产品级定位声明;
+- **路由决策表** (0.2) — 回答"本次任务**怎么执行**" (`route`), 是执行选择
+  维度。
+
+两套语义不混用: **适用性** (执行模型能否自然表达) 与**执行选择** (本次值不
+值得 / 走哪条路) 是正交的 — **Applicability ≠ Justification** (定义见 0.3)。
+第 0 节与第 1 节的机制能力三态同样是两套正交语义: 第 1 节的三态 / Capability
+Question / Probe / Rescue 语义不受本节影响, 不因 Workload 形态而改变。
+
+### 0.1 能力语义表（基础 workload → 执行模型适用性）
+
+```text
+Workload semantics           table-fill Product   FillSpec Model
+Grid / record transformation SUPPORTED            APPLICABLE
+Non-grid Office operation    SUPPORTED            NOT_APPLICABLE
+```
+
+- 仅列**基础 workload 两行**; `mixed` **不占行** — 它是 Grid + Non-grid 的
+  **组合 workload**, 需要两套执行模型协作, FillSpec 对其天然无法单格表达
+  (路由层面见 0.2 第 4 行 `combined`)。
+- 行与 `task_shape` 值域对齐: **Grid / record transformation** ≈ `grid_record`
+  (稳定 header + 重复 record 行 + 可克隆数据区; 映射以列↔列为主; 输出行数由
+  源记录数驱动); **Non-grid Office operation** ≈ `form_content` (固定内容区 /
+  merged form regions; 源内容需跨格/跨行组合)。
+- **table-fill Product 列**回答产品层是否支持这条 workload (`SUPPORTED`; 两条
+  路径都是一等公民, 无 fallback); **FillSpec Model 列**回答执行模型能否自然
+  表达 (`APPLICABLE` / `NOT_APPLICABLE`)。两列处于不同层, 不互相推导 — 产品
+  支持不推导引擎适用, 引擎不适用也不推导产品不支持。
+
+### 0.2 路由决策表（Workload situation → Route）
+
+| Workload situation | route | 典型 evidence |
+|---|---|---|
+| obvious substantial Grid (复杂报价单类) | `fillspec` | `obvious_grid` |
+| bounded explicit Grid, 无实质 Grid 收益 (3~5 固定 cell 类) † | `officecli_native` | `bounded_explicit_edit` + `no_material_grid_benefit` |
+| Non-grid 内容/版式组合 (087 类) | `officecli_native` | `content_composition` + `layout_or_object_work` |
+| substantial Grid + 明显可分离 Non-grid (80 records + Logo/行高 类) † | `combined` | `substantial_grid_workload` + `separable_non_grid_workload` |
+
+† Direct (第 2 行) 与 Combined (第 4 行) 为 canonical 起步 — 标注「待第一条
+真实案例 evidence」, 未经验证不声称常见 (见 0.5)。
+
+- 路由决策表是**执行选择维度**, 与 0.1 能力语义表**正交**: 同一 shape 可以有
+  不同 route — `grid_record` 默认走 `fillspec` Fast Path, 例外以 Direct 走
+  `officecli_native` (第 2 行)。**Direct 是执行决策, 永不作为 shape 出现**;
+  shape 值域仍为 `grid_record` / `form_content` / `mixed` / `uncertain` —
+  `mixed` 对应第 4 行, `uncertain` 是**临时判定态**, 不落执行 route。
+- `route` 值域仅 `fillspec` / `officecli_native` / `combined`; `combined` 是
+  fillspec + officecli_native 的**组合执行**, **不是第三引擎**。
+- 分支命名与 SKILL.md §1.5 对齐: 四行对应 Level 0 **Fast Path** 与 Exception
+  Routing 的 **Direct** / **Non-Grid** / **Combined** 三分支。
+- Non-grid 分支的形态判据 (信号型, 非打分) 见下; 判定输入永远是三项:
+  **任务指令 × 源结构 × 目标结构**。
+
+**Task Shape Check 指引联动**: 分流判定时机是 Prepare Stage B 后、MOD 前; 判定
+结果落盘 `task_shape.json` (`task_shape` + `route` + `evidence` 三字段), 与
+`prepare_manifest.json` 机器事实分层; 执行步骤与各分支执行契约见 SKILL.md
+「1.5 Task Shape Check」。
+
+**form_content 判据 (信号型, 非打分)**:
+
+下列信号**指向** Non-grid 分支 (shape = `form_content`), 但不是打分或阈值 —
+判据是**信号型**的, 且判定**始终结合任务指令** (同一文件对不同任务可走不同
+路径: "填 50 条产品明细"→ `grid_record`, "只填封面客户资料"→ `form_content`):
+
+- 目标主体是固定内容区 (merged form regions), 且**无可克隆数据行模板**;
+- 源内容需**跨格 / 跨行组合**后才能写入 (搬运单位是"多格拼成一段文本块 →
+  塞进一个固定格", 不是"行记录 → 行记录");
+- 主要操作是**文本 / 图片 / 版面内容填充**, 而非重复 record 映射。
+
+### 0.3 Applicability ≠ Justification（正式定义）
+
+- **Applicability (适用性)** = 该执行模型能否**自然表达**此 workload — 能力
+  语义表回答的维度 (`APPLICABLE` / `NOT_APPLICABLE`);
+- **Justification (启动理由)** = 即使适用, 本次是否**值得启用完整 pipeline**
+  (Grid 主路径的 MOD / FillSpec / Compile / readback / 结构验证 / QA / Gate
+  全链) — 路由决策表回答的维度;
+- 二者**不相等**: 适用不自动等于应当启用。示例 — 3~5 个固定 cell 映射: Grid
+  语义, FillSpec Model 对其 **APPLICABLE** (能自然表达), 但写集合执行前已
+  **bounded/explicit**、无 record-driven 语义、无需 Grid 专业能力 → 本次
+  **NOT JUSTIFIED** → 路由 `officecli_native` (Direct);
+- 反向同理: 适用且 justified → `fillspec`; 不适用 (`NOT_APPLICABLE` 的
+  Non-grid) → `officecli_native` 一等路径 — 产品层 `SUPPORTED` **不构成**启用
+  FillSpec 的理由 (措辞见 0.6)。
+
+### 0.4 evidence vocabulary（判定标签, canonical 起步）
+
+| Code | 含义 |
+|---|---|
+| `obvious_grid` | 明显常规 Grid, Fast Path 唯一 evidence |
+| `bounded_explicit_edit` | 写集合执行前已明确且有限 |
+| `no_material_grid_benefit` | Grid pipeline 无实质收益 |
+| `content_composition` | 核心是内容组合而非 record transformation |
+| `layout_or_object_work` | 核心涉及版式/图片/Shape 等 non-grid 对象 |
+| `substantial_grid_workload` | 存在值得启用 Grid 的工作 |
+| `separable_non_grid_workload` | 同时存在清晰可分离的 non-grid 工作 |
+
+uncertain 可用三码 (临时态, 不扩设计): `insufficient_routing_evidence` /
+`conflicting_workload_signals` / `task_intent_ambiguous`。
+
+- **不封闭枚举**: 七码是 canonical 起步, 不是穷尽表; 新理由只有在**真实
+  benchmark 反复出现且有统计价值**时才晋升入表;
+- evidence code 是**判定标签** (`task_shape.json` 的 `evidence` 字段, 短
+  snake_case code、最小充分, 不写长句论据), 记录路由理由、供误判诊断; 它不进
+  glossary (术语注册见根目录 `UBIQUITOUS_LANGUAGE.md`, evidence code 不在
+  注册之列)。
+
+### 0.5 第一条 evidence: officeval_087
+
+本节的第一条 evidence 是 officeval_087 (识字《四季小景》→ 分层作业设计),
+支撑 Non-grid 行的 `NOT_APPLICABLE` 判定。**evidence ≠ 定义** — 087 是支撑
+本节语义的事实样本, 不是语义本身; 语义不因 087 而改变。
+
+0.2 路由决策表的 **Direct 行与 Combined 行** (†) 标注「待第一条真实案例
+evidence」— canonical 起步, 未经验证不声称常见; 087 是截至目前的唯一真实
+案例 evidence。
+
+087 的 FillSpec 引擎拒绝码实测事实:
+
+- `SPEC_SOURCE_CSV` (compile_fill.py:2375) — 纯 `sets` (无数据块) 被编译器
+  强制要求 rows 数据块;
+- `CLONE_SOURCE_IS_ANCHOR` / `CLONE_RESIDUE_UNHANDLED` (compile_fill.py) —
+  `append` 数据块会克隆行扩表, 破坏 8 个合并区;
+- inplace 1:1 约束 — `inplace` 是唯一不扩表模式, 但要求源行↔目标行 1:1,
+  087 无法成立;
+- `PROPS_WHITELIST = ("numberformat",)` (compile_fill.py:1314) — wrapText /
+  行高 / 图片均不在此白名单之列。
+
+结论: 这些拒绝码是引擎**正确表达"非 record/grid 世界"**的信号, 不是缺陷。
+087 的问题不在编译器, 而在于 skill 未在早期按任务形态分流。
+
+### 0.6 措辞纪律（防漂移, 硬性）
+
+- `NOT_APPLICABLE` ≠ `UNSUPPORTED` — 前者是"这条形态不属于本引擎的执行模型",
+  后者暗示"欠 feature" (capability gap 待补), 会诱发向 FillSpec 塞 wrapText /
+  行高 / 图片的扩张, 必须防;
+- `NOT_APPLICABLE` ≠ `Known Rejected` — Known Rejected 指"契约已拒绝的行为",
+  而 Non-grid (form_content) 是产品支持的**另一条一等执行路径** (第 1 节三态
+  里的 Known Rejected 与本节 0.1 的 NOT_APPLICABLE 是两套正交语义, 不混用);
+- `APPLICABLE` ≠ `SUPPORTED` — 前者回答执行模型对本 workload 的**适用性**
+  (能否自然表达, 0.1 FillSpec Model 列), 后者回答**产品层支持承诺** (0.1
+  table-fill Product 列); 产品 SUPPORTED 不推导引擎适用, 引擎不适用不推导
+  产品不支持;
+- `combined` ≠ `hybrid` — 路由语境 route 值域只有 `fillspec` /
+  `officecli_native` / `combined`, **`hybrid` 不是 route 名**。FILLSPEC 文档
+  另有 "hybrid overflow" (references/FILLSPEC.md:853), 指 inplace 位置模型,
+  与本路由概念无关 — 消歧陈述提及该词仅用于排除混用;
+- 未来解读为"capability gap 待补"→ 诱发向 FillSpec 塞 wrapText/行高/图片的
+  扩张——必须防。
 
 ## 1. 能力知识三态与 Capability Question
 
