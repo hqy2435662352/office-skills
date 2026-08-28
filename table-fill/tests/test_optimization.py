@@ -1172,6 +1172,168 @@ class LookupNormalizeTests(unittest.TestCase):
             self.assertEqual(f_vals[0], "C-1")  # ' Z001 ' → hit
 
 
+class LookupKeyColumnInvalidContractTests(unittest.TestCase):
+    """issue 04: lookup key_column 契约 — 单缺陷码 LOOKUP_KEY_COLUMN_INVALID。
+
+    key_column 必须是当前展平源数据中真实存在的 Excel 列字母; 接受集冻结 =
+    col_letter_to_idx 一线语义 (大小写不敏感 1-2 个字母, 不另发明 regex)。
+    列级/表级两个入口都在静态验证段拦截 (exit 3, 生成 plan 之前), reason
+    区分 invalid_format / out_of_range; range 基准 = 该 lookup 实际 consumer
+    source(s) 的展平宽度; resolve_lookup 保留兜底, 绝不裸 IndexError。"""
+
+    def _compile_capture(self, wd: dict, spec: dict):
+        """Compile with captured stderr; return (plan, exit_code, stderr)."""
+        from io import StringIO
+        buf = StringIO()
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            plan = compile_fill.compile_spec(
+                spec, wd["manifest"], wd["workdir"])
+            return plan, None, buf.getvalue()
+        except SystemExit as e:
+            return None, e.code, buf.getvalue()
+        finally:
+            sys.stderr = old
+
+    def _lookup_spec(self, wd: dict, key_column: str = "C",
+                     col_key: str | None = None) -> dict:
+        spec = lookup_column_spec(wd, key_column=key_column)
+        if col_key is not None:
+            spec["mapping"]["targets"][0]["columns"][-1]["lookup"][
+                "key_column"] = col_key
+        return spec
+
+    # ── 用例 1: 列级入口, malformed (invalid_format) ──
+    def test_column_level_malformed_key_column_invalid_format(self):
+        """columns[].lookup.key_column='sku' (逻辑键名) → exit 3 +
+        LOOKUP_KEY_COLUMN_INVALID (invalid_format), plan 之前拦截,
+        无裸 traceback。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            plan, code, err = self._compile_capture(
+                wd, self._lookup_spec(wd, col_key="sku"))
+            self.assertIsNone(plan)  # 编译在返回 plan 前失败
+            self.assertEqual(code, 3)
+            self.assertIn("LOOKUP_KEY_COLUMN_INVALID", err)
+            self.assertIn("invalid_format", err)
+            self.assertNotIn("Traceback", err)  # 结构化缺陷, 不裸崩
+            defect = json.loads(err)["defects"][0]
+            self.assertEqual(defect["code"], "LOOKUP_KEY_COLUMN_INVALID")
+            self.assertEqual(defect["reason"], "invalid_format")
+            self.assertEqual(
+                defect["corrective_action"],
+                "key_column='sku' is invalid: expected an Excel column letter "
+                "present in the flattened source (e.g. G), not a logical "
+                "field/key name.")
+
+    # ── 用例 2: 表级入口, out-of-range ──
+    def test_table_level_out_of_range_key_column(self):
+        """lookups[].key_column='AB' + 默认 8 列源 (A:H) → exit 3 +
+        LOOKUP_KEY_COLUMN_INVALID (out_of_range); range 基准 = 实际
+        consumer source (source_maoli), 无裸 traceback。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            plan, code, err = self._compile_capture(
+                wd, self._lookup_spec(wd, key_column="AB"))
+            self.assertIsNone(plan)
+            self.assertEqual(code, 3)
+            self.assertIn("LOOKUP_KEY_COLUMN_INVALID", err)
+            self.assertIn("out_of_range", err)
+            self.assertNotIn("Traceback", err)
+            defect = json.loads(err)["defects"][0]
+            self.assertEqual(defect["reason"], "out_of_range")
+            self.assertEqual(defect["source"], "source_maoli")
+            self.assertIn(
+                "key_column='AB' is out of range: flattened source has "
+                "columns A:H. Choose an existing source column.",
+                defect["corrective_action"])
+
+    # ── 合法输入防回归 (行为零漂移) ──
+    def test_lowercase_key_column_still_compiles(self):
+        """key_column='c' (小写, 列存在) → compile 通过; guard 不收紧
+        col_letter_to_idx 的大小写容忍。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            plan, code, err = self._compile_capture(
+                wd, self._lookup_spec(wd, key_column="c"))
+            self.assertIsNotNone(plan)
+            self.assertIsNone(code)
+            f_vals = [w["value"] for w in plan["writes"] if w["col"] == "F"]
+            self.assertEqual(f_vals[0], "C-1")  # C 列 key 照常命中
+
+    def test_double_letter_key_column_wide_source_compiles(self):
+        """key_column='AB' + 28 列源 (A..AB) → compile 通过;
+        out_of_range 只按实际 consumer source 宽度判, 不误拒合法 spec。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp, src_rows=[
+                [f"r{i}" for i in range(28)] for _ in range(3)])
+            wd["workdir"] = tmp
+            plan, code, err = self._compile_capture(
+                wd, self._lookup_spec(wd, key_column="AB"))
+            self.assertIsNotNone(plan)
+            self.assertIsNone(code)
+
+    def test_unreferenced_table_lookup_not_checked(self):
+        """表级 lookup 未被任何 column 引用 → 不消费不 crash, 不检查
+        (含非法 key_column='sku' 也放行 — 检查它反而误拒合法 spec)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            wd = make_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = spec_with(wd)
+            spec["mapping"]["targets"][0]["lookups"] = [
+                {"name": "unused", "from": "inheritance.json",
+                 "key_column": "sku", "fields": ["compressor"],
+                 "missing": "empty"}]
+            plan, code, err = self._compile_capture(wd, spec)
+            self.assertIsNotNone(plan)
+            self.assertIsNone(code)
+
+    # ── resolve_lookup 兜底 (要求 6: 静态拦截命中后走不到裸 IndexError) ──
+    def test_resolve_lookup_backstop_out_of_range(self):
+        """静态拦截漏网时 resolve_lookup 也不再裸 IndexError — 同缺陷码 +
+        out_of_range, 返回 None (该行跳过, 交给 MATERIALIZE_DEFECTS)。"""
+        defects = []
+        tbl = {"data": {"Z001": {"compressor": "C-1"}}, "key_column": "D"}
+        out = compile_fill.resolve_lookup(
+            {"name": "fields", "field": "compressor"}, ["a", "b"],
+            {"fields": tbl}, defects)
+        self.assertIsNone(out)
+        self.assertEqual(defects[0]["code"], "LOOKUP_KEY_COLUMN_INVALID")
+        self.assertEqual(defects[0]["reason"], "out_of_range")
+
+    def test_resolve_lookup_backstop_invalid_format(self):
+        """key_column='sku' 直接进 resolve_lookup → invalid_format 缺陷 +
+        None (原 L1163 裸 values[col_letter_to_idx(kcol)] 已封死)。"""
+        defects = []
+        tbl = {"data": {}, "key_column": "sku"}
+        out = compile_fill.resolve_lookup(
+            {"name": "fields", "field": "compressor"}, ["a", "b"],
+            {"fields": tbl}, defects)
+        self.assertIsNone(out)
+        self.assertEqual(defects[0]["code"], "LOOKUP_KEY_COLUMN_INVALID")
+        self.assertEqual(defects[0]["reason"], "invalid_format")
+
+    def test_falsy_key_column_path_unchanged(self):
+        """key_column 缺失/为空 (falsy) → 不检查不报错 (现状非 crash 路径
+        冻结为保持原样: key=None → miss → missing: empty 留空)。"""
+        defects = []
+        tbl = {"data": {"Z001": {"compressor": "C-1"}}, "key_column": None}
+        out = compile_fill.resolve_lookup(
+            {"name": "fields", "field": "compressor", "missing": "empty"},
+            ["a", "b"], {"fields": tbl}, defects)
+        self.assertEqual(out, "")
+        self.assertEqual(defects, [])
+
+
 class NumericPrecisionTests(unittest.TestCase):
     def test_long_precision_value_auto_rounded_with_warning(self):
         """15-digit cost value is AUTO-ROUNDED to 4 decimals with a warning

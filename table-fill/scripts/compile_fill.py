@@ -1052,6 +1052,137 @@ def apply_precision_policy(target: dict, data_rows: list,
             })
 
 
+# ── Lookup key_column guard (issue 04) ─────────────────────────────────
+
+def _lookup_key_column_reason(kcol) -> str:
+    """Classify an invalid lookup key_column (issue 04).
+
+    Acceptance set is FROZEN to the col_letter_to_idx line semantics: an
+    Excel column letter = 1-2 ASCII letters, case-insensitive (CELL_RE on
+    the upper-cased value — no new regex, no ^[A-Z]{1,3}$ drift). Anything
+    else — logical field names like 'sku', whitespace-padded values,
+    digits, length 0/>2 — is invalid_format; a well-formed letter beyond
+    the consumer source's width is out_of_range (caller decides). Falsy
+    values never reach this (no key_column keeps the historical path)."""
+    if not isinstance(kcol, str) or not CELL_RE.fullmatch(kcol.upper()):
+        return "invalid_format"
+    return "out_of_range"
+
+
+def _lookup_key_column_corrective(kcol, reason: str,
+                                  width: int | None) -> str:
+    """corrective_action per reason (issue 04 wording, value/range inlined)."""
+    if reason == "invalid_format":
+        return (f"key_column={kcol!r} is invalid: expected an Excel column "
+                "letter present in the flattened source (e.g. G), not a "
+                "logical field/key name.")
+    return (f"key_column={kcol!r} is out of range: flattened source has "
+            f"columns A:{col_idx_to_letter(width - 1)}. Choose an existing "
+            "source column.")
+
+
+def validate_lookup_key_columns(blocks_cfg: list, spec_mapping: dict,
+                                target_cfg: dict, manifest_flat: dict,
+                                workdir: Path, num_cols: int) -> list:
+    """Static guard for lookup key_column declarations (issue 04).
+
+    Binding semantics (verified against resolve_lookup's only callers, both
+    in materialize_values): table-level lookups[] are NOT auto-applied to
+    every block/source — a lookup is consumed only by columns that declare
+    lookup: {name: ...}. The effective key_column is the column's own value
+    falling back to the table's (resolve_lookup:
+    lookup.get("key_column") or tbl.get("key_column")), and the range
+    baseline is the CONSUMER source(s): the rows sources of the blocks
+    owning the referencing columns. A lookup referenced by no column never
+    reaches resolve_lookup, so it is not checked (no consumption, no crash;
+    checking it anyway would reject legal specs on unconsumed widths).
+
+    Single defect code LOOKUP_KEY_COLUMN_INVALID; reason splits
+    invalid_format / out_of_range (no new taxonomy). Sources whose name is
+    missing from the manifest or whose csv is unreadable skip the range
+    check — the existing SPEC_SOURCE_CSV path reports them (no duplicate
+    alarm)."""
+    tables = {lk.get("name"): lk.get("key_column")
+              for lk in (list(spec_mapping.get("lookups", []))
+                         + list(target_cfg.get("lookups", [])))}
+    defects: list = []
+    seen: set = set()
+    widths: dict = {}
+
+    def _source_width(src_name):
+        """Max row-cell count of the flattened source csv (L2489 semantics:
+        max(len(cells) ...)); None when unknown/unreadable (skip, don't
+        guess — SPEC_SOURCE_CSV owns missing sources)."""
+        if src_name not in widths:
+            rows = None
+            entry = manifest_flat.get(src_name)
+            csv_name = entry.get("csv") if isinstance(entry, dict) else None
+            if csv_name:
+                try:
+                    rows = load_csv_rows(workdir / csv_name)
+                except (OSError, ValueError, csv.Error):
+                    rows = None
+            widths[src_name] = None if rows is None else max(
+                (len(cells) for cells, _ in rows), default=num_cols)
+        return widths[src_name]
+
+    for bi, bcfg in enumerate(blocks_cfg):
+        rows_cfg = bcfg.get("rows") or {}
+        if rows_cfg.get("sources"):
+            src_names = list(dict.fromkeys(
+                s.get("source") for s in rows_cfg["sources"]))
+        else:
+            src_names = [rows_cfg.get("source")]
+        for col_map in bcfg.get("columns", []):
+            lookup = col_map.get("lookup")
+            if not isinstance(lookup, dict) or not lookup.get("name"):
+                continue
+            name = lookup["name"]
+            # Effective key_column — same precedence as resolve_lookup.
+            kcol = lookup.get("key_column") or tables.get(name)
+            if not kcol:
+                continue  # falsy → 现状非 crash 路径, 冻结保持原样
+            reason = _lookup_key_column_reason(kcol)
+            if reason == "invalid_format":
+                if (name, str(kcol)) in seen:
+                    continue
+                seen.add((name, str(kcol)))
+                defects.append({
+                    "code": "LOOKUP_KEY_COLUMN_INVALID", "reason": reason,
+                    "lookup": name, "block": f"block[{bi}]",
+                    "key_column": kcol,
+                    "message": f"lookup {name!r}: key_column {kcol!r} is not "
+                               "an Excel column letter (1-2 letters, "
+                               "case-insensitive, e.g. G) — lookup keys are "
+                               "read from the flattened source rows by "
+                               "column letter",
+                    "corrective_action": _lookup_key_column_corrective(
+                        kcol, reason, None),
+                })
+                continue
+            idx = col_letter_to_idx(kcol)
+            for src_name in src_names:
+                width = _source_width(src_name)
+                if width is None or idx < width:
+                    continue  # 源缺失/不可读 → SPEC_SOURCE_CSV; 宽度够 → 合法
+                if (name, str(kcol), src_name) in seen:
+                    continue
+                seen.add((name, str(kcol), src_name))
+                defects.append({
+                    "code": "LOOKUP_KEY_COLUMN_INVALID", "reason": reason,
+                    "lookup": name, "block": f"block[{bi}]",
+                    "key_column": kcol, "source": src_name,
+                    "message": f"lookup {name!r}: key_column {kcol!r} "
+                               f"resolves to column index {idx} but consumer "
+                               f"source {src_name!r} has {width} flattened "
+                               f"column(s) (A:{col_idx_to_letter(width - 1)}) "
+                               "— lookup keys are read from this source's rows",
+                    "corrective_action": _lookup_key_column_corrective(
+                        kcol, reason, width),
+                })
+    return defects
+
+
 def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list,
                    stats: dict | None = None, tcol: str = "") -> str | None:
     """Resolve a lookup for one row. Returns the field value, '' on missing
@@ -1064,7 +1195,25 @@ def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list,
         return None
     field = lookup.get("field")
     kcol = lookup.get("key_column") or tbl.get("key_column")
-    key = values[col_letter_to_idx(kcol)] if kcol else None
+    key = None
+    if kcol:
+        # issue 04 backstop: validate_lookup_key_columns intercepts invalid
+        # key_columns before any plan work; nothing may reach the old bare
+        # values[col_letter_to_idx(kcol)] IndexError even if a path slips
+        # past the static gate — same defect code + reason, row skipped.
+        idx = col_letter_to_idx(kcol) if isinstance(kcol, str) else -1
+        if not (0 <= idx < len(values)):
+            reason = _lookup_key_column_reason(kcol)
+            defects.append({
+                "code": "LOOKUP_KEY_COLUMN_INVALID", "reason": reason,
+                "key_column": kcol,
+                "message": f"lookup key_column {kcol!r} does not address a "
+                           f"cell in this source row ({len(values)} column(s))",
+                "corrective_action": _lookup_key_column_corrective(
+                    kcol, reason, len(values)),
+            })
+            return None
+        key = values[idx]
     norm_key = str(key).replace("\u00a0", " ").strip() if key is not None else None
     hit = tbl["data"].get(norm_key, {}) if norm_key is not None else {}
     if not hit:
@@ -2356,6 +2505,18 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     # Inplace declaration invariants (fail before layout: a
     # malformed region must never reach coordinate arithmetic).
     ip_ctx = validate_inplace_declaration(blocks_cfg, dims, defects)
+    if defects:
+        fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+             "Fix the spec and re-run compile_fill.py", defects)
+
+    # Lookup key_column guard (issue 04): an invalid key_column (logical
+    # field name like 'sku', or a column letter beyond the consumer source's
+    # width) used to crash resolve_lookup with a bare IndexError. Intercept
+    # BEFORE any plan work — single defect code LOOKUP_KEY_COLUMN_INVALID,
+    # reason invalid_format / out_of_range (no new taxonomy).
+    defects += validate_lookup_key_columns(
+        blocks_cfg, spec["mapping"], target_cfg, manifest_flat, workdir,
+        num_cols)
     if defects:
         fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
              "Fix the spec and re-run compile_fill.py", defects)

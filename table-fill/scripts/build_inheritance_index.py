@@ -4,7 +4,11 @@
 The index replaces the expensive pattern of querying matching SKU cells and then
 reading the whole workbook again to recover adjacent D/F/X fields. It uses one
 officecli ``view text`` call and emits only the structured candidates needed by
-Layer 3. No workbook library is used.
+Layer 3. No workbook library is used. When a sheet is used only as a
+lookup/inheritance input, build the index directly from the staged workbook
+(--input/--sheet). Do not add a sheet to the fill manifest solely for
+lookup/index construction: manifest membership is decided by fill-source use,
+not by lookup need.
 """
 
 from __future__ import annotations
@@ -159,7 +163,16 @@ def build_index(candidates: list[dict]) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a one-pass XLSX inheritance index")
+    parser = argparse.ArgumentParser(
+        description="Build a one-pass XLSX inheritance index",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "When a sheet is used only as a lookup/inheritance input, build the index\n"
+            "directly from the staged workbook (--input/--sheet). Do not add a sheet to\n"
+            "the fill manifest solely for lookup/index construction: manifest membership\n"
+            "is decided by fill-source use, not by lookup need."
+        ),
+    )
     parser.add_argument("--input", type=Path, required=True, help="staged XLSX input")
     parser.add_argument("--output", type=Path, required=True, help="JSON index output")
     parser.add_argument("--sheet", action="append", default=None, help="limit to a sheet; repeatable")

@@ -73,7 +73,7 @@ mapping:
       lookups:
         - name: sku_fields
           from: inheritance.json      # build_inheritance_index.py 输出
-          key_column: G
+          key_column: G                # 必须是当前展平源数据中真实存在的 Excel 列字母（如 G），不是索引逻辑键名/字段名
           fields: [factory_model, compressor, copper_spec]
           missing: empty              # error|empty
       formulas:                       # {r}=数据行号, {r1}:{r2}=聚合范围, {n}=数据行数
@@ -301,11 +301,33 @@ mapping:
 Compiler 自动归一化; 非 unique 共识按缺失处理。`missing: error` → 编译失败
 并列出缺失 key; `missing: empty` → 留空。
 
+key_column 必须是当前展平源数据中真实存在的 Excel 列字母（如 G），不是索引
+逻辑键名/字段名（大小写不敏感, 1-2 个字母; 列级 `columns[].lookup.key_column`
+优先于表级声明）。非法值在编译期拒绝, 单缺陷码 `LOOKUP_KEY_COLUMN_INVALID`:
+reason `invalid_format` = 不是列字母; `out_of_range` = 列字母超出该 lookup
+实际消费的展平源列宽（未被任何 column 引用的表级 lookup 不消费, 不检查）。
+
 **索引输入 sheet 排除目标 sheet**: 构建 inheritance 索引时**禁止把本次填充的
 目标 sheet 作为输入** — 目标 sheet 的既有数据是历史输出, 不是字段权威源;
 把它喂进索引会产生自引用: 同 SKU 在不同 sheet 的多值 → 共识 conflict → 按
 缺失处理 (静默留空, 常见排查线索见 KNOWN_TRAPS)。索引输入只用独立数据 sheet
 (如埃及 FRESH 的 01_埃及机型、09_Fresh拖多)。
+
+### Fill source use vs lookup-only use (硬性角色边界)
+
+- 某 sheet 作为 **fill source** 被消费（本次要展平并写进目标）→ 属于 fill
+  manifest，经 `prepare_run --flatten` 进入。
+- 某 sheet **仅为 lookup/inheritance** 被读取 → 不得为了构建索引把它
+  flatten 进当前 fill manifest；用 `build_inheritance_index.py --input
+  <staged.xlsx> --sheet <name>` 直接从 staged workbook 构建索引，不经
+  flatten。
+- 同一 sheet 同时承担 fill source 与 lookup 两种用途是**合法**的 — lookup
+  用途不改变、不重复其 manifest 身份；禁止把本契约读成"某类 sheet 天生
+  不能做 fill source"。
+- 违反后果（机械事实）: 对仅为 lookup/inheritance 读取的 sheet 执行
+  `--flatten` 会合并 manifest 条目并可改写 `manifest.target`、重算
+  source/target fingerprints → `fill_spec.fingerprints` 失配 → 编译拒绝，
+  且需手工恢复 manifest。
 
 ### formulas / merges / nulls
 
@@ -585,6 +607,7 @@ formulas:
   索引坏了 (结构问题 → 重建索引) — 重建前先检查**索引输入是否误含目标 sheet**
   (自引用: 目标 sheet 既有块与独立数据 sheet 同 SKU 多值 → 共识 conflict →
   按缺失处理, 表现与"整列未命中"相同, 见 KNOWN_TRAPS)。
+- 输入 sheet 取舍还受使用角色约束: 仅为 lookup 的 sheet 用 --input/--sheet 直接建索引、不经 flatten, 角色契约见 lookups 节「Fill source use vs lookup-only use (硬性角色边界)」。
 
 ### Q16: 模板行号空洞修复后指纹怎么办?
 
@@ -923,6 +946,7 @@ digest, 不要 unzip sheet XML 考古。
 | LOOKUP_KEY_MISSING / FIELD_MISSING | 查表失败 | missing: empty 或修 key/索引 |
 | LOOKUP_TABLE_EMPTY | 索引归一化后为空 (field_consensus 丢失 / 文件被手工改写) | 检查索引结构, 用 build_inheritance_index.py 重建 — 禁止手改 JSON |
 | LOOKUP_COLUMN_ALL_MISSING | 索引非空但声明 lookup 列全部未命中 (警告, 不阻断) | 判断真缺失 (记 gaps) 还是索引损坏 (重建); 重建前检查索引输入是否误含目标 sheet (自引用 → 共识 conflict → 缺失) |
+| LOOKUP_KEY_COLUMN_INVALID | lookup key_column 非法 (编译期拦截, exit 3) — reason invalid_format: 不是 1-2 位 Excel 列字母 (写了逻辑键名/字段名如 sku); reason out_of_range: 是列字母但超出该 lookup 实际消费的展平源列宽 | key_column 改成消费源中真实存在的 Excel 列字母 (如 G; 大小写不敏感, 双字母如 AB 需源列数足够) — 不是逻辑键名/字段名; key_column 缺失/为空不检查 |
 | HEADER_ROW_CONSIDERED_DATA | 展平 CSV 首行（表头文本行）被当作候选数据行 — rows 无 selector（或 selector 未排除首行）会把表头映射进数据区 (警告, 不阻断; issue 02 / Case 08 U1) | 在 rows.selectors 加 pattern/not_pattern 排除表头行 (如 `column A pattern 业务类别*` 或 `column A not_value 类别`) |
 | REQUIRED_COVERAGE_UNMATCHED | 必需源行未消费 | 修 selectors 或记入 gaps |
 | SPEC_TARGETS_TOO_MANY | 声明了多个目标 | 每次运行只编译一个目标 |

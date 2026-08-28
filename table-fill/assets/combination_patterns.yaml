@@ -5,11 +5,10 @@
 # 机制能力疑问 (支持/拒绝/接受性/Probe/Rescue) 按 references/CAPABILITY_EVIDENCE.md
 # 处理 — 该参考是唯一能力政策源, 按需加载。
 #
-# 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书
-# (tests/test_optimization.py: FillSpecContractTests / CapabilityMappingContractTests);
+# 每条模式的声明与 FILLSPEC「组合行为契约」一致, 并有编译用例背书;
 # 运行时可用 compile_fill.py --capabilities 直接向编译器查询整个契约矩阵。
 #
-# 完整 Canonical Pattern 准入说明 (issue 02):
+# 完整 Canonical Pattern 准入说明:
 #   - 完整 Canonical Pattern (如 preformatted_quotation_inplace) 入库必须同时满足:
 #     ① 来自真实任务; ② 有通过的 Validated Draft (E2E) 支撑; ③ skeleton 显著减少
 #     未来布局/业务表达决策。仅可编译、假想组合、单特性示例、语法展示不入库。
@@ -208,7 +207,7 @@ patterns:
                 formula: "SUM(T{r1}:T{r2})"
                 style: anchor
 
-  # ── 完整 Canonical Pattern: 预格式报价模板 (issue 02, MXP 同形) ──
+  # ── 完整 Canonical Pattern: 预格式报价模板 ──
   - id: preformatted_quotation_inplace
     question: 预格式报价模板 (带样式占位区 + 分组合并 + 绝对写 + 数字格式) 怎么写?
     answer: 完整 skeleton 一次实例化 — 按下方替换表把占位标记换成 digest/业务映射
@@ -276,8 +275,7 @@ patterns:
         required_empty: []
         key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>, <KO5>, <KO6>]
     note: |
-      完整 Canonical Pattern (准入见本文件头部说明): 真实预格式报价 Validated Draft
-      E2E 同形骨架 (tests/test_mxp_e2e.py, 2026-08-16 入库), 数据中立, 不携带客户/
+      完整 Canonical Pattern (准入见本文件头部说明): 数据中立, 不携带客户/
       sheet/行号/价格/lookup/文案事实。结构关系全部在同一 fragment: terminal inplace
       消费 → 编译器 Trim (N<capacity, 尾部) / overflow 克隆 (N>capacity) → mapped +
       label-only 两类 group_merges → block-external sets (模板坐标, 区下位移由 Excel
@@ -285,7 +283,7 @@ patterns:
       = 结构事实与 digest 不符, 以 compile 缺陷码为准修正。Pattern 是推荐构造路径,
       不是能力白名单, 不声明 cross-Run support; 同类组合未逐一验证, 不做支持承诺。
 
-  # ── 完整 Canonical Pattern: 多产品组块 (家用/商用双数据块追加, issue 03) ──
+  # ── 完整 Canonical Pattern: 多产品组块 (家用/商用双数据块追加) ──
   - id: multiproduct_block_append
     question: "家用/商用等多产品组块追加 (每个源 sheet 一块: 克隆残留 + 分组系列盈亏 + 块总盈亏 + 合并) 怎么写?"
     answer: "完整 skeleton 一次实例化 — 每个源 sheet 一块 clone_roles [spacer, title,
@@ -427,13 +425,8 @@ patterns:
         required_empty: []
         key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>, <KO5>, <KO6>, <KO7>]
     note: |
-      完整 Canonical Pattern (准入见本文件头部说明): 真实任务 Case 05/06 (毛利表 →
-      报价汇总 11_FRESH本土 追加家用/商用双数据块) 的 Validated Draft 同形骨架
-      (2026-08-19 入库)。真实执行证据 (compile 一次过 → execute readback 627/627)
-      见 docs/test-cases/case-005 与 case-006 复盘 — 本骨架复用其 V/W 显式范围
-      merges+aggregates 与双块几何; 仓库内机械背书 = 实例化契约测试 (compile 级
-      plan 形态断言, tests/test_optimization.py → MultiproductBlockPatternContractTests),
-      数据中立 — 用下方占位标记替换列名/行数/公式即得合法 FillSpec。
+      完整 Canonical Pattern (准入见本文件头部说明): 数据中立 — 用下方占位标记
+      替换列名/行数/公式即得合法 FillSpec。
       结构与语义锁定:
       ① 每个源 sheet 一块, clone_roles [spacer, title, header, data], data 的
       template_row 必须非合并锚点 (CLONE_SOURCE_IS_ANCHOR);
@@ -456,7 +449,7 @@ patterns:
       Pattern 是推荐构造路径, 不是能力白名单, 不声明 cross-Run support; 同类组合
       未逐一验证, 不做支持承诺。
 
-  # ── 完整 Canonical Pattern: 单块报价/核价块追加 (issue 02, MXP 17_MXP 同形) ──
+  # ── 完整 Canonical Pattern: 单块报价/核价块追加 ──
   - id: single_quotation_block_append
     question: "核价邮件 → 报价汇总单块 append (一个源 sheet 一块: 标题+表头+数据 + 净价公式链 + 总盈亏 + 0-口径费用列) 怎么写?"
     answer: "完整 skeleton 一次实例化 — clone_roles [spacer, title, header, data];
@@ -479,7 +472,7 @@ patterns:
       #   成本 R 由 <COST_SRC>→<COST_COL> round4; 源无此角色 → value: "0" 常量
       # <TOTAL_COL>:       总盈亏聚合列 (merges+aggregates, 聚合锚点=块首行=合并锚点)
       # <NULL_COL_1>/<NULL_COL_2>/<NULL_COL_3>: 克隆残留列 (模板行携带未映射 → 逐行清空);
-      #   `[1]` 外部工作簿引用列 (如 <NULL_COL_2>) 直接 null, 不复刻公式 (U7, 见 issue 03)
+      #   `[1]` 外部工作簿引用列 (如 <NULL_COL_2>) 直接 null, 不复刻公式 (U7)
       # <KO1>..<KO4>:      key_outputs (块首数据行 / 净价公式格 / 比率公式格 / 总盈亏锚点格)
       mapping:
         targets:
@@ -537,20 +530,17 @@ patterns:
         required_empty: []
         key_outputs: [<KO1>, <KO2>, <KO3>, <KO4>]
     note: |
-      完整 Canonical Pattern (准入见本文件头部说明): 真实任务 Case 08 (核价邮件 →
-      MXP 17_MXP 报价汇总单块追加, 一拖多外机, 2026-08-18) 的 Validated Draft
-      同形骨架, 数据中立 — 用下方参数替换表把占位标记换成 digest/业务映射事实即得
-      合法 FillSpec; 机械契约测试 = 实例化编译 (tests/test_optimization.py →
-      SingleBlockQuotationPatternContractTests)。
+      完整 Canonical Pattern (准入见本文件头部说明): 数据中立 — 用下方参数替换表
+      把占位标记换成 digest/业务映射事实即得合法 FillSpec。
       本骨架是 `multiproduct_block_append` (双数据块) 的**单块同构**: 同一套
       [spacer, title, header, data] + 克隆残留 nulls + 总盈亏 merges+aggregates
       (聚合锚点=块首行=合并锚点, Q12) + ROUND 精准公式; 单块不设类别分组合并,
       需要分组时才加 group_merges (聚合列一律不进 group_merges)。结构与语义锁定:
       ① rows.selectors **必须写** — 展平 CSV 首行（表头）是候选数据行, 无 selector
-      会把表头文本映射进数据区 (Case 08 U1); 排除表头行用 pattern / not_pattern
+      会把表头文本映射进数据区 (U1); 排除表头行用 pattern / not_pattern
       (如 `column A pattern 业务类别*` / `not_value: 类别`), Compiler 以
       HEADER_ROW_CONSIDERED_DATA 警告背书;
-      ② 0-口径 (Case 07 F1): 商业/费用列 (财务费用/OA信保/返点/其他费用) 被净价
+      ② 0-口径: 商业/费用列 (财务费用/OA信保/返点/其他费用) 被净价
       公式引用, 源无此角色 → `value: "0"` 常量, 不得写空串 (空串 → #VALUE! →
       IFERROR 兜底 0) — 见 zero_policy pattern;
       ③ 克隆残留列 (模板行携带未映射) nulls: rows: all; **聚合列 (<TOTAL_COL>)
@@ -559,9 +549,9 @@ patterns:
       同范围显式 merges 覆盖 (本骨架已配 merges+aggregates 对);
       ⑤ **`[1]` 前缀 = 外部工作簿引用**: 参考行带模板缓存值可显示旧值, 但新写公式
       未重建外部链接不可求值 (`formula_not_evaluated`) — 不含管/外部数据 → 该列
-      直接 null (置于 <NULL_COL_x>), 不复刻公式 (Case 08 U7, 机械事实见 issue 03);
+      直接 null (置于 <NULL_COL_x>), 不复刻公式 (U7);
       ⑥ ROUND 精准: 减法/乘法/除法/SUM 聚合 ROUND(...,2), 比率 ROUND(...,4),
-      纯加法不加 ROUND (见 SKILL「公式约定」);
+      纯加法不加 ROUND;
       ⑦ key_outputs 取块首数据行 + 公式格 + 聚合/合并锚点格 (行号取自 plan
       blocks[].data_start, 不手工重推)。
       Pattern 是推荐构造路径, 不是能力白名单, 不声明 cross-Run support; 同类组合

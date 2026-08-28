@@ -107,6 +107,9 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
   `file.xlsx:S1,S2;file2.xlsx:S3`) — 漏列触发 TARGET_NOT_FLATTENED, 补跑即可。
 - flatten 可**多次调用增量展平** (先源后目标或分 sheet 批次, 兜底不是常态):
   manifest 按 name 合并, 新覆盖旧, 不互相覆盖。
+- **不得仅为构建 lookup/inheritance 索引而把 sheet flatten 进当前
+  manifest** — 索引直接用 `build_inheritance_index.py` 读 staged
+  workbook (契约见 FILLSPEC「Fill source use vs lookup-only use」)。
 - **行号空洞修复 (TEMPLATE_ROW_GAP)**: `scripts/repair_row_gaps.py --workdir <dir>`
   物化缺失行元素后**自动重跑 flatten (仅目标 sheet) 同步 manifest 指纹** —
   flatten 不需手工重跑; 唯一动作 = 更新 spec 的 target_structure 指纹
@@ -387,6 +390,28 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
 
 **撰写规程 (先写后编译循环)**:
 
+- **首版收敛原则 (硬性)**:
+  - MOD Resolution 完成后，立即以当前证据撰写首版 `fill_spec.yaml` —
+    下一项主要产物就是它。
+  - 命中 canonical pattern 时直接实例化其骨架 (改替换表占位即得)，不寻找
+    相似案例、不重新推导组合、不重读 case 材料；个别参数拿不准也先完成
+    其余部分进入 Compile。
+  - 只有**阻塞项**才允许延迟首次 Compile。阻塞项 = 不回答就无法用 FillSpec
+    表达业务结果的业务未知项 (如: 目标 sheet 未确定；块数量/输出形态未
+    确定；关键业务语义无任何权威来源)。
+  - 能由 Compiler 机械检出的问题**不是阻塞项** (如: 列名/列字母合法性、
+    lookup/key_column、merge、clone residue、aggregate、源行覆盖率) —
+    交给 Compiler 暴露后按 corrective_action 定向修，不得在 Compile 前
+    手工预证明。
+  - 已被本次用户明确指令或 Selected MOD 解决的**业务语义**，以及已被当前
+    输入事实确定的**结构事实/前提**，不得因"想进一步确认"重开、再 ASK
+    或追加调查。
+  - 冲突消解 — 业务语义的裁决序: 本次用户明确指令 > Selected MOD >
+    canonical pattern 默认语义。当前输入/工作簿中的客观事实用于解析结构
+    与验证前提，是证据不是权威，不反向改写已确定的业务语义。结构合法性
+    由 Compiler 裁决 (Compiler > pattern/example)。
+  - 非阻塞的辅助证据准备 (lookup index、coverage 了解等) 不得延迟首版
+    FillSpec 落盘与首次 Compile。
 - **先写后编译**: 写 spec (信任 FILLSPEC「组合行为契约」+「能力映射表」,
   按问题定位答案) → `compile_fill.py` (单轮 ~0.1s) → stderr 缺陷清单
   (code + corrective_action) 即**权威反馈** → 定向修 → 重编译。**失败成本已
@@ -462,6 +487,7 @@ block/继承/合并结构、静默丢弃候选 — 时, **默认第一轮先查
 定向修。**命中 canonical pattern → 直接实例化** (改替换表占位列名即可),
 **不再读 case 复盘 / 测试病历重推组合** (Case 07 改进 2: E3/E4 类重复推导
 压缩为一次实例化)。
+此规则在首版撰写阶段同样适用 (见 §3「首版收敛原则」)。
 
 ### 5. Draft Execution — `execute_batch.py` (唯一一次填充)
 
