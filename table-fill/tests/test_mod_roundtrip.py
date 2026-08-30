@@ -34,6 +34,7 @@ from mod_capture import (  # noqa: E402
     CaptureError,
     CaptureRequest,
     _do_create,
+    _do_update,
 )
 import mod_nominate  # noqa: E402
 
@@ -774,6 +775,118 @@ class TestDisplayNameAndNominationEvaluators(unittest.TestCase):
         r = mod_nominate.signal_matched(
             "block_layout", "customer_quote_header_data_total_terms", "ev", digests, [])
         self.assertIs(r, False, "表头角色缺失 → miss")
+
+
+# ── Test: Display Name preserved across capture update ────────────────────
+#
+# The rebuilt header must carry the existing MOD's `Display Name` metadata —
+# the stored file after update equals the reviewed candidate (no post-capture
+# patch), and the nomination card keeps its Chinese label.
+
+
+class TestDisplayNamePreservation(_CaptureRootCase):
+    """_do_update keeps `Display Name` from the existing MOD file.
+
+    Uses an UNPREFIXED MOD name on purpose: capture accepts both name forms in
+    the current working tree, but only the unprefixed form is unambiguous under
+    plain `MOD_<name>.md` path derivation — keeping both forms supported.
+    """
+
+    _MOD_NAME = "PRESERVE_DN"
+
+    def _seed_index_and_mod(self, refs: Path, index: Path):
+        index.write_text(
+            "## Registered MODs\n\n"
+            "| MOD Name | Aliases | Scope Signals (+) | Exclusion Signals (-) "
+            "| Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {self._MOD_NAME} | dn-alias | semantic_type::dn |  | "
+            "MOD_PRESERVE_DN.md | 1 | private |\n",
+            encoding="utf-8",
+        )
+        (refs / "MOD_PRESERVE_DN.md").write_text(
+            f"# {self._MOD_NAME}\n\n## Purpose\n\n"
+            "MOD created by table-fill capture.\n"
+            "Revision: 1\nVisibility: private\nRule count: 1\n\n"
+            "## Metadata\n\n- Scope Signals: semantic_type::dn\n"
+            "- Aliases: dn-alias\n- Display Name: 中文展示名\n- Exclusion Signals: \n\n"
+            "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+            "|---------|-------|------|-------------|------------|-------|\n"
+            "| R01 | mapping | mod_gate | Test rule. | * | |\n",
+            encoding="utf-8",
+        )
+
+    def test_update_preserves_display_name_into_rebuilt_header(self):
+        root, refs, index = self.make_capture_root()
+        self._seed_index_and_mod(refs, index)
+        self.patch_capture_paths(refs, index)
+        source = self.tmpdir / "draft.md"
+        source.write_text(_valid_source_rules(
+            "| R01 | mapping | mod_gate | Test rule. | * | |"), encoding="utf-8")
+        req = CaptureRequest(
+            mod_name=self._MOD_NAME, action="update", source=source,
+            scope_signals="semantic_type::dn", aliases="dn-alias",
+            exclusion_signals="")
+        out = _do_update(req)
+        self.assertEqual(out["revision"], 2)
+        stored = (refs / "MOD_PRESERVE_DN.md").read_text(encoding="utf-8")
+        self.assertIn("- Display Name: 中文展示名", stored,
+                      "update must carry the existing Display Name into the rebuilt header")
+        entries = parse_mod_index(index.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 1,
+                         "update must replace the row, never duplicate it")
+        self.assertEqual(entries[0].revision, 2)
+        self.assertTrue((refs / "MOD_PRESERVE_DN.md.bak").is_file(),
+                        "update must create the .bak backup")
+
+    def test_update_without_existing_display_name_omits_line(self):
+        root, refs, index = self.make_capture_root()
+        self._seed_index_and_mod(refs, index)
+        stored_path = refs / "MOD_PRESERVE_DN.md"
+        text = stored_path.read_text(encoding="utf-8")
+        stored_path.write_text(
+            text.replace("- Display Name: 中文展示名\n", ""), encoding="utf-8")
+        self.patch_capture_paths(refs, index)
+        source = self.tmpdir / "draft.md"
+        source.write_text(_valid_source_rules(
+            "| R01 | mapping | mod_gate | Test rule. | * | |"), encoding="utf-8")
+        req = CaptureRequest(
+            mod_name=self._MOD_NAME, action="update", source=source,
+            scope_signals="semantic_type::dn", aliases="dn-alias",
+            exclusion_signals="")
+        out = _do_update(req)
+        self.assertEqual(out["revision"], 2)
+        stored = (refs / "MOD_PRESERVE_DN.md").read_text(encoding="utf-8")
+        self.assertNotIn("- Display Name:", stored)
+
+    def test_build_mod_content_emits_display_name_in_metadata_order(self):
+        req = CaptureRequest(
+            mod_name="DN", action="create", source=Path("."),
+            scope_signals="s", aliases="a", exclusion_signals="e")
+        content = mod_capture._build_mod_content(
+            "DN", "body", req, 1, display_name="中文名")
+        i_alias = content.index("- Aliases: a")
+        i_dn = content.index("- Display Name: 中文名")
+        i_excl = content.index("- Exclusion Signals: e")
+        self.assertLess(i_alias, i_dn)
+        self.assertLess(i_dn, i_excl)
+
+    def test_extract_display_name_absent_returns_empty(self):
+        self.assertEqual(
+            mod_capture._extract_display_name("# X\n\n## Metadata\n\n- Scope Signals: s\n"),
+            "")
+        self.assertEqual(
+            mod_capture._extract_display_name("# X\n\n## Metadata\n\n"
+                                              "- Scope Signals: s\n- Aliases: a\n"),
+            "")
+
+    def test_extract_display_name_finds_existing_entry(self):
+        text = ("# X\n\n## Metadata\n\n- Scope Signals: s\n- Aliases: a\n"
+                "- Display Name: 中文展示名\n- Exclusion Signals: e\n\n"
+                "| Rule ID | Group | Gate | Description | Applies to | Notes |\n"
+                "|---------|-------|------|-------------|------------|-------|\n"
+                "| R01 | mapping | mod_gate | r | * | |\n")
+        self.assertEqual(mod_capture._extract_display_name(text), "中文展示名")
 
 
 if __name__ == "__main__":

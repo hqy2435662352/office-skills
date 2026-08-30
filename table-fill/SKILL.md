@@ -303,6 +303,14 @@ MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.p
   spec 撰写上下文前必须已加载 (硬性, 不因输出形态优化放宽);
 - `MOD NONE` 或 status=`none` (无候选) 时无规则注入, 按无 MOD 流程撰写。
 
+**撰写纪律 (轻量, 不改动上述硬性流程)**: 以下三条只影响撰写时的认知组织方式:
+
+- 全量加载契约不变: 选中 MOD 的全部规则仍在 FillSpec 撰写前加载;
+- 若 MOD 含 `## Runtime Core`: 先建立其业务心智模型再撰写;
+- 若 MOD 含 `## Attention Map`: 一次性撰写 FillSpec 时按 resolve → map →
+  transform → validate 的认知顺序考虑业务问题 (注意力分组, 不是流水线阶段,
+  不减少任何规则的加载)。
+
 **MOD 规则变更必须经用户审核 (硬性)**: 任何向 MOD 添加、修改、删除规则
 (规则本体/Notes/Applicability/摘要/场景上下文) 的行为, agent 必须先呈现
 「拟变更规则 + 理由 + 逐条 diff」, 用户明确确认后才允许写入。MOD 内容禁止

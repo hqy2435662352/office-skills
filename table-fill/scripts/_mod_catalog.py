@@ -310,6 +310,109 @@ def parse_mod_rules(text: str) -> list[ModRule]:
     return rules
 
 
+# ── Attention Map parsing (spec §5.2 — presentation/authoring metadata) ────
+
+# Section regex mirrors mod_nominate.parse_mod_file's section extraction
+# (`## Name[^\n]*\n(.*?)(?=\n## |\Z)` with re.S): capture everything after the
+# header line up to the next `## ` heading or end of text.
+_ATTENTION_MAP_SECTION_RE = re.compile(
+    r"## Attention Map[^\n]*\n(.*?)(?=\n## |\Z)", re.S)
+# Group lines follow the Applicability `- key: value` convention:
+# `- <group>: <ID>, <ID>, ...`. Group is a single [\w_]+ token — the parser
+# does NOT validate group names (the closed set is the capture validator's job).
+_MAP_LINE_RE = re.compile(r"^\s*-\s*([\w_]+):\s*(.*?)\s*$")
+
+
+class AttentionMapParseError(ValueError):
+    """A content line inside the `## Attention Map` section is malformed.
+
+    Carries the 1-based file line number and the offending line text so the
+    capture validator can convert the failure into a CaptureError with
+    line-scoped corrective hints. The parser NEVER silently ignores a
+    non-blank line: if it cannot be understood, it is refused here.
+    """
+
+    def __init__(self, message: str, line_number: int, text: str) -> None:
+        super().__init__(message)
+        self.line_number = line_number
+        self.text = text
+
+
+def parse_attention_map_lines(text: str) -> list[tuple[str, list[str]]] | None:
+    """Line-level Attention Map parse — the ordered view capture needs.
+
+    Returns a list of ``(group, ids)`` tuples in file order, or ``None`` when
+    the MOD has no ``## Attention Map`` section (legacy MOD — capture-time
+    validation must stay disabled). Raises :class:`AttentionMapParseError` on
+    the first malformed content line.
+
+    Strictness (documented contract): blank and whitespace-only lines inside
+    the section are skipped; every other line must match
+    ``- <group>: <ID>, <ID>, ...``. A line with nothing after the colon, a
+    line that is not a ``- group:`` list item, or an ID list containing empty
+    elements (e.g. a double comma) is malformed and raises — nothing is
+    silently dropped, because a validator cannot reject lines it never sees.
+    """
+    m = _ATTENTION_MAP_SECTION_RE.search(text)
+    if m is None:
+        return None  # legacy MOD — no Attention Map section
+    # 1-based line number of the `## Attention Map` header in the full text.
+    header_line = text.count("\n", 0, m.start()) + 1
+    result: list[tuple[str, list[str]]] = []
+    for offset, raw in enumerate(m.group(1).splitlines()):
+        line_no = header_line + 1 + offset
+        stripped = raw.strip()
+        if not stripped:
+            continue  # blank lines between group lines are fine
+        mm = _MAP_LINE_RE.match(raw)
+        if mm is None:
+            raise AttentionMapParseError(
+                f"line {line_no}: {stripped!r} must match "
+                "`- <group>: <ID>, <ID>, ...`",
+                line_no, stripped)
+        group, ids_raw = mm.group(1), mm.group(2).strip()
+        if not ids_raw:
+            raise AttentionMapParseError(
+                f"line {line_no}: {stripped!r} has no Rule IDs after the "
+                "colon — must match `- <group>: <ID>, <ID>, ...`",
+                line_no, stripped)
+        ids = [i.strip() for i in ids_raw.split(",")]
+        if any(not i for i in ids):
+            raise AttentionMapParseError(
+                f"line {line_no}: {stripped!r} contains an empty Rule ID "
+                "(e.g. a double comma) — must match "
+                "`- <group>: <ID>, <ID>, ...`",
+                line_no, stripped)
+        result.append((group, ids))
+    return result
+
+
+def parse_attention_map(text: str) -> dict[str, list[str]] | None:
+    """Parse a MOD's ``## Attention Map`` section into ``{group: [IDs]}``.
+
+    Returns ``None`` when the section is absent — a legacy MOD, for which
+    capture-time validation stays disabled. An EMPTY section returns ``{}``:
+    the section is present but assigns no rules to any group, which ENABLES
+    validation and then fails the coverage check at capture time.
+
+    The dict preserves the file order of group lines (plain dict keeps
+    insertion order). Duplicate group lines collapse in this dict view —
+    the group-unique and in-group-duplicate checks need the per-line view,
+    so capture validation uses :func:`parse_attention_map_lines` instead.
+
+    Deliberately dumb: groups are not validated against the closed set
+    (resolve/map/transform/validate — the capture validator's job) and no
+    priority/dependency/enforcement/condition fields are parsed.
+    """
+    lines = parse_attention_map_lines(text)
+    if lines is None:
+        return None
+    out: dict[str, list[str]] = {}
+    for group, ids in lines:
+        out.setdefault(group, []).extend(ids)
+    return out
+
+
 # ── Dict conversion helpers (for mod_nominate.py compatibility) ────────────
 
 

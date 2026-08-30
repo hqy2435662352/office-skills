@@ -21,8 +21,11 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 ## Metadata           # Scope Signals / Aliases / Display Name / Exclusion Signals
 ## Applicability      # 业务逻辑指纹 — 提名匹配依据 (脚本读取)
 ## 业务逻辑摘要       # 提名卡数据源 (脚本读取)
+## Runtime Core       # 裁决后业务心智模型（可选，推荐；不进提名卡）
+## Attention Map      # 阅读顺序元数据（可选，推荐；机器校验，不进提名卡）
 ## 业务场景上下文     # 业务背景 (可含客户示例, 但规则本体不得硬编码)
 | Rule ID | Group | Gate | Description | Applies to | Notes |   # 六列规则表
+## Export Field Policy  # 字段资格政策（可选；使用时位于规则表之后，见已迁移 MOD）
 ```
 
 ## Metadata 段
@@ -54,6 +57,70 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 3-8 条要点式规则摘要，供用户在提名卡上快速判断"是不是我要的那套逻辑"。
 示例：`- 映射: 原型机成本 = 源面价(更新) − 源铜管成本; 上一单报价 → 历史报价`
 
+## Runtime Core（可选，推荐）
+
+**用途**: 裁决后执行心智模型 —— Agent 在 MOD 被用户选定（裁决）后、撰写 FillSpec
+前必须首先建立的业务世界模型（"我在做这个任务时按什么业务主线思考"）。
+位于 `业务逻辑摘要` 之后、`Attention Map` 之前（见「文件结构」）。
+
+- **内容 (authoring guidance，非硬 schema)**: 3~6 条、约 150~300 字的执行导向要点
+  （权威源职责、处理顺序、禁止静默推断的边界等）。**不写坐标/案例/历史原因**；
+  **不重复**六列规则表与 QA checklist。
+- **边界（硬性）**: Runtime Core **不参与 MOD 提名/候选卡生成**，仅在 MOD 被
+  选中/确认后与完整选中 MOD 内容一起加载。提名卡仍只用 `Applicability` +
+  `业务逻辑摘要`；两者职责不合并——摘要强调**区分度**（帮用户选 MOD），Core
+  强调**执行导向**（帮 Agent 做任务），也不替代 `业务逻辑摘要`。
+- **机器校验**: 仅"段存在则必须非空"（capture 时检查，见下节）；"3~6 条 /
+  150~300 字"是 authoring guidance，不是硬 schema。
+
+## Attention Map（可选，推荐）
+
+**用途**: 阅读顺序元数据 —— 把 MOD 全部规则按四个固定 attention group 组织，
+让 Agent 在一次性撰写 FillSpec 时按认知顺序考虑业务问题。它是**呈现与撰写辅助
+元数据**，不是执行阶段图，也不是规则投递机制（否定定义见下）。
+
+```markdown
+## Attention Map
+
+- resolve: SRC-001, SRC-002      # 先解决身份/权威源问题
+- map: FLD-001, FLD-002          # 再建立映射
+- transform: TRN-001             # 再做转换
+- validate: VAL-001, VAL-002     # 最后核验
+```
+
+- **物理格式**: Markdown 列表，沿 `Applicability` 的 `- key: value` 风格，每行
+  `- <group>: <ID>, <ID>, ...`。段内每个非空内容行必须匹配该语法；**冒号后无
+  ID、或 ID 列表含空元素（如双逗号）= malformed** —— dumb parser 不
+  silent-ignore（校验器不能拒收它看不见的行）。
+- **四组闭集**: `resolve / map / transform / validate`——是 authoring concerns /
+  attention groups，**不是流水线 phase**。
+- **重复规则**: 一条 Rule 允许进入多个 group（如安全规则同属 map + validate，
+  跨组重复**合法**）；同一 group 内同一 Rule ID **不允许**重复。
+- **格式稳定性**: 每个 group 最多出现一次（不引入 append/override 语义）；出现的
+  group 必须遵循 resolve → map → transform → validate 相对顺序（允许子集，禁止
+  乱序）。
+- **否定定义（spec 级，防止实现漂移）**:
+  > Attention Map is presentation and authoring metadata, not an execution
+  > phase map and not a rule-delivery mechanism. All selected MOD rules remain
+  > required to be loaded before FillSpec authoring.
+- **capture 硬校验**（`mod_capture.py` create/update 写盘前执行，校验对象是最终
+  完整 candidate body；**仅当 MOD 存在 `## Attention Map` 时启用**，旧 MOD 无此段
+  → 行为完全不变；全部失败 **exit 3**，违规聚合成一条错误消息，malformed line
+  例外——dumb parser 先拒收，错误带行号与纠正提示）:
+  1. **malformed line**: 段内每个非空内容行必须匹配 `- <group>: <ID>, <ID>, ...`，
+     否则拒收（含冒号后无 ID / 空 ID 元素）；
+  2. **dangling**: Map 引用的每个 Rule ID 必须存在于规则表；
+  3. **coverage**: 规则表每条 Rule 至少出现在一个 group；
+  4. **closed set**: group 名只能是 resolve / map / transform / validate；
+  5. **group 唯一**: 每个 group 最多出现一次；
+  6. **顺序**: 出现的 group 遵循 resolve → map → transform → validate 相对顺序
+     （允许子集）；
+  7. **组内重复**: 同一 group 内同一 Rule ID 出现两次 → 拒收；
+  8. **跨组重复**: 合法（不做任何拦截——覆盖检查用集合，重复引用不误伤）。
+  **Runtime Core** 的"存在则非空"检查在同一校验块内执行（声明段为空 → 拒收）。
+  Rules 表物理顺序由作者按"首要 attention group"人工组织（authoring guidance），
+  **不做自动重排 formatter**；Map 是唯一机器检查对象。
+
 ## 规则表 Schema（六列, 顺序固定）
 
 | Column | Required | Description |
@@ -70,7 +137,8 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 **任何向 MOD 添加、修改或删除规则的行为，必须先经用户明确审核确认，不得静默写入。**
 
 - 适用范围：规则本体（Description）、Notes、Applicability、业务逻辑摘要、
-  业务场景上下文——一切会改变 MOD 语义的编辑。
+  业务场景上下文、Runtime Core、Attention Map、Export Field Policy——一切
+  会改变 MOD 语义的编辑。
 - 流程：agent 呈现「拟变更的规则 + 变更理由 + 逐条 diff」→ 用户审核并明确
   确认 → 才允许执行 `mod_capture.py`（create/update）或手工落盘。
 - Notes 约束：
@@ -123,6 +191,9 @@ logic as a private MOD.
 - `mod_capture.py` never writes `mod_state.yaml` (V2 已彻底废弃该文件).
 - On update, backups (`MOD_<name>.md.bak`, `MOD_INDEX.md.bak`) are created before
   mutation, revision is incremented by one, and temp-file replacement is used.
+- On update, the existing `Display Name` (Metadata) is carried into the rebuilt
+  header — the stored file always equals the reviewed candidate, never a
+  post-capture patch.
 
 **Manual registration** (one-off, no verified run needed):
 1. Copy this template to `references/MOD_<name>.md`.
