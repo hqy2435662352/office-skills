@@ -53,7 +53,24 @@ import structure_digest  # noqa: E402
 
 MANIFEST_NAME = "prepare_manifest.json"
 
-
+# Business Reasoning Barrier (spec: .scratch/table-fill-mod-barrier/ — ticket 02):
+# flatten 阶段不再生成完整 digest，只生成 Pre-MOD Evidence 视图；完整 digest
+# 延后到 MOD Resolution 解锁后由 Agent 单独调用 structure_digest.py 补生成
+# (每个需要的 sheet 一条, 目标 sheet 加 --target)。
+#
+# flattened 条目因此出现两条并存的契约字段:
+#   - "evidence": 指向该 sheet 的 {name}_premod_evidence.md (Pre-MOD 视图)。
+#   - "digest":   对 xlsx 条目是 DEFERRED 标记"deferred" (见下), **不是文件名**。
+#
+# 消费者不得把 deferred 的 digest 字段当作文件路径 (task_resume.py 的
+# digest 文件存在性检查只用于 Task-Orchestration 物化 run 目录, 那些目录
+# 由 flatten_cache.materialize_entry 产出真实的 {name}_digest.md —— 并非
+# prepare_run --flatten 的产物, 因此不会命中该 deferred 标记)。
+#
+# 屏障范围仅限 xlsx 主路径: pptx flatten 仍写其自带 minimal digest
+# (真实 {name}_digest.md, 无 evidence 字段), 见 flatten_pptx_table /
+# run_flatten_stage 的 xlsx=False 调用点。
+DIGEST_DEFERRED = "deferred"
 
 
 def structure_facts(meta: dict) -> dict:
@@ -204,7 +221,27 @@ def ascii_slug(text: str) -> str:
     return slug or "sheet"
 
 
-def _entry_for(fname: str, s: str, n: str) -> dict:
+def _entry_for(fname: str, s: str, n: str, *, xlsx: bool = True) -> dict:
+    """单 run flattened 条目形态。
+
+    xlsx=True (主路径, Business Reasoning Barrier/ticket 02):
+      - "evidence" → {n}_premod_evidence.md (Pre-MOD 视图, flatten 阶段产出);
+      - "digest"   → DIGEST_DEFERRED ("deferred"), 完整 digest 延后到 MOD
+        Resolution 解锁后补生成 —— 这是标记, **不是文件路径**。
+
+    xlsx=False (pptx 路径): 保持旧形态 —— 真实 {n}_digest.md, 无 evidence
+    字段 (pptx flatten 仍写自带 minimal digest)。"""
+    if xlsx:
+        return {
+            "file": fname,
+            "sheet": s,
+            "name": n,
+            "csv": f"{n}_flat.csv",
+            "meta": f"{n}_meta.json",
+            "evidence": f"{n}_premod_evidence.md",
+            "digest": DIGEST_DEFERRED,
+            "candidates": f"{n}_candidates.yaml",
+        }
     return {
         "file": fname,
         "sheet": s,
@@ -327,7 +364,7 @@ def run_flatten_stage(workdir: Path, sheets_arg: str, target: str) -> None:
                          f"pptx flatten needs 'slide[N]/table[@id=M]' targets, got: {s!r}",
                          "Use the table id from the outline (e.g. slide[5]/table[@id=3])")
                 flatten_pptx_table(staged, s, n, workdir)
-                entry = _entry_for(fname, s, n)
+                entry = _entry_for(fname, s, n, xlsx=False)
                 if fname == target:
                     target_entry = entry
                 flattened.append(entry)
@@ -359,7 +396,8 @@ def run_flatten_stage(workdir: Path, sheets_arg: str, target: str) -> None:
             r = _sp.run(
                 [sys.executable, str(Path(__file__).resolve().parent / "structure_digest.py"),
                  "--meta", str(meta_path), "--csv", str(workdir / entry["csv"]),
-                 "--candidates", str(cand_path), "--out", str(workdir / entry["digest"])]
+                 "--candidates", str(cand_path), "--pre-mod",
+                 "--out", str(workdir / entry["evidence"])]
                 + (["--target"] if fname == target else []),
                 capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:

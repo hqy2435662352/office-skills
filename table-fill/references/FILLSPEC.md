@@ -23,8 +23,11 @@ native 路径（见 CAPABILITY_EVIDENCE.md 任务形态矩阵）。本 spec 不�
 ```yaml
 task:
   intent: 迁移 FRESH 订家用机型毛利到报价汇总 11_FRESH本土，追加新历史块
-  selected_mod: NONE              # 或 MOD 名 (来自 mod_resolution.json)
-  selected_mod_revision: null
+  selected_mod: NONE              # 契约: 必须等于 mod_resolution.json 最终裁决的 selected 字段
+                                  #   (status=resolved 时严格相等; NONE 仅在裁决为 NONE 或
+                                  #   status=none 时合法)
+  selected_mod_revision: null     # 必须等于裁决记录的 selected_revision (selected=NONE 短路, 可不填)
+                                  # 编译器 C2/C3 机械校验 (错误码见「常见编译错误速查」)
 
 inputs:
   sources: [source_maoli.xlsx]    # staged 文件名 (prepare_manifest.json)
@@ -973,3 +976,7 @@ digest, 不要 unzip sheet XML 考古。
 | CAPABILITY_NOT_ROLLED_OUT | 声明 spike 未解锁的能力 (如 group_aggregates.whole_run 跨块总计, 落点语义待 spike) | 用已解锁表达 (每组合一块 + 块级 aggregates), 或等 spike 结论落地 |
 | PPTX_CAPABILITY_NOT_ROLLED_OUT | pptx 声明未 rollout 能力: inplace / group_merges / group_aggregates / formulas (per_row·aggregates) / merges / nulls / remove_rows / columns[].props — 曾静默丢弃, 现编译期拒绝 (issue 06) | 用 xlsx, 或等 pptx lowering 验证后 rollout; 值类需求预计算进 columns; 删除多余声明 |
 | PPTX_TARGET_ROWS_OUT_OF_BOUNDS | first_data_row + 匹配行数 − 1 越过表格实际行数 (pptx 行不能克隆) | 重读 digest 修 first_data_row / 收窄 selectors / python-pptx 一次性加行 (禁在 officecli 之后重新 import) |
+| MOD_RESOLUTION_MISSING | workdir 没有 `mod_resolution.json`（或文件不可读/非合法 JSON）— 不存在合法的"无决议文件可编译"路径 | 先运行 mod_nominate.py 提名；用户裁决后带 --mod 重跑把选择写盘 |
+| MOD_UNRESOLVED | `mod_resolution.json` 的 status ∉ {resolved, none}（裁决后未带 --mod 重跑，盘上仍是 ambiguous/conflict） | 裁决后必须带 --mod <NAME\|NONE> 重跑 mod_nominate.py，把 final decision record 写盘；盘上仍是 ambiguous/conflict = 裁决后未重跑 |
+| MOD_SELECTION_MISMATCH | spec 的 `selected_mod` 不等于裁决记录 `selected` 字段（status=resolved 时严格相等；status=none 时必须为 "NONE"） | 把 spec.task.selected_mod 设为裁决记录 mod_resolution.json 里 selected 的值；status=none 时设为 "NONE" |
+| MOD_REVISION_MISMATCH | 裁决为具体 MOD 时，spec 的 `selected_mod_revision` 不等于裁决记录 `selected_revision`（NONE 短路不校验） | 把 spec.task.selected_mod_revision 设为裁决记录里 selected_revision 的值 |

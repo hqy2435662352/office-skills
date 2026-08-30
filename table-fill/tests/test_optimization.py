@@ -700,6 +700,140 @@ class ModNominateTests(unittest.TestCase):
         self.assertEqual(r["status"], "resolved")
         self.assertEqual([c["name"] for c in r["candidates"]], ["cost_reply"])
 
+    def test_d3_parameter_sheet_excludes_quotation_mods(self):
+        """B2 行为矩阵 Case 1: 参数表外发任务（型谱+参数+客户版，无价格语义）
+        → 提名新 MOD，不得出现报价 MOD 候选。"""
+        idx_dir = Path(__file__).parent / "_fixtures"
+        index = idx_dir / "MOD_INDEX_d3.md"
+        mods = idx_dir / "MODS_d3"
+        mods.mkdir(exist_ok=True)
+        index.write_text(
+            "## Registered MODs\n\n"
+            "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| param_sheet | tcl-param-sheet | "
+            "semantic_type::internal_parameter_to_customer_parameter_sheet,"
+            "source_pattern::*型谱*,target_pattern::*客户版*,"
+            "dimension_set::product_line_capacity_zcode | "
+            "目标含报价/核价/价格角色; 目标缺少客户参数表角色指纹（系列标题/参数名行/Z码）; 源无稳定产品身份（产品线-容量-Z码） | "
+            "MOD_param.md | 1 | private |\n"
+            "| quotation | tcl-quote | "
+            "semantic_type::quotation,dimension_set::product_sku | "
+            "目标缺少24角色表头指纹; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | "
+            "MOD_quote.md | 1 | private |\n",
+            encoding="utf-8")
+        (mods / "MOD_param.md").write_text(
+            "## Applicability\n- semantic_type: internal_parameter_to_customer_parameter_sheet\n\n"
+            "## 业务逻辑摘要\n- 参数表转换\n", encoding="utf-8")
+        (mods / "MOD_quote.md").write_text(
+            "## Applicability\n- semantic_type: quotation\n\n"
+            "## 业务逻辑摘要\n- 报价汇总\n", encoding="utf-8")
+        entries = mod_nominate.parse_index(index)
+
+        # 参数表任务: 型谱+参数+客户版，无价格语义
+        # digest 表头含参数表角色（系列标题、参数名、Z码），无价格角色
+        r = mod_nominate.resolve(
+            entries, mods,
+            "将型谱参数表转换为客户版参数表",
+            ["- 表头: 系列标题 | 参数名 | 单位 | Z码 | 9K | 12K"],
+            [])
+        # 应提名参数表 MOD
+        param_cand = [c for c in r["candidates"] if c["name"] == "param_sheet"]
+        self.assertTrue(len(param_cand) == 1, "参数表 MOD 应被提名")
+        # 报价 MOD 应被排除
+        quote_cand = [c for c in r["candidates"] if c["name"] == "quotation"]
+        if quote_cand:
+            self.assertTrue(
+                quote_cand[0].get("fired_exclusions"),
+                "报价 MOD 应触发排除信号")
+
+    def test_d3_quotation_task_excludes_param_sheet_mod(self):
+        """B2 行为矩阵 Case 2: 报价/核价/毛利表任务
+        → 对应报价 MOD 正常提名；参数表 MOD 触发排除信号（含价格角色）"""
+        idx_dir = Path(__file__).parent / "_fixtures"
+        index = idx_dir / "MOD_INDEX_d3b.md"
+        mods = idx_dir / "MODS_d3b"
+        mods.mkdir(exist_ok=True)
+        index.write_text(
+            "## Registered MODs\n\n"
+            "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| param_sheet | tcl-param-sheet | "
+            "semantic_type::internal_parameter_to_customer_parameter_sheet,"
+            "source_pattern::*型谱*,target_pattern::*客户版*,"
+            "dimension_set::product_line_capacity_zcode | "
+            "目标含报价/核价/价格角色; 目标缺少客户参数表角色指纹（系列标题/参数名行/Z码）; 源无稳定产品身份（产品线-容量-Z码） | "
+            "MOD_param.md | 1 | private |\n"
+            "| quotation | tcl-quote | "
+            "semantic_type::quotation,dimension_set::product_sku | "
+            "目标缺少24角色表头指纹; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | "
+            "MOD_quote.md | 1 | private |\n",
+            encoding="utf-8")
+        (mods / "MOD_param.md").write_text(
+            "## Applicability\n- semantic_type: internal_parameter_to_customer_parameter_sheet\n\n"
+            "## 业务逻辑摘要\n- 参数表转换\n", encoding="utf-8")
+        (mods / "MOD_quote.md").write_text(
+            "## Applicability\n- semantic_type: quotation\n\n"
+            "## 业务逻辑摘要\n- 报价汇总\n", encoding="utf-8")
+        entries = mod_nominate.parse_index(index)
+
+        # 报价任务: 含价格语义，表头含 SKU 角色
+        r = mod_nominate.resolve(
+            entries, mods,
+            "报价汇总 迁移 毛利表",
+            ["- 表头: Z码 | 数量 | 报价 | 原型机成本 | 净价 | 毛利"],
+            [])
+        # 应提名报价 MOD（无排除触发）
+        quote_cand = [c for c in r["candidates"] if c["name"] == "quotation"]
+        self.assertTrue(len(quote_cand) == 1, "报价 MOD 应被提名")
+        self.assertEqual(len(quote_cand[0]["fired_exclusions"]), 0,
+                         "报价 MOD 不应触发排除信号")
+        # 参数表 MOD 应触发排除信号（目标含报价/核价/价格角色）
+        param_cand = [c for c in r["candidates"] if c["name"] == "param_sheet"]
+        if param_cand:
+            self.assertTrue(
+                param_cand[0].get("fired_exclusions"),
+                "参数表 MOD 在报价任务中应触发排除信号（目标含价格角色）")
+
+    def test_d3_no_identity_chain_no_candidates(self):
+        """B2 行为矩阵 Case 3: 无身份链 / 无价格角色 / 目标非客户参数表
+        → 无候选或 pending；排除信号未评估时保持 fail-closed。"""
+        idx_dir = Path(__file__).parent / "_fixtures"
+        index = idx_dir / "MOD_INDEX_d3c.md"
+        mods = idx_dir / "MODS_d3c"
+        mods.mkdir(exist_ok=True)
+        index.write_text(
+            "## Registered MODs\n\n"
+            "| MOD Name | Aliases | Scope Signals | Exclusion Signals | Path | Revision | Visibility |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| param_sheet | tcl-param-sheet | "
+            "semantic_type::internal_parameter_to_customer_parameter_sheet,"
+            "source_pattern::*型谱*,target_pattern::*客户版*,"
+            "dimension_set::product_line_capacity_zcode | "
+            "目标含报价/核价/价格角色; 目标缺少客户参数表角色指纹（系列标题/参数名行/Z码）; 源无稳定产品身份（产品线-容量-Z码） | "
+            "MOD_param.md | 1 | private |\n"
+            "| quotation | tcl-quote | "
+            "semantic_type::quotation,dimension_set::product_sku | "
+            "目标缺少24角色表头指纹; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | "
+            "MOD_quote.md | 1 | private |\n",
+            encoding="utf-8")
+        (mods / "MOD_param.md").write_text(
+            "## Applicability\n- semantic_type: internal_parameter_to_customer_parameter_sheet\n\n"
+            "## 业务逻辑摘要\n- 参数表转换\n", encoding="utf-8")
+        (mods / "MOD_quote.md").write_text(
+            "## Applicability\n- semantic_type: quotation\n\n"
+            "## 业务逻辑摘要\n- 报价汇总\n", encoding="utf-8")
+        entries = mod_nominate.parse_index(index)
+
+        # 无关任务: 无身份链、无价格角色
+        r = mod_nominate.resolve(
+            entries, mods,
+            "整理销售数据",
+            ["- 表头: 日期 | 产品 | 数量 | 金额"],
+            [])
+        # 应无候选
+        self.assertEqual(r["status"], "none")
+
 
 class ReceiptHashTests(unittest.TestCase):
     def _promote(self, workdir, expect_code):
@@ -6482,6 +6616,165 @@ class ModCatalogIndexTests(unittest.TestCase):
             self.assertEqual(
                 entry.revision, int(m.group(1)),
                 f"{entry.mod_name} 修订号漂移: 索引 {entry.revision} vs 文件 {m.group(1)}")
+
+
+class ModConsistencyGatesTest(unittest.TestCase):
+    """ticket 04 / ADR-0011: compiler C1–C4 MOD-consistency gates.
+
+    Outward behavior only: exit code 3 + stderr defect JSON (code/message/
+    corrective_action) + artifact (non)presence — never internals. Each case
+    plants a mod_resolution.json variant into the workdir, mutates the spec
+    via spec_with, and asserts the exact defect code (or exit 0 + plan)."""
+
+    def setUp(self):
+        self.tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_ctx.name)
+        self.wd = make_workdir(self.tmp)
+        self.wd["workdir"] = self.tmp
+
+    def tearDown(self):
+        self.tmp_ctx.cleanup()
+
+    def _write_resolution(self, record: dict) -> None:
+        (self.tmp / "mod_resolution.json").write_text(
+            json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+    def _compile_capture(self, spec: dict):
+        """Run compile_spec, capture stderr JSON + SystemExit code."""
+        from io import StringIO
+        buf = StringIO()
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            plan = compile_fill.compile_spec(spec, self.wd["manifest"], self.tmp)
+            return {"exit": 0, "plan": plan, "stderr": buf.getvalue()}
+        except SystemExit as e:
+            payload = None
+            raw = buf.getvalue()
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = None
+            return {"exit": e.code, "payload": payload, "stderr": raw}
+        finally:
+            sys.stderr = old
+
+    def _assert_defect(self, result, code: str):
+        self.assertEqual(result["exit"], 3)
+        self.assertEqual(result["payload"]["code"], code)
+        self.assertIsInstance(result["payload"].get("message"), str)
+        self.assertIsInstance(result["payload"].get("corrective_action"), str)
+        self.assertGreater(len(result["payload"]["corrective_action"]), 0)
+
+    def test_c1_resolution_file_missing(self):
+        # fixture already wrote a resolution file → delete it to simulate absence
+        (self.tmp / "mod_resolution.json").unlink()
+        spec = spec_with(self.wd)
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_RESOLUTION_MISSING")
+        self.assertFalse((self.tmp / "execution_plan.json").exists())
+
+    def test_c1_resolution_file_invalid_json(self):
+        (self.tmp / "mod_resolution.json").write_text("{not valid json", encoding="utf-8")
+        spec = spec_with(self.wd)
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_RESOLUTION_MISSING")
+
+    def test_c4_status_ambiguous(self):
+        self._write_resolution({"status": "ambiguous", "candidates": []})
+        spec = spec_with(self.wd)
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_UNRESOLVED")
+
+    def test_c4_status_conflict(self):
+        self._write_resolution({"status": "conflict", "candidates": []})
+        spec = spec_with(self.wd)
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_UNRESOLVED")
+
+    def test_c2_resolved_mod_a_spec_mod_b(self):
+        self._write_resolution({"status": "resolved", "selected": "MOD_A",
+                                "selected_revision": 3, "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "MOD_B",
+                            "task.selected_mod_revision": 3})
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_SELECTION_MISMATCH")
+
+    def test_c2_resolved_mod_a_spec_none(self):
+        self._write_resolution({"status": "resolved", "selected": "MOD_A",
+                                "selected_revision": 3, "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "NONE",
+                            "task.selected_mod_revision": None})
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_SELECTION_MISMATCH")
+
+    def test_c2_status_none_spec_any_mod(self):
+        self._write_resolution({"status": "none", "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "MOD_X",
+                            "task.selected_mod_revision": 1})
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_SELECTION_MISMATCH")
+
+    def test_c3_revision_drift(self):
+        self._write_resolution({"status": "resolved", "selected": "MOD_A",
+                                "selected_revision": 3, "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "MOD_A",
+                            "task.selected_mod_revision": 999})
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_REVISION_MISMATCH")
+
+    def test_none_shortcircuit_revision_ignored(self):
+        # status=resolved + selected=NONE → spec NONE + ANY revision still compiles
+        self._write_resolution({"status": "resolved", "selected": "NONE",
+                                "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "NONE",
+                            "task.selected_mod_revision": 42})
+        r = self._compile_capture(spec)
+        self.assertEqual(r["exit"], 0)
+        self.assertGreater(len(r["plan"]["operations"]), 0)
+
+    def test_full_alignment_resolved_none(self):
+        self._write_resolution({"status": "resolved", "selected": "NONE",
+                                "candidates": [{"name": "MOD_A"}]})
+        spec = spec_with(self.wd)  # BASE_SPEC: NONE + None revision
+        r = self._compile_capture(spec)
+        self.assertEqual(r["exit"], 0)
+        self.assertGreater(len(r["plan"]["operations"]), 0)
+
+    def test_full_alignment_status_none(self):
+        self._write_resolution({"status": "none", "candidates": []})
+        spec = spec_with(self.wd)  # BASE_SPEC: NONE + None revision
+        r = self._compile_capture(spec)
+        self.assertEqual(r["exit"], 0)
+        self.assertGreater(len(r["plan"]["operations"]), 0)
+
+    def test_corrective_action_usable(self):
+        # representative case (C2): corrective_action must carry fix guidance
+        self._write_resolution({"status": "resolved", "selected": "MOD_A",
+                                "selected_revision": 3, "candidates": []})
+        spec = spec_with(self.wd,
+                         **{"task.selected_mod": "MOD_B",
+                            "task.selected_mod_revision": 3})
+        r = self._compile_capture(spec)
+        self._assert_defect(r, "MOD_SELECTION_MISMATCH")
+        self.assertIn("selected_mod", r["payload"]["corrective_action"])
+
+    def test_why_and_adjudicated_from_not_validated(self):
+        # a resolved record whose `why`/`adjudicated_from` are garbage still compiles
+        self._write_resolution({
+            "status": "resolved", "selected": "NONE", "candidates": [],
+            "why": {"garbage": ["not", "a", "string", 123]},
+            "adjudicated_from": ["totally", 1234, {"bogus": True}],
+        })
+        spec = spec_with(self.wd)  # NONE + None revision
+        r = self._compile_capture(spec)
+        self.assertEqual(r["exit"], 0)
+        self.assertGreater(len(r["plan"]["operations"]), 0)
 
 
 if __name__ == "__main__":

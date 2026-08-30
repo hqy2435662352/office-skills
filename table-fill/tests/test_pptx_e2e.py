@@ -149,6 +149,12 @@ class PptxEndToEndTests(unittest.TestCase):
         (workdir / "fill_spec.yaml").write_text(
             yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
             encoding="utf-8")
+        # ticket 04 C1: compile 需 mod_resolution.json（spec selected_mod=NONE
+        # 与 resolved/NONE 对齐）
+        (workdir / "mod_resolution.json").write_text(
+            json.dumps({"status": "resolved", "selected": "NONE",
+                        "candidates": []}, ensure_ascii=False),
+            encoding="utf-8")
 
         # 3. Compile.
         proc = run_py(workdir, "compile_fill.py", "--spec", "fill_spec.yaml",

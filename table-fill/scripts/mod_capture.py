@@ -81,7 +81,21 @@ def _mod_index_path() -> str:
 
 
 def _mod_file_path(name: str) -> str:
-    return os.path.join(_refs_dir(), f"MOD_{name}.md")
+    return os.path.join(_refs_dir(), f"MOD_{_strip_prefix(name)}.md")
+
+
+def _strip_prefix(name: str) -> str:
+    """Normalize a MOD name to its canonical body (no leading 'MOD_').
+
+    The index stores the full name ('MOD_<body>'); file paths and the MOD
+    markdown title derive from the body. Accepting both forms avoids the
+    double-prefix bug (MOD_MOD_<body>) when a caller passes the full name.
+    """
+    return name[4:] if name.startswith("MOD_") else name
+
+
+def _full_name(name: str) -> str:
+    return f"MOD_{_strip_prefix(name)}"
 
 
 # ── Validation ────────────────────────────────────────────────────────────
@@ -298,7 +312,8 @@ def _build_index_entry(req: CaptureRequest) -> ModIndexEntry:
         mod_name=req.mod_name, aliases=req.aliases,
         scope_signals=req.scope_signals,
         exclusion_signals=req.exclusion_signals,
-        path=f"MOD_{req.mod_name}.md", revision=1, visibility=req.visibility)
+        path=f"MOD_{_strip_prefix(req.mod_name)}.md", revision=1,
+        visibility=req.visibility)
 
 
 _METADATA_SECTION_RE = re.compile(r"## Metadata[^\n]*\n(.*?)(?=\n## |\Z)", re.S)
@@ -331,8 +346,9 @@ def _build_mod_content(
     nomination-card Chinese label — the final stored file must equal the
     reviewed candidate, never a post-capture patch.
     """
+    display = _full_name(name)
     lines = [
-        f"# MOD_{name}\n\n## Purpose\n\n",
+        f"# {display}\n\n## Purpose\n\n",
         "MOD created by table-fill capture.\n",
         f"Revision: {revision}\nVisibility: {req.visibility}\nRule count: {n}\n\n",
         "## Metadata\n\n",
@@ -420,18 +436,20 @@ def _do_update(req: CaptureRequest) -> dict:  # noqa: DICT_OK — JSON emission 
     existing = parse_mod_index(index_text)
     try:
         match = next(e for e in existing
-                     if e.mod_name.lower() == req.mod_name.lower())
+                     if e.mod_name.lower() == _full_name(req.mod_name).lower()
+                     or e.mod_name.lower() == req.mod_name.lower())
     except StopIteration:
         raise CaptureError(
             f"MOD '{req.mod_name}' not found in MOD_INDEX.md", _EXIT_BUSINESS)
-    mod_path = _mod_file_path(req.mod_name)
+    mod_path = os.path.join(_refs_dir(), match.path)
     if not os.path.isfile(mod_path):
         raise CaptureError(f"MOD file missing: {mod_path}", _EXIT_BUSINESS)
     new_revision = match.revision + 1
     new_entry = ModIndexEntry(
-        mod_name=req.mod_name, aliases=req.aliases,
+        mod_name=match.mod_name, aliases=req.aliases,
         scope_signals=req.scope_signals, exclusion_signals=req.exclusion_signals,
-        path=f"MOD_{req.mod_name}.md", revision=new_revision, visibility=req.visibility)
+        path=f"MOD_{_strip_prefix(req.mod_name)}.md",
+        revision=new_revision, visibility=req.visibility)
     for p in (mod_path, index_path):
         shutil.copy2(p, p + ".bak")
     try:

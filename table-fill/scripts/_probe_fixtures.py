@@ -85,6 +85,7 @@ def make_probe_workdir(tmp, n_source_rows: int = 3, n_cols: int = 10,
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
 
     lookups = {"Z001": {"compressor": "C-1", "copper": "P-1"},
                "Z002": {"compressor": "C-2", "copper": "P-2"}}
@@ -163,6 +164,7 @@ def make_probe_inplace_workdir(tmp, n_source_rows: int = 3) -> dict:
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
     return {"manifest": manifest}
 
 
@@ -267,6 +269,7 @@ def make_preformatted_quotation_workdir(tmp) -> dict:
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
     return {"manifest": manifest}
 
 
@@ -403,6 +406,7 @@ def make_multiproduct_block_workdir(tmp) -> dict:
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
     return {"manifest": manifest}
 
 
@@ -512,6 +516,7 @@ def make_single_block_workdir(tmp) -> dict:
     }
     with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
     return {"manifest": manifest}
 
 
@@ -567,6 +572,20 @@ def base_probe_spec() -> dict:
     """Minimal valid spec skeleton mutated by PROBE_CASES (deep copy)."""
     import copy
     return copy.deepcopy(BASE_SPEC)
+
+
+def _write_resolution(tmp, status: str = "resolved",
+                      selected: str = "NONE") -> None:
+    """Write mod_resolution.json into the synthetic workdir so the compile
+    contract fixtures satisfy the compiler's C1 gate (ticket 04). Matches
+    BASE_SPEC's `selected_mod: "NONE"` / `selected_mod_revision: None`: a
+    resolved decision record with selected=NONE (no selected_revision key,
+    per the C3 NONE short-circuit)."""
+    record = {"status": status, "selected": selected, "candidates": []}
+    if selected != "NONE":
+        record["selected_revision"] = 1
+    (tmp / "mod_resolution.json").write_text(
+        json.dumps(record, ensure_ascii=False), encoding="utf-8")
 
 
 # ── Probe case builders ────────────────────────────────────────────────

@@ -21,6 +21,23 @@ batch JSON. It:
      hand-written --checks).
   8. Writes execution_plan.json (machine) + mapping.md (human view).
 
+MOD consistency gates (C1–C4, per ADR-0011 "Compiler checks"): before any
+schema/fingerprint work, `compile_spec` reads `workdir/mod_resolution.json`
+(the MOD Adjudication Record — final decision, not a recommendation) and
+fails closed on the FIRST violated gate, in order:
+  C1 MOD_RESOLUTION_MISSING — file absent / unreadable / invalid JSON.
+  C4 MOD_UNRESOLVED          — record.status ∉ {resolved, none}.
+  C2 MOD_SELECTION_MISMATCH  — spec.task.selected_mod must EQUAL the recorded
+                               selected (strict equality; NONE only when the
+                               record says NONE or status=none).
+  C3 MOD_REVISION_MISMATCH   — selected != NONE ⇒ spec.task.selected_mod_revision
+                               must EQUAL record.selected_revision (strict int
+                               equality). selected == NONE short-circuits (no
+                               revision check; the spec may carry None/null).
+The compiler verifies MOD reference vs. decision consistency only — NEVER the
+adjudication process: no resolution-hash binding into spec/fingerprints, no
+`why` validation, no `adjudicated_from` validation, no C5.
+
 Exit codes: 0=pass, 1=fatal, 3=spec defects (structured, fix and re-run).
 
 Usage:
@@ -44,6 +61,7 @@ except ImportError:
     yaml = None
 
 MANIFEST_NAME = "prepare_manifest.json"
+MOD_RESOLUTION_NAME = "mod_resolution.json"
 
 from _officecli import ensure_utf8_stdio, fail, record_timing, sha256_file  # noqa: E402
 PLAN_NAME = "execution_plan.json"
@@ -323,6 +341,84 @@ def validate_schema(spec: dict, manifest: dict) -> list[dict]:
                         "corrective_action": "Split the run into one fill_spec per target, "
                                              "or fold the extra sheets into a single target entry"})
     return defects
+
+
+# ── MOD consistency gates (C1–C4) ──────────────────────────────────────
+
+def check_mod_consistency(spec: dict, workdir: Path) -> None:
+    """Static MOD-reference-vs-decision consistency gates (C1–C4).
+
+    Reads `workdir/mod_resolution.json` — the MOD Adjudication Record (final
+    decision, not a recommendation). Fails closed on the FIRST violated gate,
+    in strict order C1 → C4 → C2 → C3:
+
+      C1 MOD_RESOLUTION_MISSING — the record is absent, unreadable, or not a
+          JSON object. There is NO legal compile path without the record
+          (no exemption for probe/capabilities modes).
+      C4 MOD_UNRESOLVED          — record.status ∉ {resolved, none} (an
+          ambiguous/conflict record means adjudication was never recorded
+          by re-running `--mod`).
+      C2 MOD_SELECTION_MISMATCH  — spec.task.selected_mod must EQUAL the
+          record's selected value exactly (strict equality, not "one of the
+          candidates"). status=resolved ⇒ equal record.selected (including
+          "NONE"); status=none ⇒ must equal "NONE". A missing/None spec
+          selected_mod is NOT equal to "NONE" (strict).
+      C3 MOD_REVISION_MISMATCH   — only when record.selected != "NONE":
+          spec.task.selected_mod_revision must EQUAL record.selected_revision
+          (strict int equality). selected == "NONE" short-circuits (no
+          revision check; the spec may carry None/null).
+
+    The compiler verifies MOD reference vs. decision consistency only — never
+    the adjudication process: no resolution-hash binding, no `why` validation,
+    no `adjudicated_from` validation.
+    """
+    rec_path = workdir / MOD_RESOLUTION_NAME
+    try:
+        if not rec_path.is_file():
+            raise ValueError("missing")
+        record = json.loads(rec_path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("not a mapping")
+    except (OSError, ValueError):
+        fail("MOD_RESOLUTION_MISSING",
+             f"{MOD_RESOLUTION_NAME} absent / unreadable / invalid in {workdir}",
+             "先运行 mod_nominate.py 提名；用户裁决后带 --mod 重跑把选择写盘")
+
+    status = record.get("status")
+    if status not in ("resolved", "none"):
+        fail("MOD_UNRESOLVED",
+             f"{MOD_RESOLUTION_NAME} status is {status!r} (∈ {{ambiguous, conflict, …}})，"
+             "裁决尚未通过 --mod 重跑写盘",
+             "裁决后必须带 --mod <NAME|NONE> 重跑 mod_nominate.py，把 final decision "
+             "record 写盘；盘上仍是 ambiguous/conflict = 裁决后未重跑")
+
+    task = spec["task"]
+    spec_mod = task.get("selected_mod")
+    if status == "resolved":
+        recorded = record.get("selected")
+        if spec_mod != recorded:
+            fail("MOD_SELECTION_MISMATCH",
+                 f"task.selected_mod {spec_mod!r} != recorded selected {recorded!r} "
+                 f"(status=resolved)",
+                 f"把 spec.task.selected_mod 设为裁决记录 {MOD_RESOLUTION_NAME} 里 "
+                 f"selected 的值 ({recorded!r})")
+        if recorded != "NONE":
+            spec_rev = task.get("selected_mod_revision")
+            recorded_rev = record.get("selected_revision")
+            if spec_rev != recorded_rev:
+                fail("MOD_REVISION_MISMATCH",
+                     f"task.selected_mod_revision {spec_rev!r} != recorded "
+                     f"selected_revision {recorded_rev!r} (selected={recorded!r})",
+                     f"把 spec.task.selected_mod_revision 设为裁决记录里 "
+                     f"selected_revision 的值 ({recorded_rev!r})")
+    else:  # status == "none"
+        if spec_mod != "NONE":
+            fail("MOD_SELECTION_MISMATCH",
+                 f"task.selected_mod {spec_mod!r} != \"NONE\" (status=none)",
+                 "把 spec.task.selected_mod 设为 \"NONE\"（与 mod_resolution.json "
+                 "status=none 对齐）")
+    # C3 is short-circuited when selected == "NONE" (no revision check; the
+    # spec may legitimately carry None/null selected_mod_revision).
 
 
 # ── Layout ─────────────────────────────────────────────────────────────
@@ -2458,6 +2554,10 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     defects += validate_schema(spec, manifest)
     if defects:
         fail("SPEC_INVALID", f"{len(defects)} spec defect(s)", "Fix fill_spec.yaml", defects)
+
+    # MOD-consistency gates (C1–C4) — fail-closed BEFORE any fingerprint/structure
+    # work. No legal compile path without a resolved decision record.
+    check_mod_consistency(spec, workdir)
 
     inputs = spec["inputs"]
     manifest_target = manifest["target"]

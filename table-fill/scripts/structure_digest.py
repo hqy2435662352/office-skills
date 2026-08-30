@@ -233,6 +233,75 @@ def build_digest(meta: dict, csv_path: Path, candidates: dict | None,
     return lines
 
 
+def build_premod_evidence(meta: dict, csv_path: Path, candidates: dict | None,
+                          for_target: bool = False) -> list[str]:
+    """最小结构标签视图 (Pre-MOD Evidence): 只保留决定任务形状与 MOD 适用性的事实.
+
+    与 build_digest 共享同一批 load_meta / parse_csv_headers / 行格式辅助函数,
+    但不复用 build_digest 本身: 物理剔除一切"任务怎么填"的信息 (公式链模板、
+    合并锚点公式、列级 numFmt、非空列画像、列分类、块标题、占位样例值)。"""
+    dims = meta.get("dimensions", {})
+    lines = []
+    sheet = meta.get("sheet", "")
+    fname = Path(meta.get("file", "?")).name
+    lines.append(f"# {sheet} — 结构摘要")
+    lines.append(
+        f"- 文件: {fname} | sheet: {sheet} | {dims.get('rows','?')}行 × {dims.get('cols','?')}列"
+        f" | {dims.get('formulas',0)}公式 | {dims.get('errorCells',0)}错误"
+        f" | OLE:{dims.get('oleObjects',0)} 图表:{dims.get('charts',0)} 表:{dims.get('tables',0)}"
+    )
+
+    gaps = meta.get("row_gaps") or []
+    if gaps:
+        lines.append(f"- 行号空洞: {gaps} — row 元素 r 值不连续, "
+                     f"`add ... after: /row[N]` 锚点链会断裂, 需 materialize 后重跑 prepare")
+
+    if for_target:
+        sg = meta.get("style_granularity") or {}
+        segs = sg.get("placeholder_segments") or []
+        if segs:
+            verdict = "带样式" if any(s.get("styled") for s in segs) else "裸行"
+            if verdict == "带样式":
+                styled_ranges = ", ".join(
+                    f"{s.get('start')}-{s.get('end')}" for s in segs if s.get("styled"))
+                lines.append(f"- 占位行样式: 带样式 (段: {styled_ranges})")
+            else:
+                ranges = ", ".join(f"{s.get('start')}-{s.get('end')}" for s in segs)
+                lines.append(f"- 占位行样式: 裸行 ({ranges})")
+        for c in sg.get("clone_source_rows") or []:
+            parts = []
+            for role, _off in CLONE_ROLES:
+                rinfo = c.get(role)
+                if rinfo:
+                    v = "带样式" if rinfo.get("styled") else "裸行"
+                    parts.append(f"{role}={rinfo.get('row')} {v}")
+            lines.append(f"- 克隆源行样式: B{c.get('block')}(" + " | ".join(parts) + ")")
+
+    hb = meta.get("header_band") or {}
+    col_names = parse_csv_headers(csv_path, hb)
+    if col_names:
+        names = " | ".join(col_names.get(i, "?") for i in range(max(col_names) + 1))
+        lines.append(f"- 表头: {names}")
+    elif hb:
+        lines.append(f"- 表头带: 行 {hb.get('header_rows')} 数据起始行 {hb.get('data_start_row')}")
+
+    blocks = meta.get("blocks") or []
+    if blocks:
+        lines.append("- 数据块:")
+        for b in blocks:
+            lines.append(
+                f"  - B{b.get('id', blocks.index(b) + 1)} 行{b.get('start')}-{b.get('end')} "
+                f"(score {b.get('score', '?')})"
+            )
+    else:
+        lines.append("- 数据块: 无自动候选 (LLM 依摘要与业务上下文判定)")
+
+    merged = meta.get("merged_ranges") or []
+    if merged:
+        lines.append(f"- 合并区({len(merged)}): {', '.join(merged)}")
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description="展平结构摘要生成器")
     parser.add_argument("--meta", type=Path, required=True, help="flatten meta.json")
@@ -240,12 +309,17 @@ def main():
     parser.add_argument("--candidates", type=Path, default=None, help="classify_columns 列候选 YAML (可选)")
     parser.add_argument("--target", action="store_true",
                         help="目标 sheet: 输出样式粒度决策事实 (占位行/克隆源行样式)")
+    parser.add_argument("--pre-mod", action="store_true",
+                        help="最小结构标签视图 (Pre-MOD Evidence): 只保留任务形状/MOD 适用性事实")
     parser.add_argument("--out", type=Path, required=True, help="输出摘要 md")
     args = parser.parse_args()
 
     meta = load_meta(args.meta)
     cands = load_candidates(args.candidates)
-    lines = build_digest(meta, args.csv, cands, for_target=args.target)
+    if args.pre_mod:
+        lines = build_premod_evidence(meta, args.csv, cands, for_target=args.target)
+    else:
+        lines = build_digest(meta, args.csv, cands, for_target=args.target)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps({"status": "SUCCESS", "code": "DIGEST_WRITTEN",

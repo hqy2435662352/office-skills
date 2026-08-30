@@ -3667,6 +3667,18 @@ def strip_extra_fields(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k not in ("sha256", "cache_key")}
 
 
+# Business Reasoning Barrier（ticket 02）: 单 run xlsx 条目的 digest 是
+# deferred 标记（非文件名）、另带 evidence 字段；task 物化条目是真实 digest
+# 文件且无 evidence。compile_fill.py 只消费 file/sheet/name/csv/meta/candidates
+# 这六个 compile-facing 键 —— 同构断言只覆盖这些键，evidence/digest 的有意
+# 发散单独断言（见 test_compile_facing_fields_isomorphic_after_stripping_metadata）。
+_COMPILE_FACING_KEYS = ("file", "sheet", "name", "csv", "meta", "candidates")
+
+
+def _compile_keys(entry: dict) -> dict:
+    return {k: entry[k] for k in _COMPILE_FACING_KEYS if k in entry}
+
+
 class TestContractCompileEquivalence(unittest.TestCase):
     """issue 08 契约测试 #3（spec Testing Decision #2/#3）：
 
@@ -3687,6 +3699,12 @@ class TestContractCompileEquivalence(unittest.TestCase):
         # staged 文件（compile 的 input_hashes 绑定对象，两形态共用同一份）
         (self.workdir / "parameter_book.xlsx").write_bytes(b"source-bytes")
         (self.workdir / "filling_template.xlsx").write_bytes(b"template-bytes")
+        # ticket 04 C1: compile 需 mod_resolution.json 最终裁决记录（spec
+        # selected_mod=NONE 与 resolved/NONE 对齐）
+        (self.workdir / "mod_resolution.json").write_text(
+            json.dumps({"status": "resolved", "selected": "NONE",
+                        "candidates": []}, ensure_ascii=False),
+            encoding="utf-8")
         (self.workdir / "parameter_book_outline.txt").write_text(
             '{"data": {"sheets": [{"name": "R32参数"}]}}', encoding="utf-8")
         (self.workdir / "filling_template_outline.txt").write_text(
@@ -3734,25 +3752,55 @@ class TestContractCompileEquivalence(unittest.TestCase):
     def test_compile_facing_fields_isomorphic_after_stripping_metadata(self):
         """验收（契约测试 #1）：task 产物与单 run 产物的 compile-facing 字段
         （files/outlines/flattened/target/fingerprints）一致，仅多 cache_key
-        metadata（物化条目另带 sha256 = run 业务身份）。"""
+        metadata（物化条目另带 sha256 = run 业务身份）。
+
+        Business Reasoning Barrier（ticket 02, .scratch/table-fill-mod-barrier/）
+        带来的有意发散：单 run xlsx 条目是 Pre-MOD 形态（evidence +
+        digest == "deferred"，完整 digest 待 MOD Resolution 解锁后补生成）；
+        task 物化条目走 flatten_cache.materialize_entry，仍产出真实
+        {name}_digest.md 且无 evidence 字段。故同构断言只覆盖真正
+        compile-facing 的 file/sheet/name/csv/meta/candidates，evidence/digest
+        的差异单独显式断言。"""
         single = self.single_run_manifest()
         self.assertEqual(single["files"], self.task_manifest["files"])
         self.assertEqual(single["outlines"], self.task_manifest["outlines"])
         self.assertEqual(single["fingerprints"], self.task_manifest["fingerprints"])
-        # 目标条目同构：去元数据后一致；task 侧只比单 run 多 sha256/cache_key
-        self.assertEqual(single["target"],
-                         strip_extra_fields(self.task_manifest["target"]))
+        # 目标条目：compile-facing 键同构；task 侧只比单 run 多 sha256/cache_key
+        self.assertEqual(_compile_keys(single["target"]),
+                         _compile_keys(self.task_manifest["target"]))
         self.assertEqual(set(self.task_manifest["target"])
                          - set(single["target"]), {"cache_key", "sha256"})
-        self.assertEqual(single["flattened"],
-                         [strip_extra_fields(e)
-                          for e in self.task_manifest["flattened"]])
+        self.assertEqual(
+            _compile_keys(self.task_manifest["target"]),
+            _compile_keys(single["target"]))
+        # 展平条目：compile-facing 键同构、条目清单一致
+        self.assertEqual({e["name"]: _compile_keys(e)
+                          for e in single["flattened"]},
+                         {e["name"]: _compile_keys(e)
+                          for e in self.task_manifest["flattened"]})
+        self.assertEqual(
+            {e["name"]: _compile_keys(e) for e in single["flattened"]},
+            {e["name"]: _compile_keys(e)
+             for e in self.task_manifest["flattened"]})
         # 元数据只增不减：task 条目比单 run 多且仅多 cache_key/sha256
         for t_entry, s_entry in zip(self.task_manifest["flattened"],
                                     single["flattened"]):
             self.assertEqual(set(t_entry) - set(s_entry), {"cache_key", "sha256"})
-            self.assertEqual(s_entry,
-                             strip_extra_fields(t_entry))
+        # 屏障有意发散（显式断言）—— xlsx 单 run 是 Pre-MOD 形态：
+        # evidence == {name}_premod_evidence.md，digest == "deferred"（非文件名）；
+        # task 物化条目相反：真实 {name}_digest.md、无 evidence。
+        for e in single["flattened"]:
+            self.assertEqual(e["evidence"], f"{e['name']}_premod_evidence.md")
+            self.assertEqual(e["digest"], "deferred")
+        for e in self.task_manifest["flattened"]:
+            self.assertNotIn("evidence", e)
+            self.assertEqual(e["digest"], f"{e['name']}_digest.md")
+        self.assertEqual(single["target"]["digest"], "deferred")
+        self.assertEqual(single["target"]["evidence"],
+                         f"{single['target']['name']}_premod_evidence.md")
+        self.assertEqual(self.task_manifest["target"]["digest"],
+                         f"{self.task_manifest['target']['name']}_digest.md")
+        self.assertNotIn("evidence", self.task_manifest["target"])
 
     def test_compile_plan_equivalent(self):
         """验收（契约测试 #3）：两种 manifest 形态经 public CLI 编译 →

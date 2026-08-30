@@ -11,6 +11,7 @@ officecli-win 聚焦编码与 subprocess。
 | bash for 循环 + 中文路径变量 | `for n in a b; do ... ${n}_meta.json ...` 展开失败, 报 META_NOT_FOUND | 避免在路径中做变量拼接; 显式写全路径或改用 Python 脚本 |
 | `grep -P` (Perl 正则) | 报 "grep: -P supports only unibyte and UTF-8 locales" | 用基本 grep / `grep -E`, 或 Python re |
 | raw PowerShell 管道 | GBK 编码损坏中文输出 (乱码) | officecli 调用一律 Python `_officecli.officecli()`（UTF-8 subprocess）；非 officecli 命令用 `subprocess.run(..., encoding="utf-8")` |
+| 中文 sheet 名 + 编码环境变量 | 认为需设 `PYTHONUTF8` 才不报错 (误判) | officecli 是原生 PE，中文 sheet 名直调无需 `PYTHONUTF8`（2026-08-27 三模式实测一致）；无需为参数编码设任何环境变量 |
 | 中文路径 `set`/`batch` | Access denied (get 可能正常) | 所有输入先 stage 到 ASCII workdir (stage_files.py) |
 | 输出文件只读属性 | copy2 保留源只读位 → officecli 写失败 | execute 已有 force_writable; 手工复制后用 `chmod +w` |
 
@@ -26,6 +27,7 @@ officecli-win 聚焦编码与 subprocess。
 | `view html` 流式输出 | 无落盘 HTML 文件 (仅 stdout) | 视觉 QA 用 `view text` 限定范围替代, 或重定向到文件 |
 | L3 继承字段二次扫描 | 先 `query cell:contains(SKU)` 再 `view text` 找 D/F/X | 用 `build_inheritance_index.py` 一次 view text 生成结构化索引；禁止追加逐码查询 |
 | 步骤耗时无法复盘 | 只看终端输出或聊天时间戳 | 脚本自动写 `run_timing.json`（machine 相位）+ `note_phase.py`（agent 思考），Gate 报告读取 manifest |
+| flatten 报 `KeyError: 'data'` / FLATTEN_FAILED | 真因曾是 `--sheets` 分隔符语法错误（文件间 `;`、sheet 间 `,`），被 `officecli_get` 的裸 `json.loads` 掩盖成下游 `KeyError`；现由 `OFFICECLI_RESPONSE_INVALID` 显式拦截（2026-08-27 走查修复） | `--sheets` 文件间用 `;`、sheet 间用 `,`；失败读 stderr 结构化 defect 的 `corrective_action` |
 
 ## 3. 执行/验证机制
 

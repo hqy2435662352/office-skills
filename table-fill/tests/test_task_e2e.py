@@ -71,6 +71,17 @@ def strip_cache_metadata(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k not in ("sha256", "cache_key")}
 
 
+# Business Reasoning Barrier（ticket 02）: 单 run xlsx 条目的 digest 是
+# "deferred" 标记（非文件名）、另带 evidence 字段；task 物化条目是真实
+# {name}_digest.md、无 evidence。compile 只读这六个 compile-facing 键，故
+# 同构对账只覆盖它们，evidence/digest 的有意发散单独断言。
+COMPILE_KEYS = ("file", "sheet", "name", "csv", "meta", "candidates")
+
+
+def compile_keys(entry: dict) -> dict:
+    return {k: entry[k] for k in COMPILE_KEYS if k in entry}
+
+
 def matched_source_rows(run_dir: Path, slug: str) -> int:
     """按 fill_spec 同一 selector 口径数源数据行（不含表头）—— 期望行数
     从产物真值推导，不硬编码生成器行数。"""
@@ -118,9 +129,15 @@ def build_fill_spec(run_dir: Path, sheet: str, slug: str,
                     intent_note: str) -> Path:
     """按 workdir 自己的 prepare_manifest.json 指纹撰写 fill_spec.yaml
     （映射永远在 runs/<id>/fill_spec.yaml：MOD 规则指导撰写的消费侧）。
-    task run 与单 run 对照组共用同一构建器 —— 指纹一致 → spec 文本一致。"""
+    task run 与单 run 对照组共用同一构建器 —— 指纹一致 → spec 文本一致。
+    同时写 mod_resolution.json（ticket 04 C1：compile 需最终裁决记录，
+    spec selected_mod=NONE 与 resolved/NONE 对齐）。"""
     manifest = json.loads(
         (run_dir / "prepare_manifest.json").read_text(encoding="utf-8"))
+    (run_dir / "mod_resolution.json").write_text(
+        json.dumps({"status": "resolved", "selected": "NONE",
+                    "candidates": []}, ensure_ascii=False),
+        encoding="utf-8")
     fp = manifest["fingerprints"]
     spec = {
         "task": {"intent": f"合成参数表填充（{sheet}）— {intent_note}",
@@ -338,14 +355,25 @@ class TaskPerformanceAcceptanceTests(unittest.TestCase):
             [{"staged": f["staged"], "sha256": f["sha256"]}
              for f in single_manifest["files"]],
             "manifest.files 的 staged/sha256 与单 run 不一致")
-        # 展平条目双向对账：单 run 无多余条目、同名条目去元数据后全等
+        # 展平条目双向对账：单 run 无多余条目、同名条目 compile-facing 键全等。
+        # Business Reasoning Barrier（ticket 02）有意发散：单 run xlsx 条目是
+        # Pre-MOD 形态（evidence + digest=="deferred"）；task 物化条目是真实
+        # digest 文件、无 evidence —— 各自显式断言，不做整字典相等。
         single_by_name = {e["name"]: e for e in single_manifest["flattened"]}
         task_by_name = {e["name"]: e for e in task_manifest["flattened"]}
         self.assertEqual(set(single_by_name), set(task_by_name),
                          "task 与单 run 的展平条目名集合不一致")
         for name, entry in task_by_name.items():
-            self.assertEqual(strip_cache_metadata(entry), single_by_name[name],
-                             f"展平条目 {name} 去元数据后与单 run 条目不一致")
+            self.assertEqual(compile_keys(entry), compile_keys(single_by_name[name]),
+                             f"展平条目 {name} compile-facing 键与单 run 不一致")
+            self.assertEqual(set(entry) - set(single_by_name[name]),
+                             {"sha256", "cache_key"})
+        for name, entry in single_by_name.items():
+            self.assertEqual(entry["evidence"], f"{name}_premod_evidence.md")
+            self.assertEqual(entry["digest"], "deferred")
+        for name, entry in task_by_name.items():
+            self.assertNotIn("evidence", entry)
+            self.assertEqual(entry["digest"], f"{name}_digest.md")
         self.assertEqual(task_manifest["fingerprints"]["source_structure"],
                          single_manifest["fingerprints"]["source_structure"])
 

@@ -8,7 +8,9 @@ flatten structure digests, so structural signals are verified facts instead
 of "待L2复验" placeholders. The MOD Gate state machine is gone: resolution
 has no independent run state; the outcome is recorded in fill_spec.yaml.
 
-Evidence boundary: task text + filenames + outline text + digest facts.
+Evidence boundary: task text + filenames (original basenames from
+prepare_manifest.json files[].source, plus staged names) + outline text +
+digest facts (pre-mod evidence view).
 No cell-level reads. Flatten already ran mechanically (it never waits for MOD);
 this step only decides whether the user must be interrupted before FillSpec.
 
@@ -49,6 +51,15 @@ Usage:
       --outline source_maoli_outline.txt,target_baojia_outline.txt \
       --digest source_maoli_digest.md,target_baojia_digest.md \
       --out mod_resolution.json
+  # 裁决记录语义 (Ticket 03): 用户裁决后重跑一次, 把最终选择机械写入
+  python scripts/mod_nominate.py ... --mod <NAME|NONE> --out mod_resolution.json
+
+语义区分 (硬性注释契约):
+  - 无 --mod = 提名语义 (不变): mod_resolution.json 是提名推荐
+    (recommendation), 任务文本显式点名 (resolve(explicit_mod=...)) 仍属提名。
+  - 有 --mod = 裁决记录语义: 新鲜评估跑完后, 把用户裁决写成 final decision
+    record (status: resolved + selected), Barrier 解锁成为字面文件检查。
+
 Exit codes: 0=pass (nomination is advisory, every status is a legal result)
 """
 
@@ -85,6 +96,9 @@ SEMANTIC_KEYWORDS = {
     "pricing_block_to_customer_quotation": [
         "报价单", "客户报价", "英文报价", "quotation", "fill quotation",
     ],
+    "internal_parameter_to_customer_parameter_sheet": [
+        "参数表", "型谱", "客户版", "外发", "parameter sheet", "spectrum",
+    ],
     "margin_analysis": ["毛利", "损益", "成本", "核价"],
     "kpi_scorecard": ["kpi", "指标", "看板"],
     "sales_ledger": ["销售", "台账", "流水"],
@@ -108,6 +122,9 @@ DIMENSION_SET_FACTS = {
     "product_sku": ["z码", "sku", "货号", "型号"],
     "customer_quotation_six_fields": [
         "type", "model", "capacity", "connecting pipe", "unit price", "panel looking",
+    ],
+    "product_line_capacity_zcode": [
+        "产品线", "product line", "容量", "capacity", "z码", "z code",
     ],
 }
 
@@ -431,6 +448,90 @@ def exclusion_checks(exclusion: str, evidence: str, digests: list[str],
                 continue  # 六角色指纹存在 → 排除不触发
             fired.append({"signal": ex, "reason": "目标表头缺少客户报价角色: "
                           + ", ".join(missing)})
+        elif "目标为客户参数表" in ex_name:
+            # 报价 MOD 排除信号: 目标是客户参数表（含系列标题/参数名行/Z码角色，
+            # 无价格/报价/核价角色）→ 报价 MOD 不适用，排除触发。
+            # 用于防止参数表任务被报价 MOD 误报（D3 误报复盘）。
+            if not digests:
+                fired.append({"signal": ex, "reason": "证据缺失: digest "
+                              "未喂到 — 核对 --digest 参数后再判定, 勿以证据"
+                              "缺失当作结构不符"})
+                continue
+            headers = _header_lines(digests)
+            if not headers:
+                fired.append({"signal": ex, "reason": "证据缺失: digest "
+                              "表头行缺失 — 核对 --digest 参数后再判定"})
+                continue
+            role_text = " ".join(headers).lower()
+            # 参数表角色指纹: 系列标题、参数名行、Z码
+            param_sheet_roles = ["系列标题", "参数名", "z码", "z code"]
+            param_present = any(r in role_text for r in param_sheet_roles)
+            # 价格/报价/核价角色（报价域特征）
+            price_roles = ["报价", "核价", "价格", "毛利", "净价", "quotation",
+                           "margin", "price", "cost"]
+            price_present = any(r in role_text for r in price_roles)
+            if param_present and not price_present:
+                # 目标是参数表且无价格角色 → 报价 MOD 排除触发
+                fired.append({"signal": ex, "reason": "目标为客户参数表"
+                              "（含参数表角色指纹，无价格/报价/核价角色）"
+                              "— 报价 MOD 不适用"})
+            else:
+                # 非参数表或含价格角色 → 排除不触发
+                continue
+        elif "目标含报价/核价/价格角色" in ex_name:
+            # 参数表 MOD 排除信号: 目标含报价/核价/价格角色 → 参数表 MOD 不适用。
+            # 用于防止报价任务被参数表 MOD 误报。
+            if not digests:
+                pending_exclusions.append(ex)
+                continue
+            headers = _header_lines(digests)
+            if not headers:
+                pending_exclusions.append(ex)
+                continue
+            role_text = " ".join(headers).lower()
+            price_roles = ["报价", "核价", "价格", "毛利", "净价", "quotation",
+                           "margin", "price", "cost"]
+            price_present = any(r in role_text for r in price_roles)
+            if price_present:
+                # 目标含价格角色 → 参数表 MOD 排除触发
+                fired.append({"signal": ex, "reason": "目标含报价/核价/价格角色"
+                              "— 参数表 MOD 不适用"})
+            else:
+                continue
+        elif "目标缺少客户参数表角色指纹" in ex_name:
+            # 参数表 MOD 排除信号: 目标缺少客户参数表角色指纹（系列标题/参数名行/Z码）
+            if not digests:
+                pending_exclusions.append(ex)
+                continue
+            headers = _header_lines(digests)
+            if not headers:
+                pending_exclusions.append(ex)
+                continue
+            role_text = " ".join(headers).lower()
+            param_roles = ["系列标题", "参数名", "z码", "z code"]
+            present = [r for r in param_roles if r in role_text]
+            if len(present) >= 2:
+                # 多数角色命中 → 参数表指纹存在, 排除不触发
+                continue
+            fired.append({"signal": ex, "reason": "目标表头缺少客户参数表角色: "
+                          + ", ".join(r for r in param_roles if r not in present)})
+        elif "源无稳定产品身份" in ex_name:
+            # 参数表 MOD 排除信号: 源无稳定产品身份（产品线-容量-Z码）
+            if not digests:
+                pending_exclusions.append(ex)
+                continue
+            headers = _header_lines(digests)
+            if not headers:
+                pending_exclusions.append(ex)
+                continue
+            role_text = " ".join(headers).lower()
+            identity_roles = ["产品线", "product line", "容量", "capacity", "z码", "z code"]
+            present = [r for r in identity_roles if r in role_text]
+            if len(present) >= 2:
+                # 多数角色命中 → 稳定身份存在, 排除不触发
+                continue
+            fired.append({"signal": ex, "reason": "源缺少稳定产品身份角色: "
+                          + ", ".join(r for r in identity_roles if r not in present)})
         else:
             # Unknown exclusion: no evaluator — fail-closed, never silently
             # pass. Record as pending_exclusions → blocks auto-resolved
@@ -439,10 +540,42 @@ def exclusion_checks(exclusion: str, evidence: str, digests: list[str],
     return fired, pending_exclusions
 
 
+def filename_evidence_from_manifest(workdir: Path) -> tuple[str, bool]:
+    """Return (filename_evidence_text, degraded) from prepare_manifest.json.
+
+    原始业务文件名 (files[].source 的 basename) 与 staged 暂存名 (files[].staged)
+    一并进入证据 — MOD 信号按「业务文件名」匹配, 不再对 stage_files.py 强制的
+    ASCII 暂存命名敏感 (2026-08-27 走查修复: source_pattern::毛利表* 曾因 evidence
+    只有 staged 名 source_maoli.xlsx 而 miss)。
+
+    降级规则: manifest 缺失 / 不可读 → 返回 ("", True), 不失败; 调用方据此在
+    stderr 打一次 WARNING, 证据退化为 task + --files + outline (旧行为)。
+    """
+    manifest_path = workdir / "prepare_manifest.json"
+    if not manifest_path.is_file():
+        return "", True
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return "", True
+    names: list[str] = []
+    for f in manifest.get("files", []) or []:
+        source = f.get("source")
+        if source:
+            names.append(Path(source).name)
+        staged = f.get("staged")
+        if staged:
+            names.append(staged)
+    return " ".join(names), False
+
+
 def evidence_text(task: str, files: str, outline_arg: str, workdir: Path) -> str:
     parts = [task or ""]
     if files:
         parts.append(files)
+    # 原始业务文件名 (prepare_manifest.json files[].source basename) + staged 名
+    # 由 filename_evidence_from_manifest() 提供, 在 main() 中拼入 (降级时打
+    # WARNING, 证据退化为 task + --files + outline 的旧行为)。
     for name in [o.strip() for o in outline_arg.split(",") if o.strip()]:
         p = Path(name)
         if not p.is_absolute():
@@ -561,7 +694,13 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
                         else ". keep/downgrade/replace must be user-adjudicated") +
                        note}
     if explicit_mod:
-        return {"status": "resolved", "candidates": candidates,
+        # 任务文本显式点名 (提名语义): resolved 统一带 selected 字段
+        # (selected = 被点名候选的名称; selected_revision = 其卡片 revision)。
+        # 注意: 本条是「提名语义」—— 任务文本点名由用户任务指令流场而来,
+        # 仍是提名推荐; --mod 才是「裁决记录语义」(见 main() adjudication 分支)。
+        chosen = candidates[0]
+        return {"status": "resolved", "selected": chosen["name"],
+                "selected_revision": chosen["revision"], "candidates": candidates,
                 "why": "explicit MOD name or alias matched the catalog and no "
                        "exclusion signal fired"}
     hit_count = len([c for c in candidates if c["hits"]])
@@ -579,9 +718,108 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
                 "candidates": _attach_rule_evidence(candidates, rules_by_name),
                 "why": "the matching MOD has missed or unverifiable business "
                        "facts — user adjudication required"}
-    return {"status": "resolved", "candidates": candidates,
+    # 自动采用单候选 (提名语义): resolved 统一带 selected 字段
+    chosen = candidates[0]
+    return {"status": "resolved", "selected": chosen["name"],
+            "selected_revision": chosen["revision"], "candidates": candidates,
             "why": "exactly one candidate, every signal hit, nothing missed, "
                    "no exclusion fired, nothing pending"}
+
+
+def _adjudicated_from(result: dict, out: Path) -> str | None:
+    """推导轻量审计字段 adjudicated_from (仅 ambiguous|conflict, 否则省略)。
+
+    优先级: 上一份裁决文件 (--out) 若存在且 status ∈ {ambiguous, conflict}
+    → 取其 status; 否则取本轮新鲜评估 status 若 ∈ {ambiguous, conflict};
+    否则省略该字段。
+
+    审计专用 — 仅供追溯裁决前状态, 禁止任何后续门禁/状态机逻辑依赖它
+    (不发展成状态机; 见 ADR-0011 / ticket 03 验收标准)。
+    """
+    prev = None
+    if out.is_file():
+        try:
+            data = json.loads(out.read_text(encoding="utf-8"))
+            prev = data.get("status")
+        except (ValueError, OSError):
+            prev = None
+    if prev in ("ambiguous", "conflict"):
+        return prev
+    fresh = result.get("status")
+    if fresh in ("ambiguous", "conflict"):
+        return fresh
+    return None
+
+
+def _candidate_name_matches(cand: dict, name: str, entries: list[dict]) -> bool:
+    """NAME 是否命中该候选: 精确卡名, 或经 index alias 解析为该卡名。
+
+    候选卡本身不含 aliases 字段 (统一输出形状只带 name/display_name/…),
+    因此 alias → name 的解析走 index entries (resolve() 同源)。
+    """
+    lowered = name.strip().lower()
+    if cand["name"].lower() == lowered:
+        return True
+    for e in entries:
+        if e["name"] == cand["name"] and any(
+                a.strip().lower() == lowered
+                for a in e["aliases"].split(",") if a.strip()):
+            return True
+    return False
+
+
+def build_adjudication_record(result: dict, mod_name: str, entries: list[dict],
+                              out: Path) -> dict:
+    """--mod 裁决记录语义: 用本轮新鲜评估的候选集合 + 用户裁决, 机械写出
+    final decision record (status: resolved + selected)。绝不捏造 resolved —
+    NAME 不属于本轮候选集合 → fail-closed 报错, 不写 --out。
+
+    NONE (大小写不敏感) → 短路径: 无 selected_revision (NONE 短路 revision,
+    ticket 04 C3 依赖此点); 无候选 status=none 时也是合法 (确认式裁决)。
+    NAME → 必须命中本轮候选卡; 该卡 fired_exclusions 记为记录级
+    overridden_exclusions (用户 keep 裁决), 状态仍为 resolved (非 conflict);
+    候选卡自身的 fired_exclusions 保留为「被覆盖了什么」的审计痕迹。
+    """
+    fresh_candidates = result.get("candidates", [])
+
+    if mod_name.strip().upper() == "NONE":
+        record = {
+            "status": "resolved",
+            "selected": "NONE",
+            "candidates": fresh_candidates,
+            "why": "user adjudication recorded — no MOD selected",
+        }
+        af = _adjudicated_from(result, out)
+        if af is not None:
+            record["adjudicated_from"] = af
+        return record
+
+    # NAME 裁决: 命中本轮候选集合 (精确卡名或 alias 解析为卡名)
+    matched = [c for c in fresh_candidates
+               if _candidate_name_matches(c, mod_name, entries)]
+    if not matched:
+        candidate_names = ", ".join(c["name"] for c in fresh_candidates) or "(none)"
+        fail("MOD_NOT_IN_CANDIDATES",
+             f"--mod {mod_name!r} 不属于本轮候选集合 (候选: {candidate_names})",
+             "从候选卡中挑选一个 MOD 名重跑, 或使用 --mod NONE 记录不采用裁决; "
+             "本脚本不捏造 resolved 记录, 也不写 --out")
+    chosen = matched[0]
+    record = {
+        "status": "resolved",
+        "selected": chosen["name"],
+        "selected_revision": chosen["revision"],
+        "candidates": fresh_candidates,
+        "why": f"user adjudication recorded — keep {chosen['name']} "
+               "(keeping the candidate despite its exclusion signals, if any)",
+    }
+    if chosen["fired_exclusions"]:
+        # 用户 keep 裁决: 排除触发不返回 conflict, 而降级为记录级
+        # overridden_exclusions 审计清单; 候选卡自身 fired_exclusions 保留。
+        record["overridden_exclusions"] = chosen["fired_exclusions"]
+    af = _adjudicated_from(result, out)
+    if af is not None:
+        record["adjudicated_from"] = af
+    return record
 
 
 def main() -> None:
@@ -600,6 +838,10 @@ def main() -> None:
     parser.add_argument("--index", type=Path, default=None)
     parser.add_argument("--mods-dir", type=Path, default=None)
     parser.add_argument("--out", type=Path, required=True, help="结构化结果 JSON")
+    parser.add_argument("--mod", type=str, default=None,
+                        help="裁决记录模式: 指定用户裁决的 MOD 名或 NONE。"
+                             "缺省 = 提名语义 (行为与旧版完全一致)。"
+                             "传入即改为裁决记录语义, 机械写出 final decision record。")
     args = parser.parse_args()
 
     skill_root = Path(__file__).resolve().parent.parent
@@ -610,6 +852,14 @@ def main() -> None:
              "检查 --index 路径")
 
     evidence = evidence_text(args.task, args.files, args.outline, args.workdir)
+    filename_evidence, degraded = filename_evidence_from_manifest(args.workdir)
+    if filename_evidence:
+        evidence = " ".join([evidence, filename_evidence])
+    if degraded:
+        print("[MOD_NOMINATE] WARNING — prepare_manifest.json 不存在, "
+              "文件名证据仅限 --files 传入的暂存名; "
+              "原始业务文件名模式 (如 source_pattern::毛利表*) 可能 miss",
+              file=sys.stderr)
     digests = load_digests(args.digest, args.workdir)
     outlines = load_outlines(args.outline, args.workdir)
     entries = parse_index(index)
@@ -632,6 +882,15 @@ def main() -> None:
     out = args.out
     if not out.is_absolute():
         out = args.workdir / out  # 相对路径以 workdir 为基准 (与 outline/digest 一致)
+
+    # 裁决记录分支 (--mod 传入 = 裁决记录语义, 缺省 = 提名语义, 行为不变)。
+    # 新鲜证据管线 (--task/--files/--outline/--digest/--index/--mods-dir) 与
+    # 上文完全一致地跑完, 得到本轮 fresh result; 裁决记录即在该 fresh
+    # candidates 上机械写出 — 用户裁决被如实记录, Barrier 解锁成为字面文件
+    # 检查 (status 真实变为 resolved), 而非对会话文本的解释。
+    if args.mod is not None:
+        result = build_adjudication_record(result, args.mod, entries, out)
+
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2),
                    encoding="utf-8")

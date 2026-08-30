@@ -5,9 +5,12 @@ Verifies that:
    ``mod_capture`` (fail-closed); clean public MODs pass.
 2. Private MODs are exempt from decontamination enforcement and remain the
    default visibility.
-3. The two existing TCL MODs are private, not registered in MOD_INDEX (not
-   shipped), and would be flagged if promoted to public — proving the
-   private exemption is necessary.
+3. TCL MODs are private: they may be registered in MOD_INDEX (the capture
+   lifecycle registers private MODs — see MOD_INDEX «Adding a MOD»), but
+   every registered TCL MOD must stay ``visibility: private`` (never public,
+   never shipped with releases), and they would be flagged by the
+   decontamination check if promoted to public — proving the private
+   exemption is necessary.
 4. MOD_TEMPLATE.md clarifies the public/private decontamination scope.
 
 All capture-enforcement tests run against a temporary capture root via
@@ -211,10 +214,12 @@ class TestPrivateModExemption(unittest.TestCase):
 
 
 class TestTclModsArePrivate(unittest.TestCase):
-    """The two TCL MODs must remain private and not registered in MOD_INDEX.
+    """TCL MODs must remain private wherever they are registered.
 
-    Per issue #11: private MODs are exempt from decontamination but must not
-    be shipped with releases (no MOD_INDEX registration).
+    The capture lifecycle registers private MODs in MOD_INDEX (see MOD_INDEX
+    «Adding a MOD»); the release boundary is visibility=private, not absence
+    from the index. Per issue #11: private MODs are exempt from
+    decontamination but must never be promoted to public/shipped.
     """
 
     TCL_MODS = [
@@ -232,15 +237,20 @@ class TestTclModsArePrivate(unittest.TestCase):
                 f"{name} must declare 'Visibility: private'",
             )
 
-    def test_tcl_mods_not_registered_in_index(self):
+    def test_tcl_mods_registered_in_index_must_be_private(self):
         from _mod_catalog import parse_mod_index  # noqa: E402
 
         entries = parse_mod_index(MOD_INDEX_PATH.read_text(encoding="utf-8"))
         tcl_entries = [e for e in entries if "tcl" in e.mod_name.lower()]
+        self.assertTrue(
+            tcl_entries,
+            "expected at least one registered TCL MOD (capture lifecycle "
+            "registers private MODs in MOD_INDEX)",
+        )
+        public = [e.mod_name for e in tcl_entries if e.visibility != "private"]
         self.assertEqual(
-            len(tcl_entries), 0,
-            f"TCL MODs must not be registered in MOD_INDEX but found: "
-            f"{[e.mod_name for e in tcl_entries]}",
+            public, [],
+            f"registered TCL MODs must never be public (shipped): {public}",
         )
 
     def test_tcl_mods_have_forbidden_content(self):

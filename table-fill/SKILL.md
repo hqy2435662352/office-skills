@@ -80,7 +80,8 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 
 ## 工作流 (五个公开命令)
 
-`prepare_run.py` (outline) → MOD Resolution (条件中断) → `fill_spec.yaml` (LLM 撰写)
+`prepare_run.py` (outline → premod_evidence) → Task Shape Check → `mod_nominate.py`
+→ 用户裁决 → [--mod 落盘 → 规则加载] → digest 生成 → `fill_spec.yaml` (LLM 撰写)
 → `compile_fill.py` (plan+mapping+验证) → `execute_batch.py` (唯一一次填充) →
 Validated Draft + receipt → Execution Gate (唯一 Human Gate) → `promote_output.py`
 (hash 验证复制)
@@ -93,15 +94,15 @@ python scripts/prepare_run.py --workdir <ascii_dir> \
   --files "C:\...\毛利表.xlsx|source_maoli.xlsx,C:\...\报价汇总.xlsx|target_baojia.xlsx" \
   --outline
 
-# 阶段 B: flatten + classify + digest + 结构 fingerprint (机械, 不等 MOD)
+# 阶段 B: flatten + classify + premod evidence + fingerprints (机械, 不等 MOD)
 python scripts/prepare_run.py --workdir <dir> --flatten \
   --sheets "source_maoli.xlsx:FRESH订家用机型毛利情况;target_baojia.xlsx:11_FRESH本土" \
   --target target_baojia.xlsx
 ```
 
 - workdir 必须 ASCII (`C:\Temp\tablefill\<task>\`)。所有 artifact 名称 ASCII 化。
-- 输出 `prepare_manifest.json` (文件哈希、flattened sheets、digest、fingerprints)。
-- 每个 sheet 一个 `{name}_digest.md` — **LLM 只读 digest, 不读 meta.json**。
+- 输出 `prepare_manifest.json` (文件哈希、flattened sheets、premod evidence、fingerprints)。
+- flatten 产出每个 sheet 一个 `{name}_premod_evidence.md`（只含 task-shape 路由 + MOD 提名所需的最小结构事实，剥离一切解题材料）；full `{name}_digest.md` 在 MOD Resolution 解锁后才生成（见 Barrier 区块与 §2 解锁程序）。
 - 阶段 B 之前先读 outline 确认 sheet 名; 一次 outline 只跑一次, 不重复。
 - **`--sheets` 按任务文本一次列出全部源 sheet** (文件间用 `;` 分隔,
   `file.xlsx:S1,S2;file2.xlsx:S3`) — 漏列触发 TARGET_NOT_FLATTENED, 补跑即可。
@@ -116,18 +117,44 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
   (抄 repair 输出 JSON 的 `fingerprints.target_structure`, 或 `--patch-spec`
   一步完成) + 重编译 (见 FILLSPEC Q16)。
 
+### 1.4 Business Reasoning Barrier（硬性）
+
+Prepare 完成后 Barrier **关闭**，直到 `mod_resolution.json` 的
+`status ∈ {resolved, none}` 才**解锁** — 二元锁，无例外分级。以下三张清单全部按
+**行为**执行，不是认知建议；Barrier 关闭期间违反任一清单即越界。
+
+**允许读**:
+
+- 读 `*_premod_evidence.md`、`*_outline.txt`;
+- 裁决期间读 `mod_resolution.json`（只为呈现裁决选项与记录最终选择）;
+- `uncertain` 路由的受限补观察（view html + ≤2 次定向 get/query）**只允许回答 task shape**，不用于任何解题分析。
+
+**禁止读**:
+
+- `*_flat.csv`、`*_meta.json`、`*_candidates.yaml`。
+
+**禁止做**:
+
+- 生成 `*_digest.md`;
+- 进行 column mapping、公式·口径推导、inheritance、selector、业务 ASK、FillSpec 推导或撰写。
+
+**Barrier 未开：只识别任务与规则，不解决任务。**
+
+解锁程序见 §2 MOD Resolution（本区块只立规则，不在这里重复解锁步骤）。
+
 ### 1.5 Task Shape Check (Prepare B 后、MOD 前) — Routing V2
 
-Prepare Stage B (flatten+digest) 完成后、MOD 提名之前, 先按 **任务形态** 路由
+Prepare Stage B (flatten+premod evidence) 完成后、MOD 提名之前, 先按 **任务形态** 路由
 (Routing V2: **Level 0 Obvious Grid Fast Path** + **Exception Routing**)。判定
-输入永远三项: **任务指令 × 源 digest × 目标 digest** (不是只看文件长什么样)。
-对明确信号**一眼可判** — 读毕 digest 即答, **零新脚本、零额外 LLM 调用、零常规
+输入永远三项: **任务指令 × 源 premod_evidence × 目标 premod_evidence** (不是
+只看文件长什么样) — 这是对 ADR-0010 原表述的修正, 见 ADR-0011 后果节。
+对明确信号**一眼可判** — 读毕 premod_evidence 即答, **零新脚本、零额外 LLM 调用、零常规
 额外探测** (不追加 picture scan / HTML render / 额外 query / 第二模型调用)。同一
 文件对不同任务可走不同路径 (如"填 50 条产品明细"→ grid_record; "只填封面客户
 资料"→ form_content)。
 
 ```text
-Prepare B (读毕 digest, Agent 本来就要读)
+Prepare B (读毕 premod_evidence, Agent 本来就要读)
    ├─ Obvious Grid (稳定 header + 重复 record 行 + 可克隆数据区)
    │     └─► Level 0 FAST PATH: grid_record/fillspec, evidence=["obvious_grid"],
    │          立即进 MOD — 0 新增动作, 禁止继续 routing 分析
@@ -154,17 +181,18 @@ officecli_native 的组合执行, **不是第三引擎**。evidence 一律短 sn
 
 #### Level 0 — Obvious Grid Fast Path (默认主路径, 不是 fallback)
 
-读毕 digest 即明显常规 Grid — 稳定 header + 重复 record 行 + 目标可克隆数据区,
+读毕 premod_evidence 即明显常规 Grid — 稳定 header + 重复 record 行 + 目标可克隆数据区,
 映射以列↔列为主, 输出行数由源记录数驱动 (如四案例 Case 1 复杂报价单) → **立即**
 `grid_record` + `fillspec`, evidence 固定 `["obvious_grid"]`, 直接进入原 **MOD
 Resolution → FillSpec → Compile** 流程 — 95% 任务运行路径零变化, 不追加任何
 探测。
 
-**禁止继续 routing 分析** (stop-rule): Fast Path 寄生在"读 digest"既有动作上,
+**禁止继续 routing 分析** (stop-rule): Fast Path 寄生在"读 premod_evidence"既有动作上,
 不是新分类步骤 — **不写 signal checklist、不分级打分、不长篇 reasoning**。
 **可观测动作不变式验收线**: 与本任务 V1 基线相比, **0 新增 LLM 调用 / officecli
 调用 / inspect / render / 脚本 / scoring / decomposition / feature extraction** —
 任何"为了确认是 Grid 才做"的追加动作都违反 Fast Path, 必须直进 MOD。
+**Barrier 解锁的 digest 生成命令不计入新增动作（它不是 routing 分析）**。
 
 仅出现**明确异常信号**才进 Exception Routing (正常 Grid 任务不需要任何异常
 判断, 也不做对称分类):
@@ -192,6 +220,7 @@ Resolution → FillSpec → Compile** 流程 — 95% 任务运行路径零变化
 
 **uncertain (临时判定态)**: 既非明显 Grid、也无明确异常信号时 — 一次受限补观察
 (view html + ≤2 次定向 get/query) → 必须重判进入 Fast Path 或 Exception 分支;
+此补观察**只允许回答 task shape**（见 Barrier 区块「允许读」），不用于解题分析;
 仍存在会实质改变执行模型的歧义才 ASK (evidence 用
 `insufficient_routing_evidence` / `conflicting_workload_signals` /
 `task_intent_ambiguous`, 临时态, 不扩设计)。
@@ -242,7 +271,7 @@ Rejected)。
 #### form_content 工作流 (officecli native 路径)
 
 1. **沿用共享 workdir / source protection / Prepare** — 与 grid 路径同一 workdir
-   与暂存保护, staged 文件只读, Prepare 已生成 digest。
+   与暂存保护, staged 文件只读, Prepare 已生成 premod_evidence（完整 digest 解锁后才有）。
 2. **落 `task_shape.json`** — 分流判定产物 (三字段, 见下)。
 3. **officecli native execution** — inspect → atomic edit → adjust, 经
    `_officecli.officecli()` 适配器调用 (见不变量 6), 目标模板永不被修改 (编辑
@@ -262,7 +291,7 @@ promote / receipt / FillSpec plan/draft 哈希三元组 — 只为 QA 证据与�
 python scripts/mod_nominate.py --workdir <dir> --task "<任务文本>" \
   --files "source_maoli.xlsx,target_baojia.xlsx" \
   --outline "source_maoli_outline.txt,target_baojia_outline.txt" \
-  --digest "source_maoli_FRESH_digest.md,target_baojia_11_FRESH_digest.md" \
+  --digest "source_maoli_FRESH_premod_evidence.md,target_baojia_11_FRESH_premod_evidence.md" \
   --out mod_resolution.json
 ```
 
@@ -277,12 +306,24 @@ python scripts/mod_nominate.py --workdir <dir> --task "<任务文本>" \
 | 单候选仍有未验证业务事实 (pending)、或可验证未命中信号 (missed)、或含未知排除条件 | 视为歧义, 询问用户 (fail-closed, 不静默放行) |
 | MOD 与实际表结构冲突 (排除信号触发) | 询问降级/替换/覆盖 |
 
-`selected_mod` 只写入 fill_spec.yaml — 没有 mod_state, 没有独立 Gate。
+`selected_mod` 写进 fill_spec.yaml 之前, 裁决先落盘到 `mod_resolution.json`（`--mod` 重跑写盘）— 没有 mod_state, 没有独立 Gate; FillSpec 的 `selected_mod` 必须与 `mod_resolution.json` 最终裁决一致（编译器 C2/C3 机械校验）。
 MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.py`。
+
+**Barrier 解锁程序 (硬性, 对应 §1.4)**: Barrier 保持关闭直到
+`mod_resolution.json` 的 `status ∈ {resolved, none}` — 裁决后未带 `--mod` 重跑、
+盘上仍是 `ambiguous`/`conflict` 时, 编译器 C4 (`MOD_UNRESOLVED`) 会拦截。
+
+- **裁决落盘**: 用户裁决后**必须带 `--mod <NAME|NONE>` 重跑 `mod_nominate.py`**
+  把选择写盘 — `NAME` 须属当前候选集 (越界 fail-closed); 冲突覆盖的选择记为
+  `overridden_exclusions` 而非 conflict; `--mod NONE` 写 `resolved` + `selected: NONE`。
+- **`resolved + selected MOD`**: 先 `load_rules_for_selected_mod()` 加载该 MOD
+  全文规则, 再对每个需要的 sheet 运行 `structure_digest.py`（目标 sheet 加
+  `--target`）生成 `{name}_digest.md`。
+- **`resolved + NONE` / `status=none`**: 直接生成 digest（无规则注入）。
 
 **规则注入时机 (硬性)**: 候选 MOD 的规则**必须加载后才可写 spec** — 此硬性
 要求不变, 改变的是加载时机与粒度, 不是是否加载。为控制 mod_resolution 相位
-信息过载 (真实构成: 读 3 digest + 3 展平 CSV + 用户裁决墙钟 — 提名输出曾含
+信息过载 (真实构成: 读 premod_evidence + 用户裁决墙钟 — 提名输出曾含
 625 行两候选全量规则), 加载分两段:
 
 - **提名阶段 (mod_nominate.py 输出)**: 每个候选只给「候选名 + 命中/待复验
@@ -338,7 +379,9 @@ MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.p
 Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_template.yaml`。
 要点:
 
-- `task.intent` + `task.selected_mod` (来源信息, 不是状态)
+- `task.intent` + `task.selected_mod` (来源信息, 不是状态) — 撰写前提: spec 的
+  `selected_mod` / `selected_mod_revision` 必须等于 `mod_resolution.json` 最终裁决
+  （C2/C3 会机械校验，裁决缺失/未裁决/不一致都无法编译）。
 - `inputs`: staged 文件名 + source_sheets + target_sheet (+ `platform: xlsx|pptx`)
 - `fingerprints`: 必须与 prepare_manifest.json 完全一致, 否则编译拒绝
 - `mapping.targets[]`: 每个目标 sheet 一个条目 —
@@ -599,6 +642,10 @@ python scripts/resume_task.py    --task-root <task_dir> --resume [--rebuild] | -
 
 ## PPTX 目标
 
+- **Barrier 边界**: PPTX flatten 仍按既有行为生成自身 minimal digest（无
+  premod_evidence、无 digest 延迟）— Business Reasoning Barrier (v2.5) 当前
+  仅覆盖 XLSX 主路径（见 §1.4 与 ADR-0011 后果节）。首次引入需要 MOD 提名+
+  完整 digest 的 PPTX 业务前，重新评估该边界。
 - `platform: pptx` + `target_sheet: slide[N]/table[@id=M]` (id 来自 outline)。
 - `prepare_run.py` 直接展平 pptx 表格 (每格值写入, 无克隆/合并/公式)。
 - FillSpec 的 columns target 仍用列字母 (A..Z) — Compiler 自动映射为 `tc[索引]`。
@@ -736,8 +783,9 @@ python scripts/note_phase.py --workdir <dir> --phase <名称>
 <workdir>/                        ← ASCII workdir (C:\Temp\tablefill\<task>\)
 ├── prepare_manifest.json          ← Prepare 产物清单 + fingerprints
 ├── task_shape.json                ← Task Shape Check 分流判定 (task_shape + route + evidence)
-├── *_outline.txt / *_digest.md / *_flat.csv / *_meta.json / *_candidates.yaml
-├── mod_resolution.json            ← MOD 裁决 (结构化)
+├── *_outline.txt / *_premod_evidence.md / *_flat.csv / *_meta.json / *_candidates.yaml
+├── *_digest.md                     ← 解锁后由 structure_digest.py 生成 (Post-MOD)
+├── mod_resolution.json             ← 最终裁决记录（--mod 写盘）
 ├── fill_spec.yaml                 ← Canonical 业务语义 (LLM 撰写)
 ├── execution_plan.json / mapping.md   ← Compiler 派生
 ├── validated_draft.<ext>          ← 已验证候选交付文件 (Gate 后提升)

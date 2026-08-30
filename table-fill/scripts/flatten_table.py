@@ -11,7 +11,7 @@ Usage:
 import json, csv, re, sys, argparse, time
 from pathlib import Path
 
-from _officecli import officecli  # noqa: E402  (shared UTF-8 adapter)
+from _officecli import officecli, fail  # noqa: E402  (shared UTF-8 adapter)
 
 
 # ── Column utilities (identical to original) ──────────────────────────
@@ -42,12 +42,66 @@ def parse_merge(merge_str):
 
 # ── officecli calls (all via shared _officecli.officecli() adapter, no openpyxl) ─
 
+def _checked_officecli_json(proc, *, context="", fail_on_error=True):
+    """Fail-fast validation of an officecli `--json` response (get-style reads).
+
+    Replaces the bare `json.loads(result.stdout)` that historically masked a
+    wrong sheet / `--sheets` separator syntax error as a downstream
+    `KeyError: 'data'` — the real root cause was invisible.  Checks, in order:
+
+      1. returncode != 0            -> OFFICECLI_GET_FAILED
+      2. stdout not parseable JSON  -> OFFICECLI_RESPONSE_INVALID
+      3. JSON but no `data` key     -> OFFICECLI_RESPONSE_INVALID
+         (a non-get error schema, e.g. officecli found no such sheet)
+
+    With fail_on_error=False the same three checks return ``{}`` instead of
+    exiting, so callers that must silently degrade (collect_formula_facts) can
+    reuse the single checks home without breaking their contract.
+    """
+    def _defect(code, message, corrective_action):
+        if fail_on_error:
+            fail(code, message, corrective_action)
+        return {}
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-400:]
+        return _defect(
+            "OFFICECLI_GET_FAILED",
+            f"officecli get 失败 (rc={proc.returncode}) [{context}]: "
+            f"stderr={stderr_tail!r}",
+            "核对 sheet 名/范围参数与 outline 一致; 若 officecli 环境问题先 preflight。",
+        )
+
+    try:
+        data = json.loads(proc.stdout)
+    except (TypeError, ValueError):
+        stdout_head = repr((proc.stdout or "")[:300])
+        return _defect(
+            "OFFICECLI_RESPONSE_INVALID",
+            f"officecli 输出非 JSON [{context}]: stdout={stdout_head}",
+            "核对 sheet 名/范围参数与 outline 一致; 检查是否命令行语法导致 officecli 输出非 JSON。",
+        )
+
+    if not isinstance(data, dict) or "data" not in data:
+        top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        stdout_head = repr((proc.stdout or "")[:300])
+        return _defect(
+            "OFFICECLI_RESPONSE_INVALID",
+            f"officecli get 响应缺 data 键 [{context}]: top_keys={top_keys}, "
+            f"stdout={stdout_head}",
+            "sheet 名与 outline 不一致, 或 --sheets 分隔符语法错误 (文件间用 `;`, sheet 间用 `,`)。",
+        )
+
+    return data
+
+
 def officecli_get(filepath, sheet, range_str, depth=0):
     """Read cells via officecli get. Returns parsed JSON."""
     path = f"/{sheet}/{range_str}"
     result = officecli("get", str(filepath), path, "--depth", str(depth), "--json",
                        timeout=120)
-    return json.loads(result.stdout)
+    context = f"{Path(filepath).name} sheet={sheet!r} range={range_str}"
+    return _checked_officecli_json(result, context=context)
 
 
 def officecli_outline(filepath):
@@ -445,7 +499,9 @@ def collect_formula_facts(filepath, sheet, num_cols, data_start_row):
     try:
         proc = officecli("query", str(filepath), f"{sheet}!cell:has(formula)", "--json",
                          timeout=120)
-        data = json.loads(proc.stdout)
+        data = _checked_officecli_json(
+            proc, context=f"{Path(filepath).name} sheet={sheet!r} query:has(formula)",
+            fail_on_error=False)
         # 全量保留公式 (锚点/普通行都需要); 去重交给 digest 展示层做归一
         for res in data.get("data", {}).get("results", []):
             path = res.get("path", "")
@@ -470,7 +526,9 @@ def collect_formula_facts(filepath, sheet, num_cols, data_start_row):
         rng = f"A{start}:{col_idx_to_letter(hi - 1)}{start + 4}"
         proc = officecli("get", str(filepath), f"/{sheet}/{rng}", "--depth", "2", "--json",
                          timeout=120)
-        data = json.loads(proc.stdout)
+        data = _checked_officecli_json(
+            proc, context=f"{Path(filepath).name} sheet={sheet!r} range={rng}",
+            fail_on_error=False)
         for res in data.get("data", {}).get("results", []):
             for ch in res.get("children", []):
                 m = re.search(r"/([A-Z]+)(\d+)$", ch.get("path", ""))
