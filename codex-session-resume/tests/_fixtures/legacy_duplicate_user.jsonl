@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-30T16:20:00.000Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-1","model":"m"}}
+{"timestamp":"2026-08-30T16:20:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","id":"m1","role":"user","content":[{"type":"input_text","text":"hi"}]}}
+{"timestamp":"2026-08-30T16:20:02.000Z","ordinal":3,"type":"event_msg","payload":{"type":"user_message","message":"hi"}}
+{"timestamp":"2026-08-30T16:20:03.000Z","ordinal":4,"type":"event_msg","payload":{"type":"user_message","message":"what's up"}}

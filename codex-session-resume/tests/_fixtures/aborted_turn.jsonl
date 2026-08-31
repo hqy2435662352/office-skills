@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-30T12:00:00.000Z","ordinal":1,"type":"response_item","payload":{"type":"message","id":"msg-u","role":"user","content":[{"type":"input_text","text":"跑测试"}]}}
+{"timestamp":"2026-08-30T12:00:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1","name":"exec","status":"completed","input":"const r = await tools.exec_command({\"cmd\":\"pytest\"}); text(r.output);"}}
+{"timestamp":"2026-08-30T12:00:02.000Z","ordinal":3,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-77","reason":"interrupted","started_at":1788000000,"completed_at":1788000005,"duration_ms":5000}}
+{"timestamp":"2026-08-30T12:00:03.000Z","ordinal":4,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-78","started_at":1788000006,"completed_at":1788000008,"duration_ms":2000}}

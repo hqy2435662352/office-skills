@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-30T15:00:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"FutureNewItem","id":"x1","payload":{"something":"new"}}}}
+{"timestamp":"2026-08-30T15:00:01.000Z","ordinal":2,"type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"CommandExecution","id":"e1","command":["ls"],"parsed_cmd":"ls","status":"completed","exit_code":0}}}
+{"timestamp":"2026-08-30T15:00:02.000Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":null}}

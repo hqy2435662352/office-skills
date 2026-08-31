@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-30T14:00:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1}}}}
+
+{"timestamp":"2026-08-30T14:00:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","id":"m-u","role":"user","content":[{"type":"input_text","text":"中文内容：摩洛哥能效 🚀 Windows路径 C:\\Users\\测试\\文件夹\\表.xlsx"}]}}
+not-json-here-at-all
+[1,2,3]
+{"timestamp":"2026-08-30T14:00:02.000Z","ordinal":3,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1","name":"exec","status":"completed","input":"const r = await tools.exec_command({\"cmd\":\"dir\"}); text(r.output);"}}

@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-30T13:00:00.000Z","ordinal":1,"type":"future_record","payload":{"thing":42}}
+{"timestamp":"2026-08-30T13:00:01.000Z","ordinal":2,"type":"event_msg","payload":{"type":"quantum_leap","level":9}}
+{"timestamp":"2026-08-30T13:00:02.000Z","ordinal":3,"type":"response_item","payload":{"type":"telepathy","msg":"hi"}}
+{"timestamp":"2026-08-30T13:00:03.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","id":"m-super","role":"superuser","content":[{"type":"input_text","text":"?"}]}}

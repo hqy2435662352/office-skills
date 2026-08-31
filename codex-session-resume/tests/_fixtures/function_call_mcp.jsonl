@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-30T14:30:00.000Z","ordinal":1,"type":"response_item","payload":{"type":"function_call","id":"fc-1","name":"load_workspace_dependencies","namespace":"mcp__codex_app","arguments":"{\"path\": \"C:\\\\x\"}","call_id":"call-fc-1"}}
+{"timestamp":"2026-08-30T14:30:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"function_call_output","id":"fco-1","call_id":"call-fc-1","output":"Bundle 26.826.12353 available"}}

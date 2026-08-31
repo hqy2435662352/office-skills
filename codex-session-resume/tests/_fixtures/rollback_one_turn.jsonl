@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-30T10:00:00.000Z","ordinal":1,"type":"response_item","payload":{"type":"message","id":"msg-a","role":"user","content":[{"type":"input_text","text":"方案 A：先做摩洛哥"}]}}
+{"timestamp":"2026-08-30T10:00:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","id":"msg-a2","role":"assistant","content":[{"type":"output_text","text":"开始做方案 A"}],"phase":"commentary"}}
+{"timestamp":"2026-08-30T10:00:02.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","id":"msg-b","role":"user","content":[{"type":"input_text","text":"方案 B：改成欧洲"}]}}
+{"timestamp":"2026-08-30T10:00:03.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","id":"msg-b2","role":"assistant","content":[{"type":"output_text","text":"开始做方案 B"}],"phase":"commentary"}}
+{"timestamp":"2026-08-30T10:00:04.000Z","ordinal":5,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1,"turn_id":"turn-999"}}

@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-30T14:10:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"user_message","message":"旧格式用户消息"}}
+{"timestamp":"2026-08-30T14:10:01.000Z","ordinal":2,"type":"event_msg","payload":{"type":"agent_message","message":"旧格式助手消息"}}

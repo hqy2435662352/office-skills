@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-30T10:05:00.000Z","ordinal":1,"type":"response_item","payload":{"type":"message","id":"msg-a","role":"user","content":[{"type":"input_text","text":"第一步"}]}}
+{"timestamp":"2026-08-30T10:05:01.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","id":"msg-b","role":"user","content":[{"type":"input_text","text":"第二步"}]}}
+{"timestamp":"2026-08-30T10:05:02.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","id":"msg-c","role":"user","content":[{"type":"input_text","text":"第三步"}]}}
+{"timestamp":"2026-08-30T10:05:03.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","id":"msg-c2","role":"assistant","content":[{"type":"output_text","text":"第三步的内容"}],"phase":"commentary"}}
+{"timestamp":"2026-08-30T10:05:04.000Z","ordinal":5,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}

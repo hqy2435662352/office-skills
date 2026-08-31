@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-30T11:00:00.000Z","ordinal":1,"type":"world_state","payload":{"full":true,"state":{"agents_md":{"text":"BIG-AGENTS-BODY-SHOULD-NOT-LEAK"},"skills":{"list":[1,2,3]}}}}
+{"timestamp":"2026-08-30T11:00:01.000Z","ordinal":2,"type":"world_state","payload":{"full":false,"state":{"apps_instructions":false}}}
