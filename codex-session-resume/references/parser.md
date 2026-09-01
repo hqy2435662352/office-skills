@@ -106,5 +106,6 @@ DROP+count（legacy_duplicates_removed）。依赖"内容先于标记"的出现�
 
 ## 10. extract_resume_state.py / extract_artifacts.py
 
-见 docs/schema.md 的判定规则与契约（脚本只消费 clean.jsonl/meta.json，
-永不读 raw）。
+见 references/schema.md 的判定规则与契约（脚本只消费 clean.jsonl/meta.json，
+永不读 raw）。V1.3：resume_state 为纯净机器层；`--merge` 写独立
+agent_state.json（解读层）；generate_resume_brief.py 为确定性启动页。

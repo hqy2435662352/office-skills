@@ -48,6 +48,9 @@ compatibility: >
        --meta <out>/meta.json --out <out>/resume_state.json
    python scripts/extract_artifacts.py --clean <out>/clean.jsonl \
        --out <out>/artifact_manifest.json
+   python scripts/generate_resume_brief.py --resume-state <out>/resume_state.json \
+       [--agent-state <out>/agent_state.json] --manifest <out>/artifact_manifest.json \
+       --meta <out>/meta.json --out <out>/resume_brief.md
    ```
 3. **Restore state** — reading order below.
 4. **Rebind the workspace** — see Rebind.
@@ -55,14 +58,19 @@ compatibility: >
 
 ## Reading order
 
-1. `resume_state.json` — state snapshot (phase, next action, evidence refs).
-2. `artifact_manifest.json` — required assets + `exists` per path.
-3. `meta.json` + `stats.json` — identity and cleaning health; unknown /
+1. `resume_brief.md` — the start page: task, current state, do-not list,
+   required-asset gaps (cheap to read, safe to start from).
+2. `resume_state.json` — machine-layer state snapshot (phase, next action,
+   evidence refs, confidence).
+3. `agent_state.json` (if present) — your own interpretation from the reading
+   pass (completed / pending / notes), evidence-validated.
+4. `artifact_manifest.json` — required assets + `exists` per path + importance.
+5. `meta.json` + `stats.json` — identity and cleaning health; unknown /
    malformed counts must be checked, never ignored.
-4. **All `user` messages with `active: true`** — initial goal → scope changes →
+6. **All `user` messages with `active: true`** — initial goal → scope changes →
    corrections → current goal. Later explicit user decisions override earlier
    ones. `active: false` user turns were rolled back: exclude from the goal.
-5. Tail evidence — last lifecycle (`task_complete` = finished normally,
+7. Tail evidence — last lifecycle (`task_complete` = finished normally,
    `turn_aborted` = interrupted), last `final_answer`, last tool evidence.
    `clean.jsonl` is the evidence layer: consult it whenever a state claim is
    uncertain. Read raw rollout ONLY for targeted backfill via `source_line`,
@@ -70,11 +78,12 @@ compatibility: >
 
 ## State semantics
 
-- `resume_state.json` phase/status are rule-based inferences with `confidence`
-  and `basis` — recheck before trusting them. `completed/in_progress/pending`
-  are filled by YOU (the script leaves them empty, `awaiting_agent: true`):
-  fill them, then merge back with `--merge agent_state.json` (invalid evidence
-  refs are rejected).
+- `resume_state.json` (machine layer) is deterministic and pure; its
+  phase/status are rule-based inferences with `confidence` and `basis` —
+  recheck before trusting them. `completed/in_progress/pending` are filled by
+  YOU: write your interpretation to an agent-state file and materialize it with
+  `--merge` (writes `agent_state.json`; invalid evidence refs are rejected;
+  the machine layer never changes).
 - Evidence hierarchy: A) workspace/tool/test/git/validation output > B) user
   decisions > C) assistant claims > D) assistant plans. **D never proves
   completion; C cannot override A.**
@@ -86,7 +95,9 @@ compatibility: >
 ## Rebind
 
 - Check cwd, branch, `git status`, `git diff --stat`, then the artifacts the
-  resume point depends on (manifest `exists` flags are pre-computed).
+  resume point depends on (manifest `exists` flags and `importance` are
+  pre-computed). Only `required` gaps demand recovery; `optional` items are
+  rebuildable, `historical`/`ephemeral` ones are ignorable.
 - Missing files are NOT failure: wrong branch / moved files / wrong session
   are likelier. Rebind before rebuilding anything.
 - Workspace newer than the session (committed, changed, another agent) →

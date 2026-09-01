@@ -138,6 +138,13 @@ def test_golden1_manifest_asset_gap_detection(tmp_path):
     assert m["stats"]["file_change_artifacts"] >= 8
     assert m["stats"]["missing_on_disk"] == m["stats"]["total"]  # old-machine assets
     assert any("mapping_review.json" in a["path"] for a in m["artifacts"])
+    imp = m["stats"]["importance"]
+    assert sum(imp.values()) == m["stats"]["total"]
+    # structurally nothing is required: G1's deliverables were written by
+    # officecli subprocesses (absent from FileChange) and its source reads are
+    # staging-area references -> optional/historical is the honest answer
+    assert imp["required"] == 0
+    assert imp["historical"] > imp["optional"]
 
 
 def test_golden2_manifest(tmp_path):
@@ -146,6 +153,45 @@ def test_golden2_manifest(tmp_path):
     m = run_manifest(GOLDEN2, tmp_path)
     assert m["stats"]["total"] >= 20
     assert m["stats"]["produced"] > 0
+
+
+def test_importance_classification(tmp_path):
+    clean = tmp_path / "clean.jsonl"
+    write_synthetic_clean(clean, [
+        {"kind": "file_change", "source_line": 1, "source_type": "event_msg",
+         "changes": {
+             r"C:\work\project\out\final_receipt.json": {"type": "add", "content": "{}"},
+             r"C:\work\project\scripts\gen.py": {"type": "add", "content": "x"},
+             r"C:\work\project\build": {"type": "add", "content": "y"},
+         }},
+        {"kind": "tool_call", "source_line": 2, "source_type": "response_item",
+         "tool": "exec", "call_id": "c1", "parse_status": "parsed",
+         "command": r"Get-Content -LiteralPath D:\数据\source.xlsx"},
+        {"kind": "tool_call", "source_line": 3, "source_type": "response_item",
+         "tool": "exec", "call_id": "c2", "parse_status": "parsed",
+         "command": r"Get-Content -LiteralPath C:\Temp\tablefill\morocco\validated_draft.xlsx"},
+    ])
+    out = tmp_path / "m.json"
+    rc = ea.main(["--clean", str(clean), "--out", str(out)])
+    assert rc == 0
+    m = json.loads(out.read_text(encoding="utf-8"))
+    by_path = {a["path"].lower(): a for a in m["artifacts"]}
+    # evidence role -> required
+    assert by_path[r"c:\work\project\out\final_receipt.json"]["importance"] == "required"
+    # file_change produced generator -> optional (rebuildable)
+    assert by_path[r"c:\work\project\scripts\gen.py"]["importance"] == "optional"
+    # no-extension path -> ephemeral
+    assert by_path[r"c:\work\project\build"]["importance"] == "ephemeral"
+    # source input outside staging -> required; staging read -> historical
+    assert by_path[r"d:\数据\source.xlsx"]["importance"] == "required"
+    assert by_path[r"c:\temp\tablefill\morocco\validated_draft.xlsx"]["importance"] == "historical"
+    # aggregation sanity
+    imp = m["stats"]["importance"]
+    assert sum(imp.values()) == m["stats"]["total"]
+    assert m["stats"]["required_exists"] == 0              # nothing on disk
+    assert m["stats"]["required_missing"] == imp["required"]  # both required are missing
+    assert imp["required"] == 2 and imp["optional"] == 1
+    assert imp["historical"] == 1 and imp["ephemeral"] == 1
 
 
 def test_determinism(tmp_path):

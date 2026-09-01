@@ -21,9 +21,15 @@ Continuation Package:
 Boundary (kept from V1): this script derives state only from STRUCTURE,
 deterministic rules and traceable keyword signals. Completed / in-progress /
 pending / blocked items are semantic facts — the script leaves them empty with
-"awaiting_agent": true. The reading Agent fills them (optionally via --merge,
-which validates every evidence reference against clean.jsonl so nothing can be
-invented without a pointer to evidence).
+"awaiting_agent": true.
+
+Two-layer contract (V1.3):
+  resume_state.json  = MACHINE layer: deterministic, pure, reproducible
+  agent_state.json   = AGENT layer: the reading Agent's interpretation
+                       (completed / in_progress / pending / blocked_by / notes),
+                       produced via --merge after every evidence reference has
+                       been validated against clean.jsonl — nothing can be
+                       invented without a pointer to evidence.
 
 Every inferred field carries a "basis" (event seqs) and a "confidence" so the
 Agent can audit the inference. Never a silent guess: unknown stays unknown.
@@ -259,13 +265,17 @@ def validate_agent_state(agent: dict[str, Any], events: list[dict[str, Any]],
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Extract resume_state.json from a preprocessed session.")
+        description="Extract resume_state.json (machine layer) from a preprocessed session.")
     ap.add_argument("--clean", required=True, help="clean.jsonl from preprocess_session.py")
     ap.add_argument("--meta", default=None, help="meta.json (same preprocess output)")
-    ap.add_argument("--out", required=True, help="output resume_state.json")
+    ap.add_argument("--out", required=True, help="output resume_state.json (MACHINE layer, pure)")
     ap.add_argument("--merge", default=None,
-                    help="agent-supplied state file (completed/in_progress/pending/"
-                         "blocked_by/next_action) merged after evidence validation")
+                    help="agent-interpreted state file (completed/in_progress/pending/"
+                         "blocked_by [+optional next_action/notes]); evidence refs are "
+                         "validated against clean.jsonl before the agent layer is written")
+    ap.add_argument("--out-agent-state", default=None,
+                    help="output agent_state.json (agent-interpreted layer); "
+                         "defaults to <out dir>/agent_state.json when --merge is used")
     args = ap.parse_args(argv)
 
     clean = Path(args.clean)
@@ -289,8 +299,10 @@ def main(argv: list[str] | None = None) -> int:
     exec_state = infer_execution(events)
     next_action = next_action_for(exec_state)
 
+    # MACHINE layer: deterministic, pure, reproducible. Never modified by merges.
     state: dict[str, Any] = {
         "version": "1.0",
+        "layer": "machine",
         "session": session,
         "task": {
             "identity": identity,
@@ -306,32 +318,42 @@ def main(argv: list[str] | None = None) -> int:
         "awaiting_agent": True,
     }
 
-    if args.merge:
-        merge_path = Path(args.merge)
-        if not merge_path.is_file():
-            raise SystemExit(f"error: merge file not found: {merge_path}")
-        agent = json.loads(merge_path.read_text(encoding="utf-8"))
-        if not isinstance(agent, dict):
-            raise SystemExit("error: agent state file must be a JSON object")
-        validate_agent_state(agent, events, clean)
-        for field in ("completed", "in_progress", "pending", "blocked_by"):
-            if field in agent:
-                state[field] = agent[field]
-        if "next_action" in agent:
-            state["next_action"] = agent["next_action"]
-        state["awaiting_agent"] = False
-        state["agent_merged"] = True
-
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
 
+    agent_written = False
+    if args.merge:
+        merge_path = Path(args.merge)
+        if not merge_path.is_file():
+            fail(f"merge file not found: {merge_path}")
+        agent = json.loads(merge_path.read_text(encoding="utf-8"))
+        if not isinstance(agent, dict):
+            fail("agent state file must be a JSON object")
+        validate_agent_state(agent, events, clean)
+        agent_state: dict[str, Any] = {
+            "version": "1.0",
+            "layer": "agent",
+            "session_id": session.get("session_id"),
+            "completed": agent.get("completed", []),
+            "in_progress": agent.get("in_progress", []),
+            "pending": agent.get("pending", []),
+            "blocked_by": agent.get("blocked_by", []),
+            "next_action": agent.get("next_action", next_action),
+            "notes": agent.get("notes"),
+            "evidence_validated": True,
+        }
+        out_agent = Path(args.out_agent_state) if args.out_agent_state \
+            else out.parent / "agent_state.json"
+        with out_agent.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(agent_state, ensure_ascii=False, indent=2) + "\n")
+        agent_written = True
+
     ex = state["execution"]
     print(f"phase={ex['phase']} status={ex.get('status')} "
-          f"confidence={ex['confidence']} next={state['next_action'].get('action')} "
-          + (f"merge=ok" if args.merge else "awaiting_agent=True"))
-    print(f"wrote: {out}")
+          f"confidence={ex['confidence']} next={state['next_action'].get('action')}")
+    print(f"wrote: {out}" + (f" + agent_state.json" if agent_written else " (awaiting_agent=True)"))
     return 0
 
 

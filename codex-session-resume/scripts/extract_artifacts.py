@@ -42,6 +42,11 @@ from typing import Any
 
 DELIVERABLE_EXT = {".xlsx", ".xls", ".docx", ".pptx", ".pdf", ".csv", ".png", ".html", ".htm"}
 EVIDENCE_MARKERS = ("receipt", "manifest", "validation", "report", "summary", "hash")
+# input files a task genuinely depends on (source data / config), when NOT in a
+# staging area — staging reads (Temp/tmp) are historical references, not assets
+SOURCE_INPUT_EXT = {".xlsx", ".xls", ".xlsm", ".csv", ".docx", ".pptx", ".pdf",
+                    ".json", ".yaml", ".yml", ".md", ".txt"}
+_STAGING = ("\\temp\\", "\\tmp\\")
 
 WRITE_VERBS = {"New-Item", "Set-Content", "Copy-Item", "Move-Item", "Out-File",
                "mkdir", "cp", "mv", "touch", "tee"}
@@ -61,9 +66,9 @@ _PATH_TOKEN = re.compile(r"""
 # regex fragments that are NOT file paths
 _JUNK_CHARS = set("[]()^$+*?{}|")
 
-# well-known environment reads (the machine's skill/instruction files), not
-# task assets; filtered and counted instead of listed
-_ENV_PATH = ("\\.codex\\skills\\", "/.codex/skills/")
+# well-known environment reads (the machine's codex home: skills, memories,
+# instruction files), not task assets; filtered and counted instead of listed
+_ENV_MARKS = ("\\.codex\\", "/.codex/")
 
 
 def _norm(path_text: str) -> str:
@@ -103,6 +108,30 @@ def _role_for(path_text: str) -> str:
     return "generator"
 
 
+def _importance(entry: dict[str, Any], path_text: str) -> tuple[str, str]:
+    """White-box importance: required / optional / historical / ephemeral.
+
+    required : must exist before continuing (deliverables, proof, source inputs)
+    optional : rebuildable with the session's own scripts
+    historical : was read/created mid-run only; missing is harmless
+    ephemeral : staging directories / no-extension paths
+    """
+    low = path_text.lower()
+    ext = PurePath(path_text).suffix.lower()
+    in_staging = any(s in low for s in _STAGING)
+    if entry["role"] in ("evidence", "deliverable"):
+        return "required", "deliverable/evidence"
+    if entry["category"] == "input":
+        if not in_staging and ext in SOURCE_INPUT_EXT:
+            return "required", "source input outside staging"
+        return "historical", "staging or derived input read"
+    if not ext:
+        return "ephemeral", "no extension (likely directory)"
+    if entry["source"] == "file_change":
+        return "optional", "file_change-produced (rebuildable)"
+    return "optional", "tool-command derived"
+
+
 def extract_command_paths(events: list[dict[str, Any]],
                           produced: dict[str, dict[str, Any]],
                           stats: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -121,7 +150,7 @@ def extract_command_paths(events: list[dict[str, Any]],
                 p = _norm(pm.group("q") or pm.group("b"))
                 if not p or any(c in p for c in _JUNK_CHARS):
                     continue
-                if any(env in p for env in _ENV_PATH):
+                if any(env in p for env in _ENV_MARKS):
                     stats["env_reads_filtered"] += 1
                     continue
                 if p in produced or p in out:
@@ -152,7 +181,7 @@ def extract_command_paths(events: list[dict[str, Any]],
                 p = _norm(pm.group("q") or pm.group("b"))
                 if not p or any(c in p for c in _JUNK_CHARS):
                     continue
-                if any(env in p for env in _ENV_PATH):
+                if any(env in p for env in _ENV_MARKS):
                     stats["env_reads_filtered"] += 1
                     continue
                 if p in produced or p in out or p in inputs:
@@ -223,18 +252,28 @@ def main(argv: list[str] | None = None) -> int:
                   "exists_on_disk": 0, "missing_on_disk": 0, "hashed": 0})
     artifacts: list[dict[str, Any]] = []
     merged = {**produced, **with_tool}  # tool-derived entries never override file_change truth
+    stats.update({"importance": {"required": 0, "optional": 0, "historical": 0, "ephemeral": 0},
+                  "required_exists": 0, "required_missing": 0})
     for path in sorted(merged):
         entry = dict(merged[path])
+        importance, basis = _importance(entry, entry["path"])
+        entry["importance"] = importance
+        entry["importance_basis"] = basis
         entry["verification"] = verify(entry["path"], args.max_hash_bytes)
         artifacts.append(entry)
         stats["total"] += 1
         stats[entry["category"]] = stats.get(entry["category"], 0) + 1
         if entry["role"] == "evidence":
             stats["evidence"] += 1
+        stats["importance"][importance] += 1
         if entry["verification"]["exists"]:
             stats["exists_on_disk"] += 1
+            if importance == "required":
+                stats["required_exists"] += 1
         else:
             stats["missing_on_disk"] += 1
+            if importance == "required":
+                stats["required_missing"] += 1
         if entry["verification"].get("sha256"):
             stats["hashed"] += 1
 
@@ -253,7 +292,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"artifacts={stats['total']} produced={stats['produced']} "
           f"input={stats['input']} evidence={stats['evidence']} "
           f"exists={stats['exists_on_disk']} missing={stats['missing_on_disk']} "
-          f"hashed={stats['hashed']}")
+          f"required_missing={stats['required_missing']} hashed={stats['hashed']}")
+    print(f"importance={stats['importance']}")
     print(f"wrote: {out}")
     return 0
 

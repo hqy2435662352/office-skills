@@ -99,7 +99,7 @@ def test_fixture_basic_completed_turn(tmp_path):
     assert s["next_action"]["action"] == "continue"
 
 
-def test_merge_flow_validates_evidence_refs(tmp_path):
+def test_merge_writes_agent_layer_keeps_machine_pure(tmp_path):
     out = run_clean(FIXTURES / "basic_session.jsonl", tmp_path)
     with (tmp_path / "clean-out" / "clean.jsonl").open(encoding="utf-8") as f:
         clean = [json.loads(l) for l in f if l.strip()]
@@ -108,22 +108,32 @@ def test_merge_flow_validates_evidence_refs(tmp_path):
         "completed": [{"item": "检查源表结构", "status": "verified",
                        "evidence_refs": [valid_seq]}],
         "pending": [{"action": "等待用户确认", "type": "user_confirmation"}],
+        "notes": "来源表已核对，草稿阶段结束",
     }
-    agent_file = tmp_path / "agent_state.json"
+    agent_file = tmp_path / "agent_src.json"
     agent_file.write_text(json.dumps(agent_state, ensure_ascii=False), encoding="utf-8")
     rs.main(["--clean", str(out / "clean.jsonl"), "--meta", str(out / "meta.json"),
-             "--out", str(tmp_path / "merged.json"), "--merge", str(agent_file)])
-    merged = json.loads((tmp_path / "merged.json").read_text(encoding="utf-8"))
-    assert merged["awaiting_agent"] is False and merged["agent_merged"] is True
-    assert merged["completed"][0]["item"] == "检查源表结构"
-    assert merged["pending"][0]["type"] == "user_confirmation"
-    # invalid ref must fail loudly (exit code 2)
+             "--out", str(tmp_path / "resume_state.json"), "--merge", str(agent_file)])
+    # MACHINE layer stays pure and reproducible
+    machine = json.loads((tmp_path / "resume_state.json").read_text(encoding="utf-8"))
+    assert machine["layer"] == "machine"
+    assert machine["completed"] == [] and machine["awaiting_agent"] is True
+    assert machine["evidence_refs"]  # untouched by the merge
+    # AGENT layer carries the interpretation, evidence-validated
+    agent_out = json.loads((tmp_path / "agent_state.json").read_text(encoding="utf-8"))
+    assert agent_out["layer"] == "agent"
+    assert agent_out["completed"][0]["item"] == "检查源表结构"
+    assert agent_out["pending"][0]["type"] == "user_confirmation"
+    assert agent_out["notes"] == "来源表已核对，草稿阶段结束"
+    assert agent_out["evidence_validated"] is True
+    assert agent_out["next_action"]["action"] == "continue"  # machine fallback
+    # invalid ref must fail loudly (exit code 2) and write NOTHING extra
     bad = tmp_path / "bad_state.json"
     bad.write_text(json.dumps({"completed": [{"item": "x", "evidence_refs": [999999]}]}),
                    encoding="utf-8")
     with pytest.raises(SystemExit) as ei:
         rs.main(["--clean", str(out / "clean.jsonl"), "--meta", str(out / "meta.json"),
-                 "--out", str(tmp_path / "bad.json"), "--merge", str(bad)])
+                 "--out", str(tmp_path / "r2.json"), "--merge", str(bad)])
     assert ei.value.code == 2
 
 

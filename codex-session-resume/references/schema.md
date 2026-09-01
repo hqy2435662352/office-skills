@@ -88,12 +88,38 @@ tail 40%，确定性）。`file_change.changes` 按路径逐条截断。
 latest_user / final_answer / last_lifecycle / last_tool_output /
 last_file_change / last_rollback / last_abort（各至多一条，最近者）。
 
-### --merge 契约
+### --merge 契约（V1.3 两层分离）
 
-Agent 填充 `completed/in_progress/pending/blocked_by`（每项可带
-`evidence_refs: [seq,...]`）与可选 `next_action` 覆盖。merge 校验每个 ref
-必须存在于 clean.jsonl；非法引用 → exit 2（fail-visible）。合并后
-`awaiting_agent=false, agent_merged=true`。
+```text
+resume_state.json  = MACHINE layer（确定性、纯净、可复现；永不因 merge 改变）
+agent_state.json   = AGENT layer（阅读 Agent 的解读）
+```
+
+`--merge <src>`：读取 Agent 填写的解读文件（completed/in_progress/pending/
+blocked_by + 可选 next_action/notes），校验每个 evidence_ref 必须存在于
+clean.jsonl（否则 exit 2），输出 `agent_state.json`（默认 --out 同目录；
+`--out-agent-state` 可改）。机器层保持 `awaiting_agent:true` 不动。
+
+agent_state.json：
+```json
+{"version":"1.0","layer":"agent","session_id":"...",
+ "completed":[...],"in_progress":[...],"pending":[...],"blocked_by":[...],
+ "next_action":{...},"notes":"...","evidence_validated":true}
+```
+
+### resume_brief.md（V1.3 P0，启动页）
+
+由 `generate_resume_brief.py` 确定性渲染（无 LLM、无时钟）：
+
+- 任务 identity + 原始目标（≤180 字截断）
+- 当前状态：phase/status 中文解释 + 事实（turn 数/abort/rollback）+ 下一步
+- 已完成/待办：来自 agent_state（≤8 项）；无 agent 层时给出证据入口指引
+- **不要（Do not）**：白盒规则（gate 不自动发布、不无据重新生成、中断先
+  定位、active:false 不使用、required 缺失先 rebind）
+- 资产摘要：importance 计数 + required 缺失清单（≤6 条）
+- 证据入口：resume_state → agent_state → clean.jsonl（seq/source_line）
+
+长度目标：<1000 tokens（中文 brief 实测 ~530-680 tokens）
 
 ## 3. artifact_manifest.json（schema v1）
 
@@ -103,9 +129,12 @@ Agent 填充 `completed/in_progress/pending/blocked_by`（每项可带
   "max_hash_bytes": 1000000,
   "stats": {"file_change_artifacts","tool_command_artifacts","env_reads_filtered",
             "total","produced","input","evidence",
-            "exists_on_disk","missing_on_disk","hashed"},
+            "exists_on_disk","missing_on_disk","hashed",
+            "importance": {"required","optional","historical","ephemeral"},
+            "required_exists","required_missing"},
   "artifacts": [
     {"path","category","role","role_basis","source","source_ref",
+     "importance","importance_basis",
      "verification": {"exists","size","mtime","sha256"?,"hash_skipped"?}}
   ]
 }
@@ -115,12 +144,18 @@ Agent 填充 `completed/in_progress/pending/blocked_by`（每项可带
 - `role`（白盒）：generator（脚本等）/ deliverable（xlsx/docx/pptx/pdf/csv/
   png/html 等后缀）/ evidence（basename 含 receipt/manifest/validation/
   report/summary/hash）/ input
+- `importance`（V1.3，白盒，importance_basis 可见）：
+  - **required**：deliverable/evidence 角色，或 staging 之外的源输入
+    （source.xlsx 等）—— 继续前必须存在
+  - **optional**：file_change 产出的脚本/配置（可重建）
+  - **historical**：staging（Temp/tmp）内的读取/衍生路径 —— 缺失无害
+  - **ephemeral**：无扩展名路径（目录/暂存）
 - `source`：file_change（主源）或 tool_command（parsed exec 中的字面量路径）
 - 路径归一化：normcase（Windows 大小写折叠）去重，保留最新 source_ref
 - 验证：exists/size/mtime(UTC)；`sha256` 仅当 `size <= max_hash_bytes`
   （默认 1MB）；大文件 → `hash_skipped:"large_file"`
-- tool_command 路径提取上限：150 条/类（确定性 cap）；`.codex\skills` 环境
-  读入 → 过滤并计入 `env_reads_filtered`
+- tool_command 路径提取上限：150 条/类（确定性 cap）；`.codex` 内部路径
+  （skills/memories 等环境读入）→ 过滤并计入 `env_reads_filtered`
 - 路径 token 规则：必须 drive-letter 或 dot-relative 开头（`C:\...`、`.\...`）；
   以 `/` 根开头的 POSIX 路径与 officecli sheet 查询路径（`/R32 摩洛哥能效/A1:G5`）
   不提取 —— Windows 主场景的已知取舍
