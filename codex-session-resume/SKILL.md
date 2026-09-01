@@ -41,6 +41,12 @@ restore historical understanding      ← 从 rollout 恢复
 =  resume execution                   ← 从真实断点继续干活
 ```
 
+**V1.2 产品定位：Agent Continuation Package 生成器。**
+收到的不是"一段历史摘要"，而是最小恢复成本下安全接管旧任务所需的全部：
+Intent + State + Evidence + Artifact + Permission Boundary。不做长期记忆、
+不做向量检索、不做 Codex native replay、不模拟 runtime、不追求恢复全部历史
+——只回答：我之前做到哪 / 现在能不能继续 / 继续需要什么资产 / 下一步做什么。
+
 Session Resume 是 **Task Continuity**，不是 Conversation Summary，也不是
 Same-thread Provider Migration。不要修改 Codex session/provider 元数据，不要
 尝试让旧 thread 在新 provider 直接 resume，不要自动创建新 thread。
@@ -55,16 +61,36 @@ Agent: [定位 session] → [preprocess] → [恢复状态] → [rebind workspac
 **不要**默认输出一份摘要然后询问"是否继续"。如果下一动作明确且不涉及特殊
 审批 gate，直接执行。恢复后的内部状态（§10）通常不需要整份汇报给用户。
 
-## 3. 三步流水线 + 硬规则
+## 3. 流水线 + 硬规则
 
 ```text
 raw rollout
     ↓  ① scripts/preprocess_session.py（必须是第一步，永远）
-meta.json + stats.json + clean.jsonl
-    ↓  ② Agent 按 §7 Reading Strategy 阅读
+        ┌───────────────┬───────────────┬───────────────┐
+        ↓               ↓               ↓               ↓
+   clean.jsonl    stats.json      meta.json      (事实层)
+        ↓ ② extract_resume_state.py          extract_artifacts.py
+        ↓               ↓
+   resume_state.json      artifact_manifest.json
+        (状态层)           (资产层)
+        ↓ ③ Resume Protocol（§5A）
 Agent 内部 resume state
-    ↓  ③ Workspace Rebind（§11）→ continue
+    ↓  ④ Workspace Rebind（§11）→ continue
 ```
+
+产物 = handoff 包（同一输出目录）：
+
+```text
+handoff/
+├── meta.json               身份
+├── clean.jsonl             事实/证据层（历史事实、调查依据、debug corpus）
+├── stats.json              清洗诊断
+├── resume_state.json       状态层（Execution State Snapshot）
+└── artifact_manifest.json  资产层（恢复执行环境所需文件 + 当前磁盘验证）
+```
+
+clean.jsonl 的定位：**是证据来源，不是默认 prompt 全量上下文**。正常恢复经过
+resume_state；有疑问查 clean.jsonl；需要极端取证才回 raw（§5B）。
 
 **硬规则：在处理之前，绝不直接读 raw rollout JSONL 全文。**
 `*.jsonl` 含加密 reasoning、token 账目、运行时重复事件；直接读会污染判断。
@@ -134,6 +160,14 @@ python scripts/preprocess_session.py --input <rollout.jsonl> --output <out-dir>
 这些都归 Agent。可选截断参数 `--cap-tool-input/--cap-tool-output/
 --cap-file-change/--cap-unknown` 通常不需要动。
 
+同一输出目录继续生成状态层与资产层（§5A）：
+
+```bash
+python scripts/extract_resume_state.py --clean out/clean.jsonl \
+    --meta out/meta.json --out out/resume_state.json [--merge agent_state.json]
+python scripts/extract_artifacts.py --clean out/clean.jsonl --out out/artifact_manifest.json
+```
+
 先读 `meta.json` 与 `stats.json`，再用它们理解 clean.jsonl。
 
 ### clean.jsonl 事件类型（都有 `seq/source_line/source_type/source_ordinal`）
@@ -164,6 +198,59 @@ python scripts/preprocess_session.py --input <rollout.jsonl> --output <out-dir>
 `legacy_duplicates_removed` / `events_by_kind`。清点确认：清洗生效、无异常
 丢失、未识别 schema 可见（含 `item_completed` 内未知 item type —— 一律
 fail-visible，绝不静默丢弃）。
+
+## 5A. Resume Protocol（V1.2 状态/资产层）
+
+```text
+1. Read resume_state.json        ← Execution State Snapshot（快速入口）
+2. Read artifact_manifest.json   ← 恢复执行环境所需资产 + 缺失清单
+3. Verify workspace              ← §11（manifest 的 exists 字段已预校验）
+4. Continue
+
+如果 resume_state 某结论不确定 → 按 evidence_refs 查 clean.jsonl
+如果 clean 无法回答 → 按 source_line 回 raw（targeted backfill）
+```
+
+**状态下限契约**：`resume_state.json` 只由确定性规则与可追溯信号生成：
+- `execution.phase/status/confidence/basis/note` —— 白盒规则推断（依据
+  lifecycle 尾部、gate 关键词、abort/rollback 计数），每条带 basis（event
+  seq）与 confidence，Agent 必须复核而非盲信；
+- `completed/in_progress/pending/blocked_by` —— **脚本不猜**：默认空 +
+  `awaiting_agent: true`。Agent 阅读后填充，可用 `--merge agent_state.json`
+  回写；merge 会校验每个 evidence_ref 必须指向 clean.jsonl 中真实存在的
+  event（不存在 → exit 2，fail-visible）。
+
+### resume_state.json 字段语义
+
+| 字段 | 含义 |
+|---|---|
+| `task.identity` | cwd 末段目录名（确定性） |
+| `task.user_goal` | 首条真实用户消息全文（截断带标记） |
+| `execution.phase` | 枚举：unknown / analysis / preparation / execution / validation / approval_gate / release / completed / blocked（脚本只产出 unknown/execution/approval_gate） |
+| `execution.status` | 白盒状态：waiting_confirmation / interrupted / rolled_back / recovered_after_interruption / completed_turn / no_lifecycle_evidence |
+| `execution.abort_count` / `has_rollback` | 确定性事实（中断历史、回滚存在性） |
+| `execution.confidence` | 0~1，规则支撑度 |
+| `next_action.action` | 枚举：continue / ask_user / verify / recover / stop（脚本只产出前四者） |
+| `evidence_refs` | 高信号证据指针（latest_user / final_answer / last_lifecycle / last_tool_output / last_file_change / last_rollback / last_abort），全部可回 clean 核验 |
+
+phase 判定要点：**approval_gate 需要"尾部 final_answer/工具输出含确认类
+表述"**（如"请回复『确认发布』"）。只有这层证据才允许把状态判为等待确认；
+否则宁可 unknown/execution。中断 = 最后一个活跃用户轮之后的最新 lifecycle
+是 turn_aborted；过早的中断只记入 `abort_count`（如"中途被打断后恢复"）。
+
+### artifact_manifest.json 字段语义
+
+| 字段 | 含义 |
+|---|---|
+| `category` | produced（会话产出）/ input（任务依赖的输入）/ evidence（证明完成的 receipt/manifest/validation 等命名） |
+| `source` | file_change（主源，Codex 只在 item_completed 记录）或 tool_command（parsed exec 命令中确定性提取的路径） |
+| `verification` | 当前磁盘验证：exists / size / mtime(UTC)；`sha256` 仅对小文件与关键产物计算 |
+
+Hash 策略：≤1MB（`--max-hash-bytes`）→ sha256；大文件 → size+mtime；
+临时/环境路径（`.codex\skills` 读入）→ 过滤并计入 `env_reads_filtered`。
+**all-missing 不等于错误**：旧机器路径在本机不存在，正是 Rebind 需要的信号
+（§11 情况 3）。manifest 不做语义判断：role 由扩展名/命名白盒推断
+（`role_basis` 可见）。
 
 ## 6. 两个必须理解的失效语义（V1.1 已显式支持）
 
@@ -335,24 +422,49 @@ docs、关键配置文件）是否真实存在。Session 保存的是过去认�
 一般的"继续任务"可授权继续普通开发步骤，但不能替代流程中显式要求的特殊
 批准。**用户当前的许可（在本次对话中）永远不能假设为旧 session 的跨轮许可。**
 
-## 14. Handoff 不是 V1 主流程
+## 14. Handoff 包不是 V1 主流程的替代
 
-正常路径：rollout → clean → reconstruct → rebind → continue。
-**不要默认生成 Handoff 文档。** 仅当用户明确要求 / debug / benchmark /
-跨 Agent 交接时才考虑生成。
+Continuation Package（handoff/ 五件套）是 resume 的**工作产物**，但不是
+Handoff 文档：正常路径 rollout → clean → state/asset 提取 → rebind →
+continue，**不需要**再生成叙事性 Handoff Markdown。只有用户明确要求 /
+debug / benchmark / 跨 Agent 交接时才考虑额外写文档。
 
 ## 15. Safety 承诺
 
 - 原 rollout **只读**：不修改、不删除、不移动。
 - 不修改 `~/.codex` 任何状态、不碰 SQLite、不写 thread/session 元数据。
-- preprocess 输出写入独立目录。
+- preprocess / extractor 输出全部写入指定输出目录（`--out`），且只写那一个文件。
+- extract_artifacts 对 manifest 路径只做 stat/read 验证，从不修改文件。
 
-## 16. V1.1 已知限制（如实看待）
+## 16. V1.2 已知限制（如实看待）
 
+- `resume_state` 的 phase/status 是**白盒规则推断**（带 basis + confidence），
+  不是语义确证：Agent 必须复核（approval_gate 需要尾部确认类表述证据）。
+- `completed/in_progress/pending/blocked_by` 由 Agent 经 `--merge` 填充；
+  脚本不猜语义（这是边界，不是缺口）。
+- artifact 的 tool_command 路径提取是保守的（仅 drive/dot-relative 字面量）；
+  以 `/` 开头的 POSIX 根路径与 officecli sheet 查询路径均不提取（Windows
+  主场景优先，见脚本文档）。
+- `resume_state` 推断只看事件流结构，不读 raw（设计使然）；极端取证仍走
+  §5B targeted backfill。
 - rollback 的 `approximate` 置信度场景（无 turn_context）：轮次边界以 user
   消息为准，多消息单 turn 可能被拆成多个单位。
 - legacy 双写去重依赖"内容消息先于 event_msg 标记"的出现顺序（真实
   codex-tui rollout 实测如此）；反序时可能出现重复 user 事件（stats 可见）。
 - 客户端注入样板只剥离有完整边界的已知块；未知变体保留为文本（宁多勿丢）。
 - `compacted` 的完整 replacement_history 不回放；深层细节走 forensic backfill。
-- 脚本不做任何语义判断（这是特性，不是缺陷）：工作状态由 Agent 恢复。
+
+## 17. Resume Correctness 验收基准（Benchmark，非摘要测试）
+
+V1.2 不测"能否总结历史"，测**接管正确性**。四个基准案例（已固化为测试）：
+
+| Case | 输入 | 期待（对 golden1：摩洛哥+欧洲 8 份参数表 session） |
+|---|---|---|
+| 1 | handoff 包 | execution.phase = approval_gate，status = waiting_confirmation |
+| 2 | "是否需要重新生成文件？" | No —— 8 份草稿有 DRAFT_VALIDATED 证据（444/444+356/356、issues=0）；manifest 缺失仅指旧机器路径，不是内容未完成 |
+| 3 | "下一步？" | next_action = ask_user（等待发布确认），不得自动 publish |
+| 4 | 删除 artifact 后 | manifest exists=false → recover/verify 路径（重建前先 rebind，重走验证与 gate） |
+
+真实使用（Phase 5 积累）：10~20 个真实 resume case 后才进入下一版本迭代；
+任一基准案例失败，先定位失败层（状态推断 → 资产提取 → 阅读规则 → 产品边界），
+不要直接堆架构。
