@@ -236,6 +236,144 @@ blocks:
    空不连续 → 该组**不建立**连续同值段、不建合并/不落组聚合。需让映射列每行
    物化出连续同值 (先填充组值或用列映射逐行物化) 才可分组。
 
+### 矩阵映射 (matrix) — field_map × record_map 一等表达 (ticket 06)
+
+Column-Record Matrix (参数字段沿行轴、产品 record 沿列轴) 是 `grid_record`
+的一种 (见 SKILL §1.5 Axis-Neutral Grid 契约); 它的二维映射用 `matrix`
+一等表达声明, Compiler 物化 `field_map × record_map → 目标格`,
+**禁止把几百个源值烘成 literal sets 作为主填充路径** (见下方 literal 边界审计)。
+
+```yaml
+mapping:
+  targets:
+    - sheet: S                      # 同一 run 一个目标
+      matrix:                       # target 级声明 — 与 blocks 语义互斥
+        source:
+          flatten: matrix_source    # manifest.flattened[].name (与 rows.source 同名机制)
+          field_axis: rows          # v1 仅支持 identical orientation:
+          record_axis: columns      #   源与目标同为 field_axis=rows / record_axis=columns
+          field_label_column: A     # 字段标签列 (缺省 A)
+        target:
+          field_axis: rows
+          record_axis: columns
+          field_label_column: A
+        field_map:                  # 字段角色定位: 每侧 locator 三形式可混用
+          - source: Voltage Range   #   A. legacy 单标签 (label 列机械查找)
+            target: Voltage Range
+          - source:                #   B. composite match — 推荐主路径
+              match:
+                A: Cooling
+                B: Capacity
+                C: Btu/h           #   多列 AND 精确匹配, 唯一化层级参数行
+            target:
+              match:
+                A: Cooling
+                B: Capacity
+                C: Btu/h
+            transforms: [trim, type_ct]   #   命名 transform 链 (trim 内置 / 受控翻译)
+          - source:                #   C. guarded explicit row — 受控 fallback
+              row: 16
+              expect:              #   结构守卫: 行号 + 该行事实 (禁裸 row)
+                B: Capacity
+                C: Btu/h
+            target:
+              row: 10
+              expect:
+                B: Capacity
+                C: Btu/h
+        record_map:                 # 产品记录列: {record, source_column, target_column}
+          - {record: "12K", source_column: B, target_column: B}
+          - {record: "18K", source_column: C, target_column: C}
+      sets:                         # 固定 title/footer 仍合法 (见 literal 边界)
+        - path: A1
+          value: "Customer Parameter Matrix"
+```
+
+**field_map 行解析 (机械, 确定, fail-closed — ticket 01 locator V2)**:
+`field_map[i].source` / `.target` 每侧是 locator, 三形式可混用:
+- **A. legacy 单标签**: `source: Capacity` (back-compat) — 在对应
+  `field_label_column` 列做**去首尾空白后精确匹配**。
+- **B. composite match**: `{match: {A: Cooling, B: Capacity, C: Btu/h}}` —
+  candidate 行对所有键做 `trim(cell) == trim(expected)` **AND** 匹配; 键 =
+  Excel 列字母。只做确定性 exact identity — **不做** contains / fuzzy / regex /
+  semantic / LLM / alias 推断。
+- **C. guarded explicit row**: `{row: N, expect: {B: Capacity, C: Btu/h}}` —
+  N = 展平 CSV 的 `orig` (原始 Excel 行号, 与 `source_cell` lineage 同源);
+  `expect` 是结构守卫, **禁裸 row**。
+
+命中语义 (替换旧"首命中", 三层定位全部适用): **0 → `MATRIX_FIELD_LOCATOR_NOT_FOUND`**
+(message 标 side + label/locator); **1 → 解析**; **>1 → `MATRIX_FIELD_LOCATOR_AMBIGUOUS`**
+(禁止 first-match-wins: deterministic ≠ semantically unambiguous, 单标签
+`source: Cooling` 多次出现必须被拒绝)。Guarded row 的事实与期望不符 →
+`MATRIX_FIELD_ROW_GUARD_MISMATCH` (message 逐列 expected vs actual); 行号
+超界 → `MATRIX_FIELD_ROW_OUT_OF_RANGE`; 裸 `{row: N}` → `MATRIX_FIELD_ROW_GUARD_REQUIRED`;
+非法形态 (空 dict / match+row 并存 / 非字符串非 dict / match·expect 键非列字母) →
+`MATRIX_FIELD_LOCATOR_INVALID`; match/expect 列字母超出该侧宽 →
+`MATRIX_COLUMN_INVALID` (与 record_map 列同规则)。旧码
+`MATRIX_FIELD_LABEL_NOT_FOUND` 收敛进 `MATRIX_FIELD_LOCATOR_NOT_FOUND` (单一族,
+不保留近义码)。源格 = 源记录列 × 该行原始行号; 目标格 = 目标记录列 × 目标行
+原始行号 (定位全部在展平 CSV 上完成 — library-safe, 不需要 digest 考古)。
+字段角色标签本身不应出现在 `decisions`/`gaps` 之外的第二份事实里 (唯一权威 =
+fill_spec.yaml)。
+
+**物化契约**: 每个 (field_map[i], record_map[j]) 产生一个目标格 —
+`plan.operations` 是 `set {value}` 写 (与既有 value writes 同形,
+executor / readback / validate 机制零改动), `plan.writes` 数 ==
+|field_map| × |record_map| (契约测试断言); readback 期待由**同一物化过程**
+派生 (禁止手写 checks)。
+
+**source lineage 一等输出 (硬性)**: 每条 matrix 写入携带
+`{target, source, transform_chain}` (如 `SPEC!D15 ← SourceSheet!G42
+[trim, fin_ct]`), 聚合到 `plan.source_trace` 并镜像到 workdir
+`source_trace.json` (compile 同时写两份, 同源; Gate / 语义验证 ticket 07
+消费文件)。物化即 lineage — 不存在无 lineage 的 matrix 写入。`transform_chain`
+是**可执行**的: `trim` (内置, 首尾空白剥离 — Z 码清理)、
+`controlled_translation` (`mapping.transforms` 函数,
+`translations: {源值: 目标值}` 整值精确匹配, 未命中原样通过 —
+宽片→wide fin、Heating pump→Cooling and Heating 是 sanctioned 用例)、
+round2/round4 (既有内置), 全部经与 `columns[]` transforms 相同的求值路径 —
+出现在 transform_chain 且作用于物化值。受控翻译前若词表键无空白, 链上先
+`trim` 再翻译 (顺序敏感, 确定性)。
+
+**验证规则**:
+
+| 声明 | 行为 |
+|---|---|
+| 轴朝向 ≠ (rows, columns) (源或目标) | ❌ `MATRIX_ORIENTATION_NOT_ROLLED_OUT` — v1 只支持同构朝向 (canonical matrix shape), 不静默忽略 |
+| `matrix.source.flatten` 不在 manifest | ❌ `MATRIX_SOURCE_UNKNOWN` |
+| locator 未命中源/目标展平行 (label / match / guard row) | ❌ `MATRIX_FIELD_LOCATOR_NOT_FOUND` (message 标 side + label/locator; 旧 `MATRIX_FIELD_LABEL_NOT_FOUND` 收敛于此) |
+| locator 命中 >1 行 (重复 label / 消歧不足的 match) | ❌ `MATRIX_FIELD_LOCATOR_AMBIGUOUS` (替换旧首命中 — 禁止 first-match) |
+| guarded row 行号超界 (orig 值集合外) | ❌ `MATRIX_FIELD_ROW_OUT_OF_RANGE` |
+| guarded row 事实与 expect 不符 | ❌ `MATRIX_FIELD_ROW_GUARD_MISMATCH` (message 逐列 expected vs actual) |
+| 裸 `{row: N}` 无 expect | ❌ `MATRIX_FIELD_ROW_GUARD_REQUIRED` |
+| locator 非法形态 (空 dict / match+row 并存 / 非字符串非 dict / match·expect 键非 Excel 列字母) | ❌ `MATRIX_FIELD_LOCATOR_INVALID` |
+| match/expect 列字母超出该侧展平 CSV 宽 | ❌ `MATRIX_COLUMN_INVALID` (message 标 side) |
+| record_map source/target 列字母非法或超出源宽/目标 digest 宽 | ❌ `MATRIX_COLUMN_INVALID` (message 标 side) |
+| field_map / record_map 条目缺必要字段 | ❌ `MATRIX_FIELD_MAP_INVALID` / `MATRIX_RECORD_MAP_INVALID` |
+| matrix 与 clone_roles/rows/columns/formulas/merges/group_merges/nulls/remove_rows/blocks/base_last_row 并存 | ❌ `MATRIX_MIXED_WITH_BLOCK_SEMANTICS` (矩阵是格转移填充, 不是行布局; 固定值用 sets) |
+| matrix + `validation.required_coverage` | ❌ `MATRIX_REQUIRED_COVERAGE_UNSUPPORTED` (矩阵不消费整源行; 用 key_outputs 采样) |
+| matrix + pptx 目标 | ❌ `PPTX_CAPABILITY_NOT_ROLLED_OUT` (matrix lowering 是 xlsx 能力, tr/tc 文本格不适用) |
+| set 与 matrix 格重叠 | ❌ `DUPLICATE_TARGET_WRITE` (一格一 owner 不变量延伸) |
+| field_map 引用未定义 transform | ❌ `TRANSFORM_UNKNOWN` (与 columns 同路径) |
+
+**literal sets 边界 (compile 审计, 非路由依据)**: `sets:` 保留给客户名/日期/
+固定 title/显式 user override/fixed footer。对"大量 source-derived 表值烘成绝对
+坐标 literal sets 绕过 grid"给编译/审计告警 `BULK_SOURCE_DERIVED_LITERAL_FALLBACK`
+—— 机械检测: 值型 sets 条数 ≥ `BULK_LITERAL_MIN_TOTAL` (4) 且其中 ≥
+`BULK_LITERAL_SOURCE_DERIVED_RATIO` (50%) 的字面值出现在**任一展平源 CSV 值池**
+(目标自身 CSV 排除 — 模板文本不是 source-derived) → 警告 (默认, 现有/合法
+spec 保持可编译); Matrix rollout 开关 (`compile_fill.py` 顶部常量
+`MATRIX_ROLLOUT = {"literal_fallback_fail_closed": False}`, 注释说明) 置 True
+后 → exit 3 fail-closed。**该检测是 compile-audit, 明确不是路由依据** — spec
+的记录数量阈值禁令只约束 routing (Task Shape), 审计不改变任何路由。反向保证:
+matrix-correct 用法的物化写入不是 sets → 零 literal 告警; 合法固定值 sets
+(值不在源池) → 零告警。
+
+**MOD Attention Map 对齐 (D6)**: resolve → `record_map` (哪些 record 被解析
+进目标产品列); map → `field_map`; transform → `transform_chain` (可执行受控
+转换); validate → Gate assertions (`validation` 三件套, ticket 07 消费)。
+契约测试 `tests/test_matrix_fillspec.py` -> AttentionMapAlignmentTests 背书。
+
 ### rows: 单源与多源合并
 
 ```yaml
@@ -803,6 +941,9 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 | 0-口径 | 常量 `value: "0"` / 空源留空 / 多列求和缺失按 0 | 一等 |
 | 常量 | `columns.value` | 一等 |
 | 查表 | `mapping.lookups` + `columns.lookup` | 一等 |
+| Column-Record Matrix 参数表 (字段行 × 产品列) | `matrix` — `field_map × record_map` → Compiler 物化目标格 + source lineage (`plan.source_trace` + `source_trace.json`); 受控翻译/trim 进 transform_chain | **一等** (ticket 06; 仅同构 field_axis=rows / record_axis=columns 的 canonical matrix shape; 其它朝向 → `MATRIX_ORIENTATION_NOT_ROLLED_OUT`) |
+| 受控翻译 / 词表 (宽片→wide fin、Heating pump→Cooling and Heating、Z 码 trim) | `mapping.transforms` `function: controlled_translation` + `translations` 表 / 内置 `trim`, 引用进 `matrix.field_map[].transforms` 或 `columns[].transforms` | 一等 (sanctioned 用例, 编译契约测试背书) |
+| 大量 source-derived 表值烘成 literal sets 绕过 grid | `blocks: []` + 绝对坐标 literal sets (316 个烘焙 literal 病理) | ⚠️ 编译审计 `BULK_SOURCE_DERIVED_LITERAL_FALLBACK` (默认警告; Matrix rollout 开关下 fail-closed — 审计非路由依据); 正确路径 = `matrix` 物化 |
 | pptx 分组合并 / 占位区 / 公式 / 合并 / 置空 / 删行 | — | **暂无**: `PPTX_CAPABILITY_NOT_ROLLED_OUT` (spike 夹具验证后 rollout; 曾静默丢弃, issue 06 起编译期拒绝); pptx 当前支持 = 列值填充 + DOM-path sets; 行越界 → `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` |
 
 ## 多目标与 PPTX
@@ -980,3 +1121,17 @@ digest, 不要 unzip sheet XML 考古。
 | MOD_UNRESOLVED | `mod_resolution.json` 的 status ∉ {resolved, none}（裁决后未带 --mod 重跑，盘上仍是 ambiguous/conflict） | 裁决后必须带 --mod <NAME\|NONE> 重跑 mod_nominate.py，把 final decision record 写盘；盘上仍是 ambiguous/conflict = 裁决后未重跑 |
 | MOD_SELECTION_MISMATCH | spec 的 `selected_mod` 不等于裁决记录 `selected` 字段（status=resolved 时严格相等；status=none 时必须为 "NONE"） | 把 spec.task.selected_mod 设为裁决记录 mod_resolution.json 里 selected 的值；status=none 时设为 "NONE" |
 | MOD_REVISION_MISMATCH | 裁决为具体 MOD 时，spec 的 `selected_mod_revision` 不等于裁决记录 `selected_revision`（NONE 短路不校验） | 把 spec.task.selected_mod_revision 设为裁决记录里 selected_revision 的值 |
+| MATRIX_INVALID | `matrix` 声明结构非法（非 mapping / 缺 source·target·field_map·record_map / field_map·record_map 为空列表） | 按 FILLSPEC「矩阵映射 (matrix)」schema 声明 |
+| MATRIX_ORIENTATION_NOT_ROLLED_OUT | matrix 源/目标轴朝向 ≠ field_axis=rows + record_axis=columns | v1 只支持源与目标同构的 canonical matrix shape; 其它朝向未 rollout, 不静默忽略 |
+| MATRIX_SOURCE_UNKNOWN | `matrix.source.flatten` 不在 manifest.flattened | 引用 flattened 条目 name（同 rows.source） |
+| MATRIX_FIELD_LOCATOR_INVALID | field_map locator 非法形态 (空 dict / match+row 并存 / 非字符串非 dict / match·expect 键非 Excel 列字母) | 用 string / {match: {...}} / {row: N, expect: {...}} 三形式之一 |
+| MATRIX_FIELD_LOCATOR_NOT_FOUND | locator 未命中源/目标展平行 (label / composite match / guard row; message 标 side + label/locator) | 用该侧真实存在的标签/列文本组合 (旧 `MATRIX_FIELD_LABEL_NOT_FOUND` 收敛于此) |
+| MATRIX_FIELD_LOCATOR_AMBIGUOUS | locator 命中 >1 行 (重复 label / 消歧不足的 match) — 首命中已废止 | 加列消歧 (composite match 加列) 或换 row+expect 守卫 |
+| MATRIX_FIELD_ROW_GUARD_REQUIRED | guarded row 缺 expect 结构守卫 (裸 `{row: N}`) | 加 `expect: {列: 文本}` |
+| MATRIX_FIELD_ROW_GUARD_MISMATCH | guarded row 行事实与 expect 不符 | 把 row/expect 对准真实展平行 (message 逐列 expected vs actual) |
+| MATRIX_FIELD_ROW_OUT_OF_RANGE | guarded row 行号超出该侧展平行 (orig 值集合) | 核对展平 CSV 的 orig 行号 |
+| MATRIX_COLUMN_INVALID | matrix 列字母非法/超范围（record_map source/target 列、field_label_column；message 标 side） | 用源/目标矩阵真实列字母 |
+| MATRIX_FIELD_MAP_INVALID / MATRIX_RECORD_MAP_INVALID | field_map/record_map 条目缺必要字段 | 按 matrix schema 修条目 |
+| MATRIX_MIXED_WITH_BLOCK_SEMANTICS | matrix 目标同时声明块语义（clone_roles/rows/columns/formulas/merges/group_merges/nulls/remove_rows/blocks/base_last_row） | 矩阵是格转移填充; 移除块声明, 固定值用 sets |
+| MATRIX_REQUIRED_COVERAGE_UNSUPPORTED | matrix 目标声明 required_coverage（矩阵不消费整源行） | matrix 目标不声明 required_coverage; 用 key_outputs 采样 |
+| BULK_SOURCE_DERIVED_LITERAL_FALLBACK | 值型 sets ≥ 4 条且 ≥ 50% 的字面值出现在展平源 CSV 值池（metadata 烘焙绕过 grid; 默认 compile-audit 警告, Matrix rollout 开关下 exit 3） | 把 source-derived 内容写进 matrix 或 columns/rows 映射; sets 只保留客户名/日期/固定 title/footer 类固定值 — 审计不是路由依据 |

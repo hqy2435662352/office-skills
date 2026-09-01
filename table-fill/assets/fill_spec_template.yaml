@@ -5,6 +5,8 @@
 #   - 克隆行携带的未填列必须进 nulls
 #   - 派生数值公式默认 ROUND(...,2) 防浮点残值 (text overflow)
 #   - key_outputs 必须是被本 plan 写入的格
+#   - Column-Record Matrix (字段行 × 产品列) 用 matrix 一等表达填, 禁止把
+#     几百个源值烘成 literal sets (见下矩阵示例块)
 
 task:
   intent: <一句话说明填充意图>
@@ -24,6 +26,12 @@ fingerprints:
   target_structure: <prepare_manifest.json.fingerprints.target_structure>
 
 mapping:
+  # transforms:                        # 可选 — 命名 transform (columns/matrix 链引用)
+  #   - name: fin_translate
+  #     function: controlled_translation   # 受控翻译: 整值精确匹配, 未命中原样
+  #     translations: {"宽片": "wide fin"}  #   (matrix 场景 sanctioned 词表)
+  #   - name: strip_sku
+  #     function: strip                    # 等价内置 trim (直接写 transforms: [trim])
   targets:
     - sheet: <目标 sheet 名>
       base_last_row: <目标 digest 的最后数据行>
@@ -77,6 +85,42 @@ mapping:
         - col: <列>
           rows: all                     # 或 [1,3] / "2:4"
       remove_rows: []                   # 源行数 < 模板行数时, 自底向上
+      # ── Column-Record Matrix 替代 (ticket 06): 字段行 × 产品列 ──────
+      # 客户参数表类 (fields 沿行轴、records 沿列轴) 用 matrix 一等表达,
+      # Compiler 物化 field_map × record_map → 目标格 + source lineage;
+      # 与上方 clone_roles/rows/columns 块语义互斥, 二选一。受控翻译
+      # (宽片→wide fin、Heating pump→Cooling and Heating) 用
+      # mapping.transforms 的 controlled_translation 函数, Z 码 trim 用
+      # 内置 trim; 固定 title/footer 仍写 sets。
+      # matrix:
+      #   source:
+      #     flatten: <展平源条目 name>      # manifest.flattened[].name
+      #     field_axis: rows                 # v1 仅支持同构朝向
+      #     record_axis: columns
+      #     field_label_column: A            # 字段标签列 (缺省 A)
+      #   target:
+      #     field_axis: rows
+      #     record_axis: columns
+      #     field_label_column: A
+      #   field_map:                         # 字段定位: 每侧 locator 三形式可混用
+      #     - source: <源参数角色>            #   A. 字符串标签 (label 列精确匹配)
+      #       target: <目标参数行>
+      #       transforms: [trim, fin_translate]
+      #     - source:                        #   B. composite match (推荐):
+      #         match: {A: Cooling, B: Capacity, C: Btu/h}   # 多列 AND 精确匹配
+      #       target:
+      #         match: {A: Cooling, B: Capacity, C: Btu/h}
+      #     - source:                        #   C. guarded explicit row (禁裸 row):
+      #         row: 16
+      #         expect: {B: Capacity}        #   行号 = 展平 CSV 的 orig; 事实守卫
+      #       target:
+      #         row: 10
+      #         expect: {B: Capacity}
+      #     重复命中 fail-closed: 0 → LOCATOR_NOT_FOUND, 1 → 解析,
+      #     >1 → MATRIX_FIELD_LOCATOR_AMBIGUOUS (首命中已废止)
+      #   record_map:                        # 产品记录列
+      #     - {record: "12K", source_column: B, target_column: B}
+      #     - {record: "18K", source_column: C, target_column: C}
 
 decisions:
   - <业务决策, 每条一行>

@@ -541,6 +541,348 @@ def make_all_missing_lookup_workdir(tmp) -> dict:
     return wd
 
 
+# ── Ticket 06: matrix fixtures (column-record matrix, data-neutral) ──────
+
+MATRIX_SRC_ROWS = [
+    # field label column A × record columns B/C/D (12K/18K/24K), mirroring
+    # fixture_c_column_record_matrix.xlsx conventions + the sanctioned
+    # transform cases: 宽片→wide fin, Heating pump→Cooling and Heating,
+    # Z 码 首尾空白 trim。
+    ["Parameter", "12K", "18K", "24K"],                       # orig 2
+    ["Capacity", "12000", "18000", "24000"],                  # orig 3
+    ["EER", "11", "10.8", "11.6"],                            # orig 4
+    ["Sound", "42", "45", "48"],                              # orig 5
+    ["Type", "Wall", "Wall", "Wall"],                         # orig 6
+    ["Compressor", "VS1", "VS2", "VS3"],                      # orig 7
+    ["Refrigerant", "R32", "R32", "R32"],                     # orig 8
+    ["Operation", "Heating pump", "Cooling and Heating",
+     "Cooling and Heating"],                                  # orig 9
+    ["Fin", "宽片", "宽片", "高效片"],                          # orig 10
+    ["Z 码", " Z2U20101009819 ", "Z2U20101009820",
+     "Z2U20101009821 "],                                      # orig 11
+]
+
+MATRIX_TGT_ROWS = [
+    # customer-facing template: same labels, empty value cells (filled by the
+    # matrix); labels live in A (field_label_column), records in B/C/D。
+    ["Product Parameter Matrix (template)", "", "", ""],      # orig 1
+    ["Parameter", "12K", "18K", "24K"],                       # orig 2
+    ["Capacity", "", "", ""],                                 # orig 3
+    ["EER", "", "", ""],                                      # orig 4
+    ["Sound", "", "", ""],                                    # orig 5
+    ["Type", "", "", ""],                                     # orig 6
+    ["Compressor", "", "", ""],                               # orig 7
+    ["Refrigerant", "", "", ""],                              # orig 8
+    ["Operation", "", "", ""],                                # orig 9
+    ["Fin", "", "", ""],                                      # orig 10
+    ["Z 码", "", "", ""],                                     # orig 11
+    ["", "", "", ""],                                         # orig 12
+    ["", "", "", ""],                                         # orig 13
+    ["", "", "", ""],                                         # orig 14
+]
+
+MATRIX_LABELS = ["Capacity", "EER", "Sound", "Type", "Compressor",
+                 "Refrigerant", "Operation", "Fin", "Z 码"]
+MATRIX_RECORDS = ["12K", "18K", "24K"]
+
+
+def _write_matrix_csv(path, rows: list, start_orig: int) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(rows):
+            csv.writer(f).writerow(row + [start_orig + i])
+
+
+def make_matrix_workdir(tmp) -> dict:
+    """Synthetic column-record matrix workdir (ticket 06): one flattened
+    matrix SOURCE entry (name `matrix_source`) + the flattened TARGET entry
+    (name `target`, sheet S, 14×4). Labels in column A, records in B/C/D —
+    the data-neutral shape of fixture_c_column_record_matrix.xlsx plus the
+    sanctioned transform cases (宽片 / Heating pump / Z 码 trim)."""
+    _write_matrix_csv(tmp / "matrix_source_flat.csv", MATRIX_SRC_ROWS, 2)
+    _write_matrix_csv(tmp / "target_flat.csv", MATRIX_TGT_ROWS, 1)
+
+    target_meta = {
+        "sheet": "S",
+        "dimensions": {"rows": 14, "cols": 4, "data_rows": 0},
+        "header_band": {"header_rows": [2], "data_start_row": 3},
+        "merged_ranges": ["A1:D1"],
+        "merge_anchors": [{"range": "A1:D1", "anchor": "A1", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 11}],
+        "formulas": {},
+        "column_numfmt": {},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [
+            {"staged": "matrix_source.xlsx", "source": "x", "sha256": "a"},
+            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
+        ],
+        "flattened": [
+            {"file": "matrix_source.xlsx", "sheet": "参数", "name": "matrix_source",
+             "csv": "matrix_source_flat.csv", "meta": "m.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "target.xlsx", "sheet": "S", "name": "target",
+             "csv": "target_flat.csv", "meta": "target_meta.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+        ],
+        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
+                   "csv": "target_flat.csv", "meta": "target_meta.json",
+                   "digest": "d.md", "candidates": "c.yaml"},
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
+    return {"manifest": manifest}
+
+
+# ── Ticket 01: matrix locator V2 fixture (hierarchical, data-neutral) ────
+
+MATRIX_LOCATOR_SRC_ROWS = [
+    # 层级参数表形状 (ticket 01 locator V2): 父级 section (A, 重复: Cooling ×3
+    # / Heating ×2) × 子 label (B, 重复: Capacity ×2) × unit (C, 最终消歧:
+    # Btu/h vs W) → record 列 D/E/F (12K/18K/24K)。只有 A+B+C 一起才能唯一
+    # 定位一行 (composite match); guarded row 用 orig 行号; legacy 唯一标签
+    # 用 Voltage (首次出现唯一次级行)。所有值 data-neutral。
+    ["Cooling", "Capacity", "Btu/h", "12000", "18000", "24000"],   # orig 2
+    ["Cooling", "Capacity", "W",     "3500",  "5300",  "7000"],    # orig 3
+    ["Cooling", "EER",     "Btu/Wh", "11",    "10.8",  "11.6"],    # orig 4
+    ["Heating", "Capacity", "Btu/h", "14000", "21000", "28000"],   # orig 5
+    ["Heating", "COP",     "W/W",    "3.6",   "3.8",   "4.0"],     # orig 6
+    ["Voltage", "Supply",  "V/Ph/Hz", "220",  "220",   "220"],     # orig 7
+]
+
+# 目标模板: 同标签行 (orig 10-15), D/E/F 空 (matrix 填), orig 16-18 空行
+# 承载固定 footer sets。orig 与源行号刻意错开, 证明 row 指展平 CSV 的 orig。
+MATRIX_LOCATOR_TGT_ROWS = [
+    (["Product Parameter Matrix (template)", "", "", "", "", ""], 1),
+    (["Cooling", "Capacity", "Btu/h", "", "", ""], 10),
+    (["Cooling", "Capacity", "W",     "", "", ""], 11),
+    (["Cooling", "EER",     "Btu/Wh", "", "", ""], 12),
+    (["Heating", "Capacity", "Btu/h", "", "", ""], 13),
+    (["Heating", "COP",     "W/W",    "", "", ""], 14),
+    (["Voltage", "Supply",  "V/Ph/Hz", "", "", ""], 15),
+    (["", "", "", "", "", ""], 16),
+    (["", "", "", "", "", ""], 17),
+    (["", "", "", "", "", ""], 18),
+]
+
+
+def _write_locator_csv(path, rows_with_orig: list) -> None:
+    """CSV rows with EXPLICIT original row numbers (ticket 01 guarded-row
+    tests need fixed orig values, so orig is not derived from list order)."""
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        for cells, orig in rows_with_orig:
+            csv.writer(f).writerow(cells + [str(orig)])
+
+
+def make_matrix_locator_workdir(tmp) -> dict:
+    """Synthetic hierarchical parameter-table workdir (ticket 01 locator V2):
+    one flattened matrix SOURCE entry (name `matrix_locator_source`, 6 field
+    rows) + the flattened TARGET entry (name `target`, sheet S, 18×7).
+
+    Shape: duplicated parent labels (Cooling ×3 / Heating ×2), duplicated
+    sub-labels (Capacity ×2), unit C the final disambiguator, record columns
+    D/E/F (12K/18K/24K) — `source: Cooling` alone must fail closed
+    (AMBIGUOUS), `match {A+B+C}` resolves exactly one row, guarded rows use
+    the flattened orig numbers (source orig 3 = Cooling/Capacity/W …)."""
+    _write_matrix_csv(tmp / "matrix_locator_source_flat.csv",
+                      MATRIX_LOCATOR_SRC_ROWS, 2)
+    _write_locator_csv(tmp / "target_flat.csv", MATRIX_LOCATOR_TGT_ROWS)
+
+    target_meta = {
+        "sheet": "S",
+        "dimensions": {"rows": 18, "cols": 7, "data_rows": 0},
+        "header_band": {"header_rows": [1], "data_start_row": 10},
+        "merged_ranges": ["A1:F1"],
+        "merge_anchors": [{"range": "A1:F1", "anchor": "A1", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 6}],
+        "formulas": {},
+        "column_numfmt": {},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [
+            {"staged": "matrix_locator_source.xlsx", "source": "x", "sha256": "a"},
+            {"staged": "target.xlsx", "source": "x", "sha256": "b"},
+        ],
+        "flattened": [
+            {"file": "matrix_locator_source.xlsx", "sheet": "参数",
+             "name": "matrix_locator_source",
+             "csv": "matrix_locator_source_flat.csv", "meta": "m.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+            {"file": "target.xlsx", "sheet": "S", "name": "target",
+             "csv": "target_flat.csv", "meta": "target_meta.json",
+             "digest": "d.md", "candidates": "c.yaml"},
+        ],
+        "target": {"file": "target.xlsx", "sheet": "S", "name": "target",
+                   "csv": "target_flat.csv", "meta": "target_meta.json",
+                   "digest": "d.md", "candidates": "c.yaml"},
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
+    return {"manifest": manifest}
+
+
+# ── Ticket 06: fixture C (canonical column-record matrix) prepare 形态 ────
+
+FIX_C_MATRIX_ROWS = [
+    # fixture_c_column_record_matrix.xlsx Sheet1 的可验证行画像
+    # (test_axis_neutral_grid_routing Layer 1 契约同源)。
+    ["Product Parameter Matrix", "", "", ""],                # orig 1
+    ["Parameter", "12K", "18K", "24K"],                       # orig 2
+    ["Capacity", "12000", "18000", "24000"],                  # orig 3
+    ["EER", "11", "10.8", "11.6"],                            # orig 4
+    ["Sound", "42", "45", "48"],                              # orig 5
+    ["Type", "Wall", "Wall", "Wall"],                         # orig 6
+    ["Compressor", "VS1", "VS2", "VS3"],                      # orig 7
+    ["Refrigerant", "R32", "R32", "R32"],                     # orig 8
+]
+
+FIX_C_LABELS = ["Capacity", "EER", "Sound", "Type", "Compressor",
+                "Refrigerant"]
+FIX_C_RECORDS = ["12K", "18K", "24K"]
+FIX_C_ENTRY_NAME = "fixture_c_column_record_matrix_Sheet1"
+
+
+def make_fixture_c_workdir(tmp) -> dict:
+    """`tests/_fixtures/routing/fixture_c_column_record_matrix.xlsx` 的
+    prepare 产物形态 (ticket 06, officecli-free): 自填充 matrix — 源与目标
+    同展平条目 `fixture_c_column_record_matrix_Sheet1` (Sheet1, 8×4)。
+    与 test_axis_neutral_grid_routing 的 E2E prepare 齐形 (同一 data-neutral
+    matrix shape: 字段标签 A 列 × 产品列 B/C/D)。"""
+    _write_matrix_csv(tmp / f"{FIX_C_ENTRY_NAME}_flat.csv", FIX_C_MATRIX_ROWS, 1)
+    target_meta = {
+        "sheet": "Sheet1",
+        "dimensions": {"rows": 8, "cols": 4, "data_rows": 0},
+        "header_band": {"header_rows": [2], "data_start_row": 3},
+        "merged_ranges": ["A1:D1"],
+        "merge_anchors": [{"range": "A1:D1", "anchor": "A1", "formula": ""}],
+        "blocks": [],
+        "columns": [{"col": "A", "nonempty": 8}],
+        "formulas": {},
+        "column_numfmt": {},
+    }
+    with open(tmp / "target_meta.json", "w", encoding="utf-8") as f:
+        json.dump(target_meta, f, ensure_ascii=False)
+    entry = {"file": "fixture_c_column_record_matrix.xlsx", "sheet": "Sheet1",
+             "name": FIX_C_ENTRY_NAME,
+             "csv": f"{FIX_C_ENTRY_NAME}_flat.csv",
+             "meta": "target_meta.json", "digest": "d.md", "candidates": "c.yaml"}
+    facts = [structure_facts(target_meta)]
+    manifest = {
+        "schema_version": 2,
+        "files": [{"staged": "fixture_c_column_record_matrix.xlsx",
+                   "source": "x", "sha256": "a"}],
+        "flattened": [dict(entry)],
+        "target": dict(entry),
+        "fingerprints": {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        },
+    }
+    with open(tmp / "prepare_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False)
+    _write_resolution(tmp)
+    return {"manifest": manifest}
+
+
+MATRIX_BASE_SPEC = {
+    "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
+    "inputs": {"sources": ["matrix_source.xlsx"], "target": "target.xlsx",
+               "source_sheets": [{"source": "matrix_source.xlsx", "sheets": ["参数"]}],
+               "target_sheet": "S"},
+    "fingerprints": {"source_structure": None, "target_structure": None},
+    "mapping": {"targets": [{
+        "sheet": "S",
+        "matrix": {
+            "source": {"flatten": "matrix_source", "field_axis": "rows",
+                       "record_axis": "columns", "field_label_column": "A"},
+            "target": {"field_axis": "rows", "record_axis": "columns",
+                       "field_label_column": "A"},
+            "field_map": [
+                {"source": label, "target": label} for label in MATRIX_LABELS
+            ],
+            "record_map": [
+                {"record": rec, "source_column": col, "target_column": col}
+                for rec, col in zip(MATRIX_RECORDS, ("B", "C", "D"))
+            ],
+        },
+        "sets": [
+            {"path": "A1", "value": "Product Parameter Matrix (template)"},
+            {"path": "A12", "value": "* fixed footer"},
+            {"path": "A13", "value": "ACME"},                # customer name (固定值)
+            {"path": "A14", "value": "2026-01-01"},          # date (固定值)
+        ],
+    }]},
+    "decisions": [], "gaps": [],
+    "lineage": [{"source": "matrix_source_flat.csv", "role": "primary",
+                 "note": "matrix cell-transfer (field_map × record_map)"}],
+    "validation": {"required_coverage": [], "required_empty": [],
+                   "key_outputs": ["A1"]},
+}
+
+
+# ── Ticket 01: matrix locator V2 base spec (hierarchical fixture) ────────
+
+MATRIX_LOCATOR_BASE_SPEC = {
+    "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
+    "inputs": {"sources": ["matrix_locator_source.xlsx"], "target": "target.xlsx",
+               "source_sheets": [{"source": "matrix_locator_source.xlsx",
+                                  "sheets": ["参数"]}],
+               "target_sheet": "S"},
+    "fingerprints": {"source_structure": None, "target_structure": None},
+    "mapping": {"targets": [{
+        "sheet": "S",
+        "matrix": {
+            "source": {"flatten": "matrix_locator_source", "field_axis": "rows",
+                       "record_axis": "columns", "field_label_column": "A"},
+            "target": {"field_axis": "rows", "record_axis": "columns",
+                       "field_label_column": "A"},
+            "field_map": [
+                # 默认: composite match (Cooling + Capacity + Btu/h) 唯一化
+                {"source": {"match": {"A": "Cooling", "B": "Capacity", "C": "Btu/h"}},
+                 "target": {"match": {"A": "Cooling", "B": "Capacity", "C": "Btu/h"}}},
+            ],
+            "record_map": [
+                {"record": "12K", "source_column": "D", "target_column": "D"},
+                {"record": "18K", "source_column": "E", "target_column": "E"},
+                {"record": "24K", "source_column": "F", "target_column": "F"},
+            ],
+        },
+        "sets": [
+            {"path": "A1", "value": "Product Parameter Matrix (template)"},
+            {"path": "A16", "value": "* fixed footer"},
+            {"path": "A17", "value": "ACME"},                # customer name (固定值)
+            {"path": "A18", "value": "2026-01-01"},          # date (固定值)
+        ],
+    }]},
+    "decisions": [], "gaps": [],
+    "lineage": [{"source": "matrix_locator_source_flat.csv", "role": "primary",
+                 "note": "matrix hierarchical field locator (composite match)"}],
+    "validation": {"required_coverage": [], "required_empty": [],
+                   "key_outputs": ["D10"]},
+}
+
+
 BASE_SPEC = {
     "task": {"intent": "t", "selected_mod": "NONE", "selected_mod_revision": None},
     "inputs": {"sources": ["source_maoli.xlsx"], "target": "target.xlsx",

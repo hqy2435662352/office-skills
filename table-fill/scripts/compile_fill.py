@@ -66,6 +66,7 @@ MOD_RESOLUTION_NAME = "mod_resolution.json"
 from _officecli import ensure_utf8_stdio, fail, record_timing, sha256_file  # noqa: E402
 PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
+SOURCE_TRACE_NAME = "source_trace.json"
 
 CELL_RE = re.compile(r"^[A-Z]{1,2}$")
 # 合并/聚合锚点默认样式。⚠️ 字体属性 (font.*) 不在此默认集内 —
@@ -83,6 +84,22 @@ STYLE_DEFAULTS = {
         "alignment.vertical": "center",
     },
 }
+
+# ── Matrix FillSpec (ticket 06) rollout ────────────────────────────────
+
+# Rollout switch: Matrix 一等表达 (mapping.targets[].matrix + source lineage)
+# 启用后, bulk source-derived literal-sets fallback (把大量源表值烘焙成绝对
+# 坐标 literal sets 绕过 grid) 从编译审计警告升级为 fail-closed 缺陷。
+# 默认 warn — 既有/合法 spec (客户名/日期/固定 title/显式 user override/
+# fixed footer 的 sets) 保持可编译; 矩阵能力 rollout 完成后置 True。
+MATRIX_ROLLOUT = {"literal_fallback_fail_closed": False}
+
+# 编译审计启发式 (仅审计 sets, 不是路由依据 — spec 的记录数量阈值禁令只约束
+# routing): 值型 sets ≥ BULK_LITERAL_MIN_TOTAL 条、且其中 ≥
+# BULK_LITERAL_SOURCE_DERIVED_RATIO 的字面值出现在任一展平源 CSV 值池 →
+# BULK_SOURCE_DERIVED_LITERAL_FALLBACK (默认警告 / 开关打开时 fail-closed)。
+BULK_LITERAL_MIN_TOTAL = 4
+BULK_LITERAL_SOURCE_DERIVED_RATIO = 0.5
 
 
 def inherited_anchor_style(meta: dict, col: str, region_start: int,
@@ -882,10 +899,16 @@ def is_header_text_row(cells: list) -> bool:
 
 def _resolve_transform(tname: str, transforms: dict):
     """Resolve a transform name: custom transforms first, then built-ins
-    round2/round4/... (numeric rounding). None when unknown."""
+    round2/round4/... (numeric rounding) and trim (whitespace strip).
+    None when unknown."""
     fn = transforms.get(tname)
     if fn is None and re.fullmatch(r"round\d+", tname):
         return (lambda v, n=int(tname[5:]): round_value(v, n))
+    if fn is None and tname == "trim":
+        # Built-in trim (ticket 06): leading/trailing whitespace strip — the
+        # sanctioned Z-码 cleanup (MOD ID-001 要求去除首尾空白). Custom
+        # transforms named "trim" (defined in mapping.transforms) win.
+        return lambda v: str(v).strip()
     return fn
 
 
@@ -1461,9 +1484,19 @@ def build_transforms(spec_mapping: dict, target_cfg: dict) -> dict:
             def _st(v):
                 return str(v).strip()
             fns[name] = _st
+        elif fn == "controlled_translation":
+            # Ticket 06: exact-match value translation (宽片→wide fin、
+            # Heating pump→Cooling and Heating). Deterministic: unmatched
+            # values pass through unchanged — agents must trim BEFORE
+            # translation when the vocabulary keys carry no whitespace.
+            translations = tr.get("translations") or {}
+            def _ct(v, _t=translations):
+                s = str(v)
+                return _t.get(s, s)
+            fns[name] = _ct
         else:
             fail("TRANSFORM_FUNCTION_UNKNOWN", f"transform function {fn!r} unknown",
-                 "Use regex_replace or strip")
+                 "Use regex_replace, strip or controlled_translation")
     return fns
 
 
@@ -1802,6 +1835,528 @@ def _emit_sets(target: dict, region_lo: int, region_hi: int, final_path,
         records.append({"path": fpath, "value": value,
                         "numberformat": props.get("numberformat")})
     return records
+
+
+# ── Matrix FillSpec (ticket 06 + ticket 01 locator V2): ────────────────
+#    field_map × record_map ───────────────────────────────────────────────
+
+# v1 唯一支持的轴朝向: 源与目标同构的 field_axis=rows / record_axis=columns
+# (canonical matrix shape — 参数行 × 产品列)。任何其它朝向 → 编译缺陷
+# MATRIX_ORIENTATION_NOT_ROLLED_OUT, 不静默忽略。
+MATRIX_AXES = {"field_axis": "rows", "record_axis": "columns"}
+# matrix 目标禁止并存的块语义声明 (矩阵是格转移填充, 不是行/块布局 —
+# base_last_row 也是块布局锚点, 对 matrix 无意义)。
+MATRIX_BLOCK_SEMANTICS_KEYS = ("clone_roles", "rows", "columns", "formulas",
+                               "merges", "group_merges", "nulls", "remove_rows",
+                               "blocks", "base_last_row")
+
+# field_map[].source/.target 每侧 locator 三形式 (ticket 01 V2):
+#   A. legacy 单标签 string (back-compat, label 列机械查找)
+#   B. {match: {列: 文本}} — 多列 AND trim 精确匹配 (推荐主路径)
+#   C. {row: N, expect: {列: 文本}} — guarded explicit row (禁裸 row)
+# 解析 fail-closed: 0 → MATRIX_FIELD_LOCATOR_NOT_FOUND, 1 → resolve,
+# >1 → MATRIX_FIELD_LOCATOR_AMBIGUOUS (替换旧"首命中"; deterministic ≠
+# unambiguous)。旧 MATRIX_FIELD_LABEL_NOT_FOUND 收敛进 LOCATOR_NOT_FOUND。
+
+
+def _matrix_axes_ok(block: dict, side: str, defects: list) -> bool:
+    if (block.get("field_axis"), block.get("record_axis")) != \
+            (MATRIX_AXES["field_axis"], MATRIX_AXES["record_axis"]):
+        defects.append({
+            "code": "MATRIX_ORIENTATION_NOT_ROLLED_OUT", "side": side,
+            "message": f"matrix.{side} axes ({block.get('field_axis')!r}, "
+                       f"{block.get('record_axis')!r}) — v1 仅支持源与目标同构的 "
+                       "field_axis=rows / record_axis=columns (canonical matrix shape)",
+            "corrective_action": "源和目标都声明 field_axis: rows + record_axis: "
+                                 "columns (identical orientation); 其它朝向未 rollout"})
+        return False
+    return True
+
+
+def _matrix_transform_names(entry: dict) -> list:
+    tnames = entry.get("transforms") or (
+        [entry["transform"]] if entry.get("transform") else [])
+    if not isinstance(tnames, list):
+        tnames = [tnames]
+    return tnames
+
+
+def _locator_desc(loc) -> str:
+    """Human-readable locator description for defect messages / mapping.md."""
+    if isinstance(loc, str):
+        return f"label {loc!r}"
+    if isinstance(loc, dict) and isinstance(loc.get("match"), dict):
+        pairs = ", ".join(f"{k}={v!r}" for k, v in loc["match"].items())
+        return f"match {{{pairs}}}"
+    if isinstance(loc, dict) and "row" in loc:
+        return f"guard row {loc.get('row')!r}"
+    return f"locator {loc!r}"
+
+
+def _locator_structure_ok(loc, side: str, fi: int, defects: list) -> bool:
+    """Structural validation of one field_map side locator (ticket 01 V2).
+
+    Accepts: non-empty string | {match: {列: 文本}} | {row: N, expect: {列: 文本}}.
+    Invalid shapes (empty {} / match+row 并存 / 非字符串非 dict / 非法列字母 /
+    裸 row 缺 expect) → 结构化缺陷; match/expect 列字母的超宽检查在
+    _locator_width_ok (与 record_map 列同规则)。"""
+    if isinstance(loc, str):
+        if loc.strip():
+            return True
+        defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                        "index": fi, "locator": loc,
+                        "message": f"matrix.field_map[{fi}].{side} locator 是空字符串 — "
+                                   "locator 必须是非空 string | {match: {...}} | "
+                                   "{row: N, expect: {...}}",
+                        "corrective_action": "写真实标签或结构化 locator 三形式之一"})
+        return False
+    if not isinstance(loc, dict):
+        defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                        "index": fi, "locator": loc,
+                        "message": f"matrix.field_map[{fi}].{side} locator {loc!r} 既不是 "
+                                   "非空字符串也不是 dict",
+                        "corrective_action": "使用 string | {match} | {row, expect} 三形式"})
+        return False
+    if "match" in loc and "row" in loc:
+        defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                        "index": fi, "locator": loc,
+                        "message": f"matrix.field_map[{fi}].{side} locator 同时声明 "
+                                   "match 与 row — 每侧只能选一种定位形式",
+                        "corrective_action": "去掉 match 或 row 之一"})
+        return False
+    if "match" in loc:
+        m = loc["match"]
+        if not isinstance(m, dict) or not m:
+            defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                            "index": fi, "locator": loc,
+                            "message": f"matrix.field_map[{fi}].{side} match 必须是非空 "
+                                       "mapping {列: 文本}",
+                            "corrective_action": "写 {match: {A: Cooling, B: Capacity, ...}}"})
+            return False
+        for col in m:
+            if not (isinstance(col, str) and CELL_RE.match(col)):
+                defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                                "index": fi, "column": col,
+                                "message": f"matrix.field_map[{fi}].{side} match 键 {col!r} "
+                                           "不是 Excel 列字母 (A..Z, 1-2 位)",
+                                "corrective_action": "用 Excel 列字母作 match 键"})
+                return False
+        return True
+    if "row" in loc:
+        row_n = loc["row"]
+        if isinstance(row_n, bool) or not isinstance(row_n, int):
+            defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                            "index": fi, "locator": loc,
+                            "message": f"matrix.field_map[{fi}].{side} row {row_n!r} "
+                                       "必须是整数 (展平 CSV 的 orig 行号)",
+                            "corrective_action": "row 用整数 orig 行号"})
+            return False
+        expect = loc.get("expect")
+        if not isinstance(expect, dict) or not expect:
+            defects.append({"code": "MATRIX_FIELD_ROW_GUARD_REQUIRED", "side": side,
+                            "index": fi, "row": row_n,
+                            "message": f"matrix.field_map[{fi}].{side} guard row {row_n} "
+                                       "缺 expect 结构守卫 — 裸 row 禁止",
+                            "corrective_action": "加 expect: {列: 文本} 结构守卫"})
+            return False
+        for col in expect:
+            if not (isinstance(col, str) and CELL_RE.match(col)):
+                defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                                "index": fi, "column": col,
+                                "message": f"matrix.field_map[{fi}].{side} expect 键 {col!r} "
+                                           "不是 Excel 列字母 (A..Z, 1-2 位)",
+                                "corrective_action": "用 Excel 列字母作 expect 键"})
+                return False
+        return True
+    defects.append({"code": "MATRIX_FIELD_LOCATOR_INVALID", "side": side,
+                    "index": fi, "locator": loc,
+                    "message": f"matrix.field_map[{fi}].{side} locator {loc!r} 为空 / "
+                               "未知形态 — 必须是 string | {match} | {row, expect}",
+                    "corrective_action": "使用三形式之一"})
+    return False
+
+
+def _locator_width_ok(loc, side: str, width: int, fi: int, defects: list) -> bool:
+    """match/expect 列字母是否超出该侧展平 CSV 宽 (与 record_map 列同规则:
+    超宽 → MATRIX_COLUMN_INVALID, message 标 side)。"""
+    if not isinstance(loc, dict):
+        return True
+    cols = []
+    if isinstance(loc.get("match"), dict):
+        cols.extend(loc["match"])
+    if isinstance(loc.get("expect"), dict):
+        cols.extend(loc["expect"])
+    ok = True
+    for col in cols:
+        if isinstance(col, str) and CELL_RE.match(col) \
+                and col_letter_to_idx(col) >= width:
+            defects.append({"code": "MATRIX_COLUMN_INVALID", "side": side,
+                            "index": fi, "column": col,
+                            "message": f"matrix.field_map[{fi}].{side} locator 列 {col!r} "
+                                       f"beyond {side} width {width}",
+                            "corrective_action": "用该侧真实存在的列字母"})
+            ok = False
+    return ok
+
+
+def _resolve_matrix_row(loc, rows: list, label_col: int, side: str, fi: int,
+                        defects: list) -> tuple | None:
+    """Resolve one field_map side locator against its side's flattened rows
+    (ticket 01 V2): label / composite match / guarded row — fail-closed
+    0 → MATRIX_FIELD_LOCATOR_NOT_FOUND, 1 → resolve, >1 →
+    MATRIX_FIELD_LOCATOR_AMBIGUOUS (首命中废止: deterministic ≠ unambiguous)。
+    Guarded row 先行校验事实: 行号超界 → MATRIX_FIELD_ROW_OUT_OF_RANGE;
+    expect 与真实行事实不符 → MATRIX_FIELD_ROW_GUARD_MISMATCH (message 逐列
+    expected vs actual)。"""
+    if isinstance(loc, str):
+        want = loc.strip()
+        hits = [(values, orig) for values, orig in rows
+                if label_col < len(values)
+                and str(values[label_col]).strip() == want]
+    elif "match" in loc:
+        conds = [(col_letter_to_idx(k), str(v).strip())
+                 for k, v in loc["match"].items()]
+        hits = []
+        for values, orig in rows:
+            if all(idx < len(values) and str(values[idx]).strip() == want
+                   for idx, want in conds):
+                hits.append((values, orig))
+    else:  # guarded explicit row
+        row_n = loc["row"]
+        matched = [(values, orig) for values, orig in rows if orig == row_n]
+        if not matched:
+            defects.append({"code": "MATRIX_FIELD_ROW_OUT_OF_RANGE", "side": side,
+                            "index": fi, "row": row_n,
+                            "message": f"matrix.field_map[{fi}].{side} guard row "
+                                       f"{row_n} 超出 {side} 展平行 (orig 行号集合)",
+                            "corrective_action": "核对展平 CSV 的 orig 列行号"})
+            return None
+        values, orig = matched[0]
+        for col, text in loc["expect"].items():
+            idx = col_letter_to_idx(col)
+            actual = str(values[idx]).strip() if idx < len(values) else ""
+            if actual != str(text).strip():
+                defects.append({"code": "MATRIX_FIELD_ROW_GUARD_MISMATCH",
+                                "side": side, "index": fi, "row": row_n,
+                                "message": f"matrix.field_map[{fi}].{side} guard row "
+                                           f"{row_n} 事实不符: expect {col}={text!r} "
+                                           f"实际 {col}={actual!r}",
+                                "corrective_action": "把 row/expect 对准真实展平行"})
+                return None
+        return matched[0]
+    if not hits:
+        defects.append({"code": "MATRIX_FIELD_LOCATOR_NOT_FOUND", "side": side,
+                        "index": fi, "locator": _locator_desc(loc),
+                        "message": f"matrix.field_map[{fi}].{side} "
+                                   f"{_locator_desc(loc)} 未在 {side} 展平 CSV 命中",
+                        "corrective_action": "用该侧真实存在的标签/列文本组合"})
+        return None
+    if len(hits) > 1:
+        defects.append({"code": "MATRIX_FIELD_LOCATOR_AMBIGUOUS", "side": side,
+                        "index": fi, "locator": _locator_desc(loc),
+                        "matches": len(hits),
+                        "message": f"matrix.field_map[{fi}].{side} "
+                                   f"{_locator_desc(loc)} 命中 {len(hits)} 行 — "
+                                   "fail-closed, 首命中已废止",
+                        "corrective_action": "加列消歧 (composite match 加列 / 换 "
+                                             "row+expect 守卫)"})
+        return None
+    return hits[0]
+
+
+def validate_matrix(matrix_cfg: dict, target_cfg: dict, num_cols: int,
+                    manifest_flat: dict, manifest_target: dict, workdir: Path,
+                    defects: list) -> dict | None:
+    """Static validation of a target-level `matrix` declaration (ticket 06,
+    locator grammar ticket 01 V2).
+
+    Returns the normalized materialization context on success, or None when
+    defects were emitted (the caller fails on them). Rules:
+      - matrix must be {source, target, field_map, record_map}; source/target
+        declare identical orientation field_axis=rows / record_axis=columns
+        (any other orientation → MATRIX_ORIENTATION_NOT_ROLLED_OUT);
+      - matrix.source.flatten references a manifest flattened entry name;
+      - field_map[i] = {source: locator, target: locator, transforms?} with
+        each side locator = string ({match: {列: 文本}} | {row, expect});
+        record_map[i] = {record, source_column, target_column} — locators
+        are resolved by mechanical lookup in each side's flattened CSV
+        (fail-closed 0/1/>1, see _resolve_matrix_row); unknown labels /
+        out-of-range columns are defects;
+      - a matrix target must not declare block semantics (clone_roles/rows/
+        columns/formulas/merges/group_merges/nulls/remove_rows/blocks) —
+        fixed title/footer values belong in `sets`."""
+    if not isinstance(matrix_cfg, dict):
+        defects.append({
+            "code": "MATRIX_INVALID",
+            "message": "mapping.targets[].matrix must be a mapping "
+                       "{source, target, field_map, record_map}",
+            "corrective_action": "声明 matrix 按 references/FILLSPEC.md「矩阵映射 "
+                                 "(matrix)」schema"})
+        return None
+    for key in ("source", "target", "field_map", "record_map"):
+        if key not in matrix_cfg:
+            defects.append({"code": "MATRIX_INVALID", "key": key,
+                            "message": f"matrix missing required key: {key}",
+                            "corrective_action": "Add the key per FILLSPEC.md matrix schema"})
+        elif key in ("source", "target") and not isinstance(matrix_cfg[key], dict):
+            defects.append({"code": "MATRIX_INVALID", "key": key,
+                            "message": f"matrix.{key} must be a mapping with "
+                                       f"field_axis + record_axis (+ flatten for source)",
+                            "corrective_action": "Declare {field_axis: rows, "
+                                                 "record_axis: columns} on both sides"})
+    if defects:
+        return None
+    src_block, tgt_block = matrix_cfg["source"], matrix_cfg["target"]
+    if not _matrix_axes_ok(src_block, "source", defects) \
+            or not _matrix_axes_ok(tgt_block, "target", defects):
+        return None
+    mixed = [k for k in MATRIX_BLOCK_SEMANTICS_KEYS if target_cfg.get(k)]
+    if mixed:
+        defects.append({
+            "code": "MATRIX_MIXED_WITH_BLOCK_SEMANTICS", "keys": mixed,
+            "message": f"matrix 目标还声明了块语义: {mixed} — v1 matrix 是格转移"
+                       "填充 (cell-transfer), 不是行/块布局",
+            "corrective_action": "matrix 目标不声明 clone_roles/rows/columns/"
+                                 "formulas/merges/group_merges/nulls/remove_rows/"
+                                 "blocks; 固定 title/footer 值放进 sets"})
+        return None
+    fm, rm = matrix_cfg.get("field_map"), matrix_cfg.get("record_map")
+    if not isinstance(fm, list) or not fm:
+        defects.append({"code": "MATRIX_INVALID", "field": "field_map",
+                        "message": "matrix.field_map must be a non-empty list of "
+                                   "{source, target, transforms} entries",
+                        "corrective_action": "列出字段角色映射 (源标签 → 目标标签)"})
+        return None
+    if not isinstance(rm, list) or not rm:
+        defects.append({"code": "MATRIX_INVALID", "field": "record_map",
+                        "message": "matrix.record_map must be a non-empty list of "
+                                   "{record, source_column, target_column} entries",
+                        "corrective_action": "列出记录列映射 (源列 → 目标列)"})
+        return None
+    for i, fe in enumerate(fm):
+        if not isinstance(fe, dict) or "source" not in fe or "target" not in fe:
+            defects.append({"code": "MATRIX_FIELD_MAP_INVALID", "index": i,
+                            "entry": fe,
+                            "message": f"matrix.field_map[{i}] must be a mapping with "
+                                       "'source' and 'target' keys (each side a locator: "
+                                       "string | {{match: ...}} | {{row, expect}})",
+                            "corrective_action": "Fix the field_map entry per FILLSPEC.md"})
+            continue
+        _locator_structure_ok(fe.get("source"), "source", i, defects)
+        _locator_structure_ok(fe.get("target"), "target", i, defects)
+    for i, re_ in enumerate(rm):
+        if not isinstance(re_, dict) or not str(re_.get("record") or "").strip():
+            defects.append({"code": "MATRIX_RECORD_MAP_INVALID", "index": i,
+                            "entry": re_,
+                            "message": f"matrix.record_map[{i}] must be a mapping with "
+                                       "a non-empty string 'record' name",
+                            "corrective_action": "Fix the record_map entry per FILLSPEC.md"})
+            continue
+        for col_key in ("source_column", "target_column"):
+            col = re_.get(col_key)
+            if not (isinstance(col, str) and CELL_RE.match(col)):
+                defects.append({"code": "MATRIX_RECORD_MAP_INVALID", "index": i,
+                                "field": col_key, "value": col,
+                                "message": f"matrix.record_map[{i}].{col_key} {col!r} "
+                                           "is not an Excel column letter",
+                                "corrective_action": "Use A..Z column letters"})
+    if defects:
+        return None
+    src_name = src_block.get("flatten")
+    src_entry = manifest_flat.get(src_name) if src_name else None
+    if src_entry is None:
+        defects.append({"code": "MATRIX_SOURCE_UNKNOWN", "source": src_name,
+                        "message": f"matrix.source.flatten {src_name!r} is not a "
+                                   "flattened source entry",
+                        "corrective_action": "引用 manifest.flattened[].name (与 "
+                                             "rows.source 同一个名字)"})
+        return None
+    try:
+        src_rows = load_csv_rows(workdir / src_entry["csv"])
+        tgt_rows = load_csv_rows(workdir / manifest_target["csv"])
+    except OSError as e:
+        defects.append({"code": "MATRIX_INVALID",
+                        "message": f"matrix CSV unreadable: {e}",
+                        "corrective_action": "Re-run prepare_run.py --flatten"})
+        return None
+    src_width = max((len(r[0]) for r in src_rows), default=0)
+    src_label_col = col_letter_to_idx(src_block.get("field_label_column") or "A")
+    tgt_label_col = col_letter_to_idx(tgt_block.get("field_label_column") or "A")
+    if src_label_col >= src_width:
+        defects.append({"code": "MATRIX_COLUMN_INVALID", "side": "source",
+                        "kind": "field_label_column", "column": src_block.get("field_label_column"),
+                        "message": f"matrix.source.field_label_column "
+                                   f"{src_block.get('field_label_column')!r} beyond source "
+                                   f"width {src_width}",
+                        "corrective_action": "Use the label column letter of the source matrix"})
+    if tgt_label_col >= num_cols:
+        defects.append({"code": "MATRIX_COLUMN_INVALID", "side": "target",
+                        "kind": "field_label_column", "column": tgt_block.get("field_label_column"),
+                        "message": f"matrix.target.field_label_column "
+                                   f"{tgt_block.get('field_label_column')!r} beyond target "
+                                   f"width {num_cols}",
+                        "corrective_action": "Use the label column letter of the target matrix"})
+    for i, re_ in enumerate(rm):
+        sc, tc = re_.get("source_column"), re_.get("target_column")
+        if isinstance(sc, str) and CELL_RE.match(sc) and col_letter_to_idx(sc) >= src_width:
+            defects.append({"code": "MATRIX_COLUMN_INVALID", "side": "source",
+                            "index": i, "column": sc,
+                            "message": f"matrix.record_map[{i}].source_column {sc!r} "
+                                       f"beyond source width {src_width}",
+                            "corrective_action": "Use a record column that exists in the "
+                                                 "source matrix"})
+        if isinstance(tc, str) and CELL_RE.match(tc) and col_letter_to_idx(tc) >= num_cols:
+            defects.append({"code": "MATRIX_COLUMN_INVALID", "side": "target",
+                            "index": i, "column": tc,
+                            "message": f"matrix.record_map[{i}].target_column {tc!r} "
+                                       f"beyond target width {num_cols}",
+                            "corrective_action": "Use a record column that exists in the "
+                                                 "target matrix"})
+    for i, fe in enumerate(fm):
+        if not isinstance(fe, dict):
+            continue
+        _locator_width_ok(fe.get("source"), "source", src_width, i, defects)
+        _locator_width_ok(fe.get("target"), "target", num_cols, i, defects)
+    if defects:
+        return None
+    return {
+        "sheet": target_cfg["sheet"],
+        "src_entry": src_entry,
+        "src_rows": src_rows,
+        "tgt_rows": tgt_rows,
+        "src_label_col": src_label_col,
+        "tgt_label_col": tgt_label_col,
+        "field_map": fm,
+        "record_map": rm,
+    }
+
+
+def materialize_matrix(ctx: dict, transforms: dict, defects: list,
+                       src_name: str) -> tuple[list, list]:
+    """field_map × record_map → (matrix_cells, source_lineage) (ticket 06;
+    locator grammar ticket 01 V2).
+
+    Every target cell is derived from its source cell through the transform
+    chain; lineage entries carry {target, source, transform_chain} —
+    `SPEC!D15 ← Sheet1!G42 [trim, controlled_translation]`. Readback
+    expectations come from the SAME materialization (no hand-written checks).
+    Each side locator resolves fail-closed via _resolve_matrix_row: 0 →
+    NOT_FOUND, 1 → resolve, >1 → AMBIGUOUS (首命中废止); guarded rows get
+    OUT_OF_RANGE / ROW_GUARD_MISMATCH on fact violations."""
+    cells: list = []
+    trace: list = []
+    for fi, fe in enumerate(ctx["field_map"]):
+        src_row = _resolve_matrix_row(fe.get("source"), ctx["src_rows"],
+                                      ctx["src_label_col"], "source", fi,
+                                      defects)
+        if src_row is None:
+            continue
+        tgt_row = _resolve_matrix_row(fe.get("target"), ctx["tgt_rows"],
+                                      ctx["tgt_label_col"], "target", fi,
+                                      defects)
+        if tgt_row is None:
+            continue
+        src_orig, tgt_orig = src_row[1], tgt_row[1]
+        tnames = _matrix_transform_names(fe)
+        for re_ in ctx["record_map"]:
+            sc, tc = re_["source_column"], re_["target_column"]
+            sidx = col_letter_to_idx(sc)
+            if sidx >= len(src_row[0]):
+                continue  # width already validated; guard for robustness
+            raw = src_row[0][sidx]
+            v = raw
+            applied: list = []
+            for tname in tnames:
+                fn = _resolve_transform(tname, transforms)
+                if fn is None:
+                    defects.append({"code": "TRANSFORM_UNKNOWN", "name": tname,
+                                    "message": f"matrix.field_map[{fi}] transform "
+                                               f"{tname!r} not defined",
+                                    "corrective_action": "Define it in mapping.transforms "
+                                                         "(or use the built-in round2/"
+                                                         "round4/trim)"})
+                    continue
+                v = fn(v)
+                applied.append(tname)
+            source_cell = f"{src_name}!{sc}{src_orig}"
+            cells.append({
+                "path": f"/{ctx['sheet']}/{tc}{tgt_orig}",
+                "value": v,
+                "source_cell": source_cell,
+                "transform_chain": list(applied),
+                "target_col": tc,
+                "target_row": tgt_orig,
+            })
+            trace.append({"target": cells[-1]["path"],
+                          "source": source_cell,
+                          "transform_chain": list(applied)})
+    return cells, trace
+
+
+def _source_value_pool(manifest: dict, workdir: Path) -> set:
+    """All non-empty cell values of every flattened CSV except the target's
+    own CSV — the mechanical pool the bulk-literal audit compares set values
+    against (target template text is NOT source-derived)."""
+    target_csv = manifest.get("target", {}).get("csv")
+    pool: set = set()
+    for e in manifest.get("flattened", []):
+        if e.get("csv") == target_csv:
+            continue
+        try:
+            rows = load_csv_rows(workdir / e["csv"])
+        except (OSError, ValueError):
+            continue
+        for values, _orig in rows:
+            for v in values:
+                s = str(v).strip()
+                if s:
+                    pool.add(s)
+    return pool
+
+
+def audit_bulk_literal_fallback(target_cfg: dict, manifest: dict,
+                                workdir: Path, warnings: list,
+                                defects: list) -> None:
+    """Compile-audit: bulk source-derived literal `sets` (ticket 06 / D6).
+
+    Mechanical heuristic (compile-audit ONLY — the spec's record-count-threshold
+    ban applies to ROUTING; this detector never routes): when value-bearing
+    `sets` entries whose literal value appears in the flattened SOURCE CSV
+    value pool dominate the sets (≥ BULK_LITERAL_MIN_TOTAL value sets and
+    ≥ BULK_LITERAL_SOURCE_DERIVED_RATIO share), emit warning
+    BULK_SOURCE_DERIVED_LITERAL_FALLBACK — or fail closed (exit 3) when the
+    Matrix rollout switch MATRIX_ROLLOUT['literal_fallback_fail_closed'] is ON.
+
+    Legit `sets:` (客户名/日期/固定 title/显式 user override/fixed footer) use
+    values NOT in the source pool → no warning. Matrix-materialized writes are
+    NOT sets → a matrix-correct spec produces zero literal-fallback warnings
+    (reverse guarantee)."""
+    entries = [s for s in (target_cfg.get("sets") or [])
+               if isinstance(s, dict) and "value" in s and s.get("value") is not None]
+    if len(entries) < BULK_LITERAL_MIN_TOTAL:
+        return
+    pool = _source_value_pool(manifest, workdir)
+    derived = [s for s in entries if str(s.get("value")).strip() in pool]
+    if not derived:
+        return
+    if len(derived) / len(entries) < BULK_LITERAL_SOURCE_DERIVED_RATIO:
+        return
+    entry = {
+        "code": "BULK_SOURCE_DERIVED_LITERAL_FALLBACK",
+        "derived": len(derived),
+        "total": len(entries),
+        "message": (f"{len(derived)}/{len(entries)} 条值型 `sets` 的字面值出现在展平"
+                    "源 CSV 值池 — 大量 source-derived 表值被烘成绝对坐标 literal "
+                    "sets 绕过 grid (source lineage 丢失, readback 全绿≠业务正确)"),
+        "corrective_action": ("把 source-derived 内容写进 matrix (field_map × "
+                              "record_map, Compiler 物化 + source lineage) 或 "
+                              "columns/rows 映射; sets 只保留客户名/日期/固定 "
+                              "title/显式 user override/fixed footer 类固定值"),
+    }
+    if MATRIX_ROLLOUT.get("literal_fallback_fail_closed"):
+        defects.append(entry)
+    else:
+        warnings.append(entry)
 
 
 def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
@@ -2481,6 +3036,32 @@ def render_mapping(spec: dict, plan: dict, manifest: dict) -> str:
     lines.append("|---|---:|---|")
     for w in plan["writes"]:
         lines.append(f"| {w['row']} | {w['col']} | {w['value']} |")
+    if plan.get("matrix"):
+        m = plan["matrix"]
+        lines.append("")
+        lines.append(f"## Matrix — {m['source']} → {m['target_sheet']} "
+                     f"(field_axis={m['orientation']['field_axis']} / "
+                     f"record_axis={m['orientation']['record_axis']})")
+        lines.append("")
+        lines.append("| Field (source → target) | Transform chain | Records |")
+        lines.append("|---|---|---|")
+        for fe in m["field_map"]:
+            chain = ", ".join(fe["transform_chain"]) or "(direct copy)"
+            src_disp = _locator_desc(fe["source"]) if isinstance(fe["source"], dict) \
+                else fe["source"]
+            tgt_disp = _locator_desc(fe["target"]) if isinstance(fe["target"], dict) \
+                else fe["target"]
+            lines.append(f"| `{src_disp}` → `{tgt_disp}` | {chain} | "
+                         f"{len(m['record_map'])} |")
+        lines.append("")
+    if plan.get("source_trace"):
+        lines.append("## Source lineage (matrix writes)")
+        lines.append("| Target | Source | Transform chain |")
+        lines.append("|---|---|---|")
+        for e in plan["source_trace"]:
+            chain = ", ".join(e["transform_chain"]) or "(direct copy)"
+            lines.append(f"| `{e['target']}` | `{e['source']}` | {chain} |")
+        lines.append("")
     if plan.get("empties"):
         lines.append("")
         lines.append("## Explicit empty cells (clone-residue nulls)")
@@ -2590,349 +3171,431 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     dims = target_meta.get("dimensions", {})
     num_cols = dims.get("cols", 0)
 
-    # Blocks — one implicit block (target-level config) or explicit blocks[].
-    blocks_cfg = resolve_blocks(target_cfg)
-
-    # Block top-level key allowlist (ID-1): misplaced/unknown keys
-    # (aggregates/per_row/group_aggregates at the block top level, typos) used
-    # to pass through resolve_blocks and get silently dropped by _emit_block_ops
-    # (Case 05 U4/E4) — now a compile-time BLOCK_KEY_STRUCTURE_INVALID.
-    defects += validate_block_top_level_keys(blocks_cfg)
-    if defects:
-        fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
-             "Fix the spec and re-run compile_fill.py", defects)
-
-    # Inplace declaration invariants (fail before layout: a
-    # malformed region must never reach coordinate arithmetic).
-    ip_ctx = validate_inplace_declaration(blocks_cfg, dims, defects)
-    if defects:
-        fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
-             "Fix the spec and re-run compile_fill.py", defects)
-
-    # Lookup key_column guard (issue 04): an invalid key_column (logical
-    # field name like 'sku', or a column letter beyond the consumer source's
-    # width) used to crash resolve_lookup with a bare IndexError. Intercept
-    # BEFORE any plan work — single defect code LOOKUP_KEY_COLUMN_INVALID,
-    # reason invalid_format / out_of_range (no new taxonomy).
-    defects += validate_lookup_key_columns(
-        blocks_cfg, spec["mapping"], target_cfg, manifest_flat, workdir,
-        num_cols)
-    if defects:
-        fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
-             "Fix the spec and re-run compile_fill.py", defects)
-
-    # Per-block source matching + materialization (block rows configs).
-    def match_block_sources(block_cfg: dict, label: str) -> list[dict]:
-        rows_cfg = block_cfg.get("rows") or {}
-        if rows_cfg.get("sources"):
-            src_specs = [
-                {"source": s.get("source"), "selectors": s.get("selectors") or []}
-                for s in rows_cfg["sources"]
-            ]
-        else:
-            src_specs = [{"source": rows_cfg.get("source"),
-                          "selectors": rows_cfg.get("selectors") or []}]
-        if any(not s["source"] for s in src_specs):
-            fail("SPEC_SOURCE_CSV", f"{label}: every rows.sources entry needs a flattened source name",
-                 "Reference flattened entry names from the manifest")
-        out = []
-        for src_spec in src_specs:
-            src_name = src_spec["source"]
-            src_entry = manifest_flat.get(src_name)
-            if src_entry is None:
-                fail("SPEC_SOURCE_CSV", f"{label}: rows source {src_name!r} not among flattened sources",
-                     "Reference the flattened entry name from the manifest (e.g. the "
-                     "name field of a flattened sheet, not the csv filename)")
-            src_rows = load_csv_rows(workdir / src_entry["csv"])
-            # Selectors match SOURCE rows — validate their column letters
-            # against the SOURCE's own width, not the target's (the MXP case:
-            # 27-col source into a 6-col target made L selectors fail).
-            src_width = max((len(r[0]) for r in src_rows), default=num_cols)
-            try:
-                matched = apply_selectors(src_rows, src_spec, src_width)
-            except ValueError as e:
-                fail("SELECTOR_INVALID", f"{label}/{src_name}: {e}", "Fix the row selectors")
-            if not matched:
-                fail("NO_MATCHED_ROWS", f"{label}: selectors matched zero rows in {src_name}",
-                     "Fix selectors or check the source flatten")
-            # issue 02 / Case 08 U1: 展平 CSV 首行（表头）是候选数据行 — rows
-            # 无 selector（或 selector 未排除）且首行是表头文本行时, 表头会被
-            # 映射进数据区 (失败语义不变, 记 warnings)。corrective_action 指向
-            # pattern/not_pattern 排除表头行。
-            if src_rows and is_header_text_row(src_rows[0][0]):
-                first_orig = src_rows[0][1]
-                if any(o == first_orig for _, o in matched):
-                    first_label = next((str(c) for c in src_rows[0][0]
-                                        if str(c).strip()), "")
-                    warnings.append({
-                        "code": "HEADER_ROW_CONSIDERED_DATA",
-                        "source": src_name,
-                        "message": f"{label}: source {src_name!r} 的展平 CSV 首行"
-                                   f"（表头文本 {first_label!r}）被当作候选数据行 — "
-                                   "rows 无 selector（或 selector 未排除首行）时表头会被"
-                                   "映射进数据区",
-                        "corrective_action": "在 rows.selectors 加 pattern/not_pattern "
-                                             "排除表头行 (如 `column A pattern 业务类别*` "
-                                             "或 `column A not_value 类别`)",
-                    })
-            out.append({"name": src_name, "csv": src_entry["csv"], "rows": src_rows,
-                        "matched": matched})
-        return out
-
-    lookups = build_lookup_tables(spec["mapping"], target_cfg, workdir)
-    transforms = build_transforms(spec["mapping"], target_cfg)
+    # ── Matrix FillSpec path (ticket 06) — cell-transfer fill WITHOUT row
+    #    blocks. A matrix target materializes field_map × record_map into plan
+    #    `set` ops (the SAME value-write shape the executor consumes) + source
+    #    lineage; fixed title/footer values still ride `sets`. Matrix is v1
+    #    xlsx-only (pptx cells use tr/tc paths, not /Sheet/ColRow).
+    matrix_cfg = target_cfg.get("matrix")
+    matrix_ctx = None
+    matrix_cells: list = []
+    source_trace: list = []
     warnings: list = []
-    lookup_stats: dict = {}
-
-    # Materialize per block and attach block data (rows, source, block index).
-    block_infos: list[dict] = []
-    data_rows: list[dict] = []
-    matched_all: list[dict] = []
-    for bi, bcfg in enumerate(blocks_cfg):
-        label = f"block[{bi}]"
-        matched = match_block_sources(bcfg, label)
-        materialized = materialize_values(
-            [r for m in matched for r in m["matched"]], bcfg, num_cols,
-            lookups, transforms, defects, lookup_stats)
-        drs = []
-        # map materialized rows back to their source csv
-        src_of = []
-        for m in matched:
-            src_of.extend([m["csv"]] * len(m["matched"]))
-        for dr, src in zip(materialized, src_of):
-            dr["src"] = src
-            drs.append(dr)
-        if not defects:
-            apply_precision_policy(bcfg, drs, defects, warnings,
-                                   col_widths=target_meta.get("column_width") or {},
-                                   col_numfmt=target_meta.get("column_numfmt") or {})
-        if defects:
-            fail("MATERIALIZE_DEFECTS", f"{len(defects)} value materialization defect(s)",
-                 "Fix the column mappings/lookups/transforms", defects)
-        data_rows.extend(drs)
-        matched_all.extend(matched)
-        block_infos.append({"cfg": bcfg, "rows": drs, "count": len(drs),
-                            "matched": matched, "label": label})
-
-    note_lookup_all_missing(lookup_stats, warnings)
-
-    for b in block_infos:
-        b["cfg"]["_rows"] = b["rows"]
-
-    roles, data_starts = compute_layout(blocks_cfg, platform, target_cfg,
-                                        defects, dims.get("rows"))
-    for b, start in zip(block_infos, data_starts):
-        b["data_start"] = start
-    for b in block_infos:
-        ip_role = next((r for r in b["cfg"].get("clone_roles", [])
-                        if r.get("mode") == "inplace"), None)
-        if ip_role:
-            b["inplace"] = {
-                "start_row": ip_role.get("start_row"),
-                "capacity": ip_role.get("capacity"),
-                "template_row": ip_role.get("template_row"),
-                "region_end": ip_role.get("start_row") + ip_role.get("capacity") - 1,
-            }
-            # 锚点样式继承 (Case 010 盲区): inplace 组锚点可能落在旧合并区
-            # 非锚点格 (无字体样式) — 采集占位区内同列既有锚点样式, 供
-            # _emit_block_ops 合并进 merge op (spec 显式 styles 优先)。
-            region = (b["inplace"]["start_row"], b["inplace"]["region_end"])
-            merge_cols = {g.get("col") for g in b["cfg"].get("group_merges", [])}
-            merge_cols |= {m.get("col") for m in b["cfg"].get("merges", [])}
-            b["inherited_styles"] = {
-                col: inherited_anchor_style(target_meta, col, *region)
-                for col in merge_cols if col
-            }
-    validate_inplace_geometry(blocks_cfg, ip_ctx, roles,
-                              target_cfg.get("base_last_row", 0), defects)
-
-    style_defaults = {
-        "anchor": dict(STYLE_DEFAULTS["anchor"], **(target_cfg.get("styles") or {}).get("anchor", {})),
-        "label": dict(STYLE_DEFAULTS["label"], **(target_cfg.get("styles") or {}).get("label", {})),
-    }
-
-    if platform == "pptx":
-        if any(inplace_roles(b) for b in blocks_cfg):
+    if matrix_cfg is not None:
+        if platform == "pptx":
             defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                            "message": "mode: inplace is meaningless for pptx — the "
-                                       "pptx model is already pre-built-row fills",
-                            "corrective_action": "Drop mode: inplace from the pptx spec"})
-        for b in block_infos:
-            cfg = b["cfg"]
-            label = b["label"]
-            # fail-closed (issue 06): every declaration the pptx lowering does
-            # NOT implement must be rejected here — build_ops_pptx only lowers
-            # column value fills + DOM-path sets, everything else was silently
-            # dropped (compile passed, no ops generated).
-            if cfg.get("group_merges"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: group_merges lowering for pptx "
-                                           "(vMerge/rowspan mechanics) is staged: verify "
-                                           "against the spike fixture before rollout",
-                                "corrective_action": "Use xlsx for group_merges, or wait "
-                                                      "for the pptx lowering rollout"})
-            if cfg.get("formulas", {}).get("group_aggregates"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: group_aggregates lowering for "
-                                           "pptx is staged — formula cells are xlsx-only; "
-                                           "verify against the spike fixture before rollout",
-                                "corrective_action": "Use xlsx for group_aggregates, or "
-                                                     "wait for the pptx lowering rollout"})
-            if cfg.get("formulas", {}).get("per_row"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: formulas.per_row lowering for pptx "
-                                           "is not rolled out — pptx cells hold text, "
-                                           "not formulas",
-                                "corrective_action": "Use xlsx for per_row formulas, or "
-                                                     "precompute the derived values into "
-                                                     "column mappings"})
-            if cfg.get("formulas", {}).get("aggregates"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: formulas.aggregates lowering for "
-                                           "pptx is not rolled out — formula cells are "
-                                           "xlsx-only",
-                                "corrective_action": "Use xlsx for aggregates, or "
-                                                     "precompute the aggregate values"})
-            if cfg.get("merges"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: merges lowering for pptx is not "
-                                           "rolled out — pptx merge mechanics differ "
-                                           "(vMerge/rowspan spike pending)",
-                                "corrective_action": "Use xlsx for merges, or drop the "
-                                                     "declaration"})
-            if cfg.get("nulls"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: nulls is meaningless for pptx — "
-                                           "there is no clone residue to clear (rows are "
-                                           "pre-built, nothing is cloned)",
-                                "corrective_action": "Drop nulls from the pptx spec"})
-            if cfg.get("remove_rows"):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: remove_rows lowering for pptx is "
-                                           "not rolled out — pptx has no structural row "
-                                           "ops",
-                                "corrective_action": "Drop remove_rows from the pptx spec"})
-            if any(col.get("props") for col in cfg.get("columns", [])):
-                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
-                                "message": f"{label}: columns[].props (numberformat) is "
-                                           "not applied on pptx — pptx cells are text "
-                                           "and carry no number format",
-                                "corrective_action": "Drop props from pptx column "
-                                                     "mappings"})
+                            "message": "matrix lowering (cell-transfer fills) 是 "
+                                       "xlsx 能力 — pptx 表格是 tr/tc 文本格",
+                            "corrective_action": "matrix 目标用 xlsx (或把值预计算进 "
+                                                 "columns 映射)"})
+        if spec["validation"].get("required_coverage"):
+            defects.append({
+                "code": "MATRIX_REQUIRED_COVERAGE_UNSUPPORTED",
+                "message": "matrix 填充是格转移 (cell transfer), 不消费整源行 — "
+                           "required_coverage (源行必须被消费) 对 matrix 无意义",
+                "corrective_action": "matrix 目标不声明 required_coverage; 用 "
+                                     "validation.key_outputs 采样目标格"})
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
-        ops, readback, written = build_ops_pptx(target_cfg, roles, data_rows,
-                                                num_cols, defects)
-        group_boundaries: list = []
+        matrix_ctx = validate_matrix(matrix_cfg, target_cfg, num_cols,
+                                     manifest_flat, manifest_target, workdir,
+                                     defects)
+        if defects:
+            fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                 "Fix the spec and re-run compile_fill.py", defects)
+        transforms = build_transforms(spec["mapping"], target_cfg)
+        matrix_cells, source_trace = materialize_matrix(
+            matrix_ctx, transforms, defects, matrix_ctx["src_entry"]["name"])
+        if defects:
+            fail("MATERIALIZE_DEFECTS", f"{len(defects)} matrix materialization defect(s)",
+                 "Fix matrix.field_map / matrix.record_map / transforms", defects)
+        blocks_cfg = []
+        block_infos = []
+        data_rows = []
+        matched_all = [matrix_ctx["src_entry"]]
+        roles = []
         trim_count = 0
-        set_records = _emit_sets(target_cfg, None, None, None, ops,
-                                 lambda p, k, v: _pptx_register(p, k, v, written,
-                                                               readback, defects),
-                                 defects, dims.get("rows", 0), num_cols)
+        group_boundaries = []
+        lookups = {}
+        ops, readback, written = [], [], {}
+
+        def matrix_register(path, kind, value):
+            prev = written.get(path)
+            if prev is not None:
+                defects.append({"code": "DUPLICATE_TARGET_WRITE", "path": path,
+                                "message": f"cell {path} written twice (first as {prev})",
+                                "corrective_action": "Each target cell may be written by "
+                                                     "exactly one matrix field_map × record_map "
+                                                     "pair or set entry"})
+            written[path] = kind
+            if kind == "value":
+                readback.append({"path": path, "expect": value or "", "kind": "value"})
+            elif kind == "empty":
+                readback.append({"path": path, "expect": "EMPTY", "kind": "empty"})
+            elif kind == "nonempty":
+                readback.append({"path": path, "expect": "", "kind": "nonempty"})
+
+        for c in matrix_cells:
+            ops.append({"command": "set", "path": c["path"],
+                        "props": {"value": c["value"]}})
+            matrix_register(c["path"], "value", c["value"])
+        sheet = target_cfg["sheet"]
+        identity = lambda col, row: f"/{sheet}/{col}{row}"  # noqa: E731 — no row shift
+        set_records = _emit_sets(target_cfg, None, None, identity, ops,
+                                 matrix_register, defects,
+                                 dims.get("rows", 0), num_cols, identity)
+        if defects:
+            fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                 "Fix the spec and re-run compile_fill.py", defects)
     else:
-        anchors = {a["anchor"] for a in target_meta.get("merge_anchors", [])}
-        anchor_rows = {int(re.search(r"\d+$", a).group()) for a in anchors}
-        whole_run_gated = False
-        for b in block_infos:
-            cfg = b["cfg"]
-            validate_nulls_rows(cfg, defects)  # 先于任何 parse_rel_rows 调用
-            if any(d.get("code") == "NULLS_ROWS_INVALID" for d in defects):
-                fail("STATIC_VALIDATION_FAILED",
-                     f"{len(defects)} static validation defect(s)",
-                     "Fix the nulls rows specs and re-run compile_fill.py", defects)
-            template_row = next((r.get("template_row") for r in cfg.get("clone_roles", [])
-                                 if r.get("role") == "data"), None)
-            if template_row is None:
-                fail("SPEC_DATA_CLONE", f"{b['label']}: xlsx data blocks need a "
-                     "data clone_role with template_row",
-                     "Add {role: data, template_row: N} to the block's clone_roles")
-            if template_row in anchor_rows:
-                defects.append({"code": "CLONE_SOURCE_IS_ANCHOR",
-                                "template_row": template_row,
-                                "message": f"{b['label']}: template row {template_row} is a "
-                                           "merge anchor; cloning it carries anchor formulas "
-                                           "into non-anchor cells",
-                                "corrective_action": "Pick a non-anchor data row with the same format"})
-            null_specs = {x["col"]: x.get("rows") for x in cfg.get("nulls", [])}
-            per_row = cfg.get("formulas", {}).get("per_row", {})
-            gm_cols = {g.get("col") for g in cfg.get("group_merges", [])}
-            validate_clone_residue(cfg, template_row,
-                                   workdir / manifest_target["csv"], num_cols,
-                                   cfg.get("columns", []), null_specs, per_row,
-                                   b["count"], defects, gm_cols)
-            if b.get("inplace"):
-                # Double residue baseline: retained rows checked against
-                # each row's OWN values; overflow clone rows against template_row
-                # (covered by validate_clone_residue above).
-                validate_placeholder_residue(
-                    cfg, b["inplace"]["start_row"], b["inplace"]["capacity"],
-                    b["count"], workdir / manifest_target["csv"], num_cols,
-                    b["rows"], defects)
-            validate_formula_references(cfg.get("formulas", {}), b["count"], defects)
-            ga_entries, ga_whole_run = split_group_aggregates(
-                cfg.get("formulas", {}).get("group_aggregates"), defects, b["label"])
-            if ga_whole_run and not whole_run_gated:
-                whole_run_gated = True
-                defects.append({"code": "CAPABILITY_NOT_ROLLED_OUT",
-                                "message": "group_aggregates.whole_run (跨块总计) 落点"
-                                           "语义 (末块尾部 vs 独立行) 需一次 spike 锁定 — "
-                                           "spike 前声明被结构化拒绝",
-                                "corrective_action": "用逐块块级 aggregates (每组合一块) "
-                                                     "表达, 或等 whole_run spike 结论"
-                                                     "落地后再声明"})
-            for col in (set(per_row) | set(null_specs)
-                        | {m.get("col") for m in cfg.get("merges", [])}
-                        | gm_cols
-                        | {g.get("col") for g in ga_entries}
-                        | {g.get("group_by") for g in ga_entries if g.get("group_by")}
-                        | {g.get("group_by") for g in cfg.get("group_merges", []) if g.get("group_by")}):
-                if col and col_letter_to_idx(col) >= num_cols:
-                    defects.append({"code": "COL_OUT_OF_DIGEST", "col": col,
-                                    "message": f"{b['label']}: column {col} beyond digest width {num_cols}",
-                                    "corrective_action": "Check the target structure"})
-        if target_cfg.get("base_last_row", 0) > dims.get("rows", 0):
-            defects.append({"code": "BASE_ROW_OUT_OF_BOUNDS",
-                            "message": f"base_last_row {target_cfg['base_last_row']} > digest rows {dims.get('rows')}",
-                            "corrective_action": "Use the digest's row count"})
-        validate_append_remove_zone(blocks_cfg,
-                                    target_cfg.get("base_last_row", 0), defects)
-        row_gaps = sorted(set(target_meta.get("row_gaps") or []))
-        if row_gaps:
-            for role in roles:
-                if role.get("mode") in ("inplace", "overflow_clone"):
-                    continue
-                r = role.get("row")
-                trow = role.get("template_row")
-                # 锚点链: data/title/header 克隆 add after /row[r-1]; spacer 无 after.
-                anchor = (r - 1) if (isinstance(r, int) and role.get("kind") != "spacer") else None
-                for a, kind in ((anchor, "add anchor (after)"), (trow, "clone source (from)")):
-                    if a in row_gaps:
-                        defects.append({
-                            "code": "TEMPLATE_ROW_GAP",
-                            "row": a,
-                            "kind": kind,
-                            "message": f"role {role.get('kind','?')} at row {r}: "
-                                       f"{kind} row {a} is a row-number gap in the target "
-                                       f"sheet (row elements: missing {row_gaps}) — officecli "
-                                       f"`add after/from /row[{a}]` would fail at runtime",
-                            "corrective_action": "Materialize the missing row "
-                                                 "elements (scripts/repair_row_gaps.py "
-                                                 "--workdir <dir> — fingerprints "
-                                                 "auto re-synced), then update the "
-                                                 "spec target_structure fingerprint "
-                                                 "(or --patch-spec) and recompile",
-                        })
+        # Blocks — one implicit block (target-level config) or explicit blocks[].
+        blocks_cfg = resolve_blocks(target_cfg)
+
+        # Block top-level key allowlist (ID-1): misplaced/unknown keys
+        # (aggregates/per_row/group_aggregates at the block top level, typos) used
+        # to pass through resolve_blocks and get silently dropped by _emit_block_ops
+        # (Case 05 U4/E4) — now a compile-time BLOCK_KEY_STRUCTURE_INVALID.
+        defects += validate_block_top_level_keys(blocks_cfg)
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
 
-        ops, readback, written, group_boundaries, trim_count, set_records = \
-            build_ops_xlsx(target_cfg, block_infos, roles, data_rows, num_cols,
-                           style_defaults, defects, sheet_rows=dims.get("rows", 0))
+        # Inplace declaration invariants (fail before layout: a
+        # malformed region must never reach coordinate arithmetic).
+        ip_ctx = validate_inplace_declaration(blocks_cfg, dims, defects)
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
+
+        # Lookup key_column guard (issue 04): an invalid key_column (logical
+        # field name like 'sku', or a column letter beyond the consumer source's
+        # width) used to crash resolve_lookup with a bare IndexError. Intercept
+        # BEFORE any plan work — single defect code LOOKUP_KEY_COLUMN_INVALID,
+        # reason invalid_format / out_of_range (no new taxonomy).
+        defects += validate_lookup_key_columns(
+            blocks_cfg, spec["mapping"], target_cfg, manifest_flat, workdir,
+            num_cols)
+        if defects:
+            fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                 "Fix the spec and re-run compile_fill.py", defects)
+
+        # Per-block source matching + materialization (block rows configs).
+        def match_block_sources(block_cfg: dict, label: str) -> list[dict]:
+            rows_cfg = block_cfg.get("rows") or {}
+            if rows_cfg.get("sources"):
+                src_specs = [
+                    {"source": s.get("source"), "selectors": s.get("selectors") or []}
+                    for s in rows_cfg["sources"]
+                ]
+            else:
+                src_specs = [{"source": rows_cfg.get("source"),
+                              "selectors": rows_cfg.get("selectors") or []}]
+            if any(not s["source"] for s in src_specs):
+                fail("SPEC_SOURCE_CSV", f"{label}: every rows.sources entry needs a flattened source name",
+                     "Reference flattened entry names from the manifest")
+            out = []
+            for src_spec in src_specs:
+                src_name = src_spec["source"]
+                src_entry = manifest_flat.get(src_name)
+                if src_entry is None:
+                    fail("SPEC_SOURCE_CSV", f"{label}: rows source {src_name!r} not among flattened sources",
+                         "Reference the flattened entry name from the manifest (e.g. the "
+                         "name field of a flattened sheet, not the csv filename)")
+                src_rows = load_csv_rows(workdir / src_entry["csv"])
+                # Selectors match SOURCE rows — validate their column letters
+                # against the SOURCE's own width, not the target's (the MXP case:
+                # 27-col source into a 6-col target made L selectors fail).
+                src_width = max((len(r[0]) for r in src_rows), default=num_cols)
+                try:
+                    matched = apply_selectors(src_rows, src_spec, src_width)
+                except ValueError as e:
+                    fail("SELECTOR_INVALID", f"{label}/{src_name}: {e}", "Fix the row selectors")
+                if not matched:
+                    fail("NO_MATCHED_ROWS", f"{label}: selectors matched zero rows in {src_name}",
+                         "Fix selectors or check the source flatten")
+                # issue 02 / Case 08 U1: 展平 CSV 首行（表头）是候选数据行 — rows
+                # 无 selector（或 selector 未排除）且首行是表头文本行时, 表头会被
+                # 映射进数据区 (失败语义不变, 记 warnings)。corrective_action 指向
+                # pattern/not_pattern 排除表头行。
+                if src_rows and is_header_text_row(src_rows[0][0]):
+                    first_orig = src_rows[0][1]
+                    if any(o == first_orig for _, o in matched):
+                        first_label = next((str(c) for c in src_rows[0][0]
+                                            if str(c).strip()), "")
+                        warnings.append({
+                            "code": "HEADER_ROW_CONSIDERED_DATA",
+                            "source": src_name,
+                            "message": f"{label}: source {src_name!r} 的展平 CSV 首行"
+                                       f"（表头文本 {first_label!r}）被当作候选数据行 — "
+                                       "rows 无 selector（或 selector 未排除首行）时表头会被"
+                                       "映射进数据区",
+                            "corrective_action": "在 rows.selectors 加 pattern/not_pattern "
+                                                 "排除表头行 (如 `column A pattern 业务类别*` "
+                                                 "或 `column A not_value 类别`)",
+                        })
+                out.append({"name": src_name, "csv": src_entry["csv"], "rows": src_rows,
+                            "matched": matched})
+            return out
+
+        lookups = build_lookup_tables(spec["mapping"], target_cfg, workdir)
+        transforms = build_transforms(spec["mapping"], target_cfg)
+        lookup_stats: dict = {}
+
+        # Materialize per block and attach block data (rows, source, block index).
+        block_infos: list[dict] = []
+        data_rows: list[dict] = []
+        matched_all: list[dict] = []
+        for bi, bcfg in enumerate(blocks_cfg):
+            label = f"block[{bi}]"
+            matched = match_block_sources(bcfg, label)
+            materialized = materialize_values(
+                [r for m in matched for r in m["matched"]], bcfg, num_cols,
+                lookups, transforms, defects, lookup_stats)
+            drs = []
+            # map materialized rows back to their source csv
+            src_of = []
+            for m in matched:
+                src_of.extend([m["csv"]] * len(m["matched"]))
+            for dr, src in zip(materialized, src_of):
+                dr["src"] = src
+                drs.append(dr)
+            if not defects:
+                apply_precision_policy(bcfg, drs, defects, warnings,
+                                       col_widths=target_meta.get("column_width") or {},
+                                       col_numfmt=target_meta.get("column_numfmt") or {})
+            if defects:
+                fail("MATERIALIZE_DEFECTS", f"{len(defects)} value materialization defect(s)",
+                     "Fix the column mappings/lookups/transforms", defects)
+            data_rows.extend(drs)
+            matched_all.extend(matched)
+            block_infos.append({"cfg": bcfg, "rows": drs, "count": len(drs),
+                                "matched": matched, "label": label})
+
+        note_lookup_all_missing(lookup_stats, warnings)
+
+        for b in block_infos:
+            b["cfg"]["_rows"] = b["rows"]
+
+        roles, data_starts = compute_layout(blocks_cfg, platform, target_cfg,
+                                            defects, dims.get("rows"))
+        for b, start in zip(block_infos, data_starts):
+            b["data_start"] = start
+        for b in block_infos:
+            ip_role = next((r for r in b["cfg"].get("clone_roles", [])
+                            if r.get("mode") == "inplace"), None)
+            if ip_role:
+                b["inplace"] = {
+                    "start_row": ip_role.get("start_row"),
+                    "capacity": ip_role.get("capacity"),
+                    "template_row": ip_role.get("template_row"),
+                    "region_end": ip_role.get("start_row") + ip_role.get("capacity") - 1,
+                }
+                # 锚点样式继承 (Case 010 盲区): inplace 组锚点可能落在旧合并区
+                # 非锚点格 (无字体样式) — 采集占位区内同列既有锚点样式, 供
+                # _emit_block_ops 合并进 merge op (spec 显式 styles 优先)。
+                region = (b["inplace"]["start_row"], b["inplace"]["region_end"])
+                merge_cols = {g.get("col") for g in b["cfg"].get("group_merges", [])}
+                merge_cols |= {m.get("col") for m in b["cfg"].get("merges", [])}
+                b["inherited_styles"] = {
+                    col: inherited_anchor_style(target_meta, col, *region)
+                    for col in merge_cols if col
+                }
+        validate_inplace_geometry(blocks_cfg, ip_ctx, roles,
+                                  target_cfg.get("base_last_row", 0), defects)
+
+        style_defaults = {
+            "anchor": dict(STYLE_DEFAULTS["anchor"], **(target_cfg.get("styles") or {}).get("anchor", {})),
+            "label": dict(STYLE_DEFAULTS["label"], **(target_cfg.get("styles") or {}).get("label", {})),
+        }
+
+        if platform == "pptx":
+            if any(inplace_roles(b) for b in blocks_cfg):
+                defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                "message": "mode: inplace is meaningless for pptx — the "
+                                           "pptx model is already pre-built-row fills",
+                                "corrective_action": "Drop mode: inplace from the pptx spec"})
+            for b in block_infos:
+                cfg = b["cfg"]
+                label = b["label"]
+                # fail-closed (issue 06): every declaration the pptx lowering does
+                # NOT implement must be rejected here — build_ops_pptx only lowers
+                # column value fills + DOM-path sets, everything else was silently
+                # dropped (compile passed, no ops generated).
+                if cfg.get("group_merges"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: group_merges lowering for pptx "
+                                               "(vMerge/rowspan mechanics) is staged: verify "
+                                               "against the spike fixture before rollout",
+                                    "corrective_action": "Use xlsx for group_merges, or wait "
+                                                          "for the pptx lowering rollout"})
+                if cfg.get("formulas", {}).get("group_aggregates"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: group_aggregates lowering for "
+                                               "pptx is staged — formula cells are xlsx-only; "
+                                               "verify against the spike fixture before rollout",
+                                    "corrective_action": "Use xlsx for group_aggregates, or "
+                                                         "wait for the pptx lowering rollout"})
+                if cfg.get("formulas", {}).get("per_row"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: formulas.per_row lowering for pptx "
+                                               "is not rolled out — pptx cells hold text, "
+                                               "not formulas",
+                                    "corrective_action": "Use xlsx for per_row formulas, or "
+                                                         "precompute the derived values into "
+                                                         "column mappings"})
+                if cfg.get("formulas", {}).get("aggregates"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: formulas.aggregates lowering for "
+                                               "pptx is not rolled out — formula cells are "
+                                               "xlsx-only",
+                                    "corrective_action": "Use xlsx for aggregates, or "
+                                                         "precompute the aggregate values"})
+                if cfg.get("merges"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: merges lowering for pptx is not "
+                                               "rolled out — pptx merge mechanics differ "
+                                               "(vMerge/rowspan spike pending)",
+                                    "corrective_action": "Use xlsx for merges, or drop the "
+                                                         "declaration"})
+                if cfg.get("nulls"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: nulls is meaningless for pptx — "
+                                               "there is no clone residue to clear (rows are "
+                                               "pre-built, nothing is cloned)",
+                                    "corrective_action": "Drop nulls from the pptx spec"})
+                if cfg.get("remove_rows"):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: remove_rows lowering for pptx is "
+                                               "not rolled out — pptx has no structural row "
+                                               "ops",
+                                    "corrective_action": "Drop remove_rows from the pptx spec"})
+                if any(col.get("props") for col in cfg.get("columns", [])):
+                    defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": f"{label}: columns[].props (numberformat) is "
+                                               "not applied on pptx — pptx cells are text "
+                                               "and carry no number format",
+                                    "corrective_action": "Drop props from pptx column "
+                                                         "mappings"})
+            if defects:
+                fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                     "Fix the spec and re-run compile_fill.py", defects)
+            ops, readback, written = build_ops_pptx(target_cfg, roles, data_rows,
+                                                    num_cols, defects)
+            group_boundaries: list = []
+            trim_count = 0
+            set_records = _emit_sets(target_cfg, None, None, None, ops,
+                                     lambda p, k, v: _pptx_register(p, k, v, written,
+                                                                   readback, defects),
+                                     defects, dims.get("rows", 0), num_cols)
+        else:
+            anchors = {a["anchor"] for a in target_meta.get("merge_anchors", [])}
+            anchor_rows = {int(re.search(r"\d+$", a).group()) for a in anchors}
+            whole_run_gated = False
+            for b in block_infos:
+                cfg = b["cfg"]
+                validate_nulls_rows(cfg, defects)  # 先于任何 parse_rel_rows 调用
+                if any(d.get("code") == "NULLS_ROWS_INVALID" for d in defects):
+                    fail("STATIC_VALIDATION_FAILED",
+                         f"{len(defects)} static validation defect(s)",
+                         "Fix the nulls rows specs and re-run compile_fill.py", defects)
+                template_row = next((r.get("template_row") for r in cfg.get("clone_roles", [])
+                                     if r.get("role") == "data"), None)
+                if template_row is None:
+                    fail("SPEC_DATA_CLONE", f"{b['label']}: xlsx data blocks need a "
+                         "data clone_role with template_row",
+                         "Add {role: data, template_row: N} to the block's clone_roles")
+                if template_row in anchor_rows:
+                    defects.append({"code": "CLONE_SOURCE_IS_ANCHOR",
+                                    "template_row": template_row,
+                                    "message": f"{b['label']}: template row {template_row} is a "
+                                               "merge anchor; cloning it carries anchor formulas "
+                                               "into non-anchor cells",
+                                    "corrective_action": "Pick a non-anchor data row with the same format"})
+                null_specs = {x["col"]: x.get("rows") for x in cfg.get("nulls", [])}
+                per_row = cfg.get("formulas", {}).get("per_row", {})
+                gm_cols = {g.get("col") for g in cfg.get("group_merges", [])}
+                validate_clone_residue(cfg, template_row,
+                                       workdir / manifest_target["csv"], num_cols,
+                                       cfg.get("columns", []), null_specs, per_row,
+                                       b["count"], defects, gm_cols)
+                if b.get("inplace"):
+                    # Double residue baseline: retained rows checked against
+                    # each row's OWN values; overflow clone rows against template_row
+                    # (covered by validate_clone_residue above).
+                    validate_placeholder_residue(
+                        cfg, b["inplace"]["start_row"], b["inplace"]["capacity"],
+                        b["count"], workdir / manifest_target["csv"], num_cols,
+                        b["rows"], defects)
+                validate_formula_references(cfg.get("formulas", {}), b["count"], defects)
+                ga_entries, ga_whole_run = split_group_aggregates(
+                    cfg.get("formulas", {}).get("group_aggregates"), defects, b["label"])
+                if ga_whole_run and not whole_run_gated:
+                    whole_run_gated = True
+                    defects.append({"code": "CAPABILITY_NOT_ROLLED_OUT",
+                                    "message": "group_aggregates.whole_run (跨块总计) 落点"
+                                               "语义 (末块尾部 vs 独立行) 需一次 spike 锁定 — "
+                                               "spike 前声明被结构化拒绝",
+                                    "corrective_action": "用逐块块级 aggregates (每组合一块) "
+                                                         "表达, 或等 whole_run spike 结论"
+                                                         "落地后再声明"})
+                for col in (set(per_row) | set(null_specs)
+                            | {m.get("col") for m in cfg.get("merges", [])}
+                            | gm_cols
+                            | {g.get("col") for g in ga_entries}
+                            | {g.get("group_by") for g in ga_entries if g.get("group_by")}
+                            | {g.get("group_by") for g in cfg.get("group_merges", []) if g.get("group_by")}):
+                    if col and col_letter_to_idx(col) >= num_cols:
+                        defects.append({"code": "COL_OUT_OF_DIGEST", "col": col,
+                                        "message": f"{b['label']}: column {col} beyond digest width {num_cols}",
+                                        "corrective_action": "Check the target structure"})
+            if target_cfg.get("base_last_row", 0) > dims.get("rows", 0):
+                defects.append({"code": "BASE_ROW_OUT_OF_BOUNDS",
+                                "message": f"base_last_row {target_cfg['base_last_row']} > digest rows {dims.get('rows')}",
+                                "corrective_action": "Use the digest's row count"})
+            validate_append_remove_zone(blocks_cfg,
+                                        target_cfg.get("base_last_row", 0), defects)
+            row_gaps = sorted(set(target_meta.get("row_gaps") or []))
+            if row_gaps:
+                for role in roles:
+                    if role.get("mode") in ("inplace", "overflow_clone"):
+                        continue
+                    r = role.get("row")
+                    trow = role.get("template_row")
+                    # 锚点链: data/title/header 克隆 add after /row[r-1]; spacer 无 after.
+                    anchor = (r - 1) if (isinstance(r, int) and role.get("kind") != "spacer") else None
+                    for a, kind in ((anchor, "add anchor (after)"), (trow, "clone source (from)")):
+                        if a in row_gaps:
+                            defects.append({
+                                "code": "TEMPLATE_ROW_GAP",
+                                "row": a,
+                                "kind": kind,
+                                "message": f"role {role.get('kind','?')} at row {r}: "
+                                           f"{kind} row {a} is a row-number gap in the target "
+                                           f"sheet (row elements: missing {row_gaps}) — officecli "
+                                           f"`add after/from /row[{a}]` would fail at runtime",
+                                "corrective_action": "Materialize the missing row "
+                                                     "elements (scripts/repair_row_gaps.py "
+                                                     "--workdir <dir> — fingerprints "
+                                                     "auto re-synced), then update the "
+                                                     "spec target_structure fingerprint "
+                                                     "(or --patch-spec) and recompile",
+                            })
+            if defects:
+                fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                     "Fix the spec and re-run compile_fill.py", defects)
+
+            ops, readback, written, group_boundaries, trim_count, set_records = \
+                build_ops_xlsx(target_cfg, block_infos, roles, data_rows, num_cols,
+                               style_defaults, defects, sheet_rows=dims.get("rows", 0))
+            if defects:
+                fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                     "Fix the spec and re-run compile_fill.py", defects)
+
+    # Bulk source-derived literal-sets audit (ticket 06 / D6) — compile-audit
+    # ONLY, never a routing basis (spec 的记录数量阈值禁令只约束 routing)。对
+    # 两条路径都生效 — blocks:[] + 大量 literal sets 正是被审计的病理形态。
+    audit_bulk_literal_fallback(target_cfg, manifest, workdir, warnings, defects)
 
     if not ops:
         fail("PLAN_EMPTY", "compilation produced zero operations",
@@ -2969,6 +3632,17 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
              "declarations — there is no reuse syntax yet")
 
     cov_entries = []
+    if matrix_ctx is not None:
+        # matrix 覆盖报告: 请求的字段标签全部解析 (每标签 × 每 record 列 = 每
+        # 格一层 lineage); required_coverage 对 matrix 无意义 (编译期已拒绝)。
+        cov_entries.append({
+            "block": "matrix",
+            "source": matrix_ctx["src_entry"]["csv"],
+            "name": matrix_ctx["src_entry"]["name"],
+            "total": len(matrix_ctx["field_map"]),
+            "matched": len(matrix_ctx["field_map"]),
+            "required_unmatched": [],
+        })
     for bi, b in enumerate(block_infos):
         for m in b["matched"]:
             matched_origs = [d["orig"] for d in b["rows"] if d["src"] == m["csv"]]
@@ -3060,6 +3734,30 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     else:
         render_region = f"/{target_cfg['sheet']}"
 
+    matrix_meta = None
+    if matrix_ctx is not None:
+        matrix_meta = {
+            "source": matrix_ctx["src_entry"]["name"],
+            "target_sheet": target_cfg["sheet"],
+            "orientation": dict(MATRIX_AXES),
+            "field_map": [
+                {"source": fe["source"], "target": fe["target"],
+                 "transform_chain": _matrix_transform_names(fe)}
+                for fe in matrix_ctx["field_map"]],
+            "record_map": [
+                {"record": r["record"], "source_column": r["source_column"],
+                 "target_column": r["target_column"]}
+                for r in matrix_ctx["record_map"]],
+        }
+    plan_writes = [
+        {"row": trow, "col": col, "value": val}
+        for drow, (_, _, trow) in zip(data_rows, row_map)
+        for col, val in drow["values"].items()
+    ]
+    for c in matrix_cells:
+        plan_writes.append({"row": c["target_row"], "col": c["target_col"],
+                            "value": c["value"]})
+
     plan = {
         "schema_version": "2.5",  # v3 保留给 plugin-化世代
         "fill_spec": None,
@@ -3086,11 +3784,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         "source_coverage": cov_entries,
         "row_map": row_map,
         "warnings": warnings,
-        "writes": [
-            {"row": trow, "col": col, "value": val}
-            for drow, (_, _, trow) in zip(data_rows, row_map)
-            for col, val in drow["values"].items()
-        ],
+        "writes": plan_writes,
         "empties": [rb["path"] for rb in readback if rb["kind"] == "empty"],
         "key_outputs": key_outputs,
         "expected_final_row_count": expected_final_row_count,
@@ -3099,6 +3793,10 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                               "inplace_overflow": inplace_overflow},
         "group_boundaries": group_boundaries,
         "sets": set_records,
+        # Ticket 06: matrix 一等表达元数据 + 每条写入的 source lineage —
+        # {target, source, transform_chain} 聚合 (mirrors source_trace.json)。
+        "matrix": matrix_meta,
+        "source_trace": source_trace,
         "mechanical_facts": derive_mechanical_facts(
             ops, target_cfg, blocks_cfg, block_infos),
         "render_qa": {"region": render_region},
@@ -3219,6 +3917,13 @@ def main() -> None:
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     mapping_path = args.workdir / MAPPING_NAME
     mapping_path.write_text(render_mapping(spec, plan, manifest), encoding="utf-8")
+    # Source lineage (ticket 06): 每条 matrix 写入的 {target, source,
+    # transform_chain} 聚合到独立文件 — Gate/语义验证 (ticket 07) 消费;
+    # execution_plan.json 内同源镜像 (plan.source_trace)。
+    if plan.get("source_trace"):
+        (args.workdir / SOURCE_TRACE_NAME).write_text(
+            json.dumps(plan["source_trace"], ensure_ascii=False, indent=2),
+            encoding="utf-8")
 
     record_timing(args.workdir, "compile")
     print(json.dumps({
