@@ -4,6 +4,7 @@ import copy
 import csv
 import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,10 +21,12 @@ import promote_output  # noqa: E402
 from _mod_catalog import parse_mod_index  # noqa: E402
 from _probe_fixtures import (  # noqa: E402
     BASE_SPEC,
+    MATRIX_LOCATOR_BASE_SPEC,
     make_all_missing_lookup_workdir,
     make_empty_lookup_workdir,
     make_egypt_workdir,
     make_header_row_workdir,
+    make_matrix_locator_workdir,
     make_multiproduct_block_workdir,
     make_preformatted_quotation_workdir,
     make_probe_inplace_workdir as make_inplace_workdir,
@@ -4981,6 +4984,234 @@ class CapabilitiesTests(unittest.TestCase):
                          by_id["header_row_excluded_by_selector"]["warnings"])
 
 
+class CapabilityQueryTests(unittest.TestCase):
+    """compile_fill.py --capability <key>: fine-grained capability query (P1-01).
+
+    纯契约查询 — 不读 workdir / workbook / manifest / spec, 任意 cwd 可运行;
+    输出短 JSON {capability, state, constraints, conflicts, reference}。
+    只测外部行为 (subprocess), 不测内部实现函数。"""
+
+    NAMESPACE = ["matrix", "matrix.field_locator", "matrix.record_map",
+                 "matrix.transforms", "matrix.literal_fallback", "inplace",
+                 "inplace.placeholder_ownership", "task.assembly",
+                 "semantic_gate"]
+    STATES = ("SUPPORTED", "REJECTED", "NOT_ROLLED_OUT")
+
+    def _run(self, *argv: str) -> subprocess.CompletedProcess:
+        """从空临时 cwd 运行 (零输入 — 纯契约查询的最强可观察形态)."""
+        with tempfile.TemporaryDirectory() as td:
+            return subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+                 "--capability", *argv],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=td)
+
+    def _query(self, key: str) -> dict:
+        r = self._run(key)
+        self.assertEqual(r.returncode, 0, r.stderr[-500:])
+        return json.loads(r.stdout)
+
+    def test_each_namespace_key_returns_short_json(self):
+        """每个 namespace key: exit 0 + 五字段 JSON; state 三态; constraints/
+        conflicts 是 terse 短串 (非长篇 prose); reference 指向 FILLSPEC;
+        输出短 (无 FILLSPEC 全文 dump)."""
+        for key in self.NAMESPACE:
+            r = self._run(key)
+            self.assertEqual(r.returncode, 0,
+                             f"{key} 应 exit 0: {r.stderr[-500:]}")
+            self.assertLess(len(r.stdout), 4000,
+                            f"{key} 输出应短 (无 FILLSPEC 全文): {len(r.stdout)}")
+            payload = json.loads(r.stdout)
+            self.assertEqual(set(payload), {"capability", "state",
+                                            "constraints", "conflicts",
+                                            "reference"})
+            self.assertEqual(payload["capability"], key)
+            self.assertIn(payload["state"], self.STATES)
+            self.assertTrue(payload["constraints"], f"{key} 缺 constraints")
+            for c in payload["constraints"] + payload["conflicts"]:
+                self.assertIsInstance(c, str)
+                self.assertLess(len(c), 200,
+                                f"{key} 约束串过长 (非 terse): {c!r}")
+            self.assertTrue(payload["reference"].startswith("FILLSPEC#"),
+                            f"{key} reference 应指向 FILLSPEC: "
+                            f"{payload['reference']}")
+
+    def test_pure_contract_query_no_workdir_no_spec(self):
+        """纯契约查询: 空临时 cwd + 零输入 (无 --workdir/--spec) → exit 0,
+        cwd 无任何产物 (不需要 Prepare)."""
+        with tempfile.TemporaryDirectory() as td:
+            r = self._run("matrix")
+            self.assertEqual(r.returncode, 0, r.stderr[-500:])
+            payload = json.loads(r.stdout)
+            self.assertEqual(payload["capability"], "matrix")
+            self.assertEqual(sorted(p.name for p in Path(td).iterdir()), [],
+                             "纯契约查询不得在 cwd 落任何产物")
+
+    def test_unknown_key_exit3_with_available_keys(self):
+        """未知 key → exit 3 + CAPABILITY_KEY_UNKNOWN + available_keys 至少含
+        一个已知 key (短输出, 不 dump FILLSPEC 全文)."""
+        r = self._run("nope")
+        self.assertEqual(r.returncode, 3)
+        payload = json.loads(r.stderr)
+        self.assertEqual(payload["code"], "CAPABILITY_KEY_UNKNOWN")
+        self.assertIn("matrix.field_locator", payload["available_keys"])
+        self.assertLess(len(r.stderr), 1500,
+                        "未知 key 输出应短 (无 FILLSPEC dump)")
+
+    def test_capability_conflicts_with_capabilities_usage_error(self):
+        """--capability 与 --capabilities 组合 → parser-level usage error
+        (exit 2, 不运行任何查询)."""
+        r = self._run("matrix", "--capabilities")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage", r.stderr)
+        self.assertIn("cannot combine", r.stderr)
+
+    def test_capability_conflicts_with_spec_and_workdir_usage_error(self):
+        """--capability 与 --spec / --workdir 组合 → parser-level usage error
+        (纯契约查询不与普通 compile 输入并存)."""
+        for combo in (("--spec", "x.yaml"), ("--workdir", "wd")):
+            r = self._run("matrix", *combo)
+            self.assertEqual(r.returncode, 2,
+                             f"--capability + {combo[0]} 应 usage error")
+            self.assertIn("cannot combine", r.stderr)
+
+    def test_field_locator_answer_reflects_ticket01_rules(self):
+        """matrix.field_locator 回答 ticket 01 真实规则: 三形式 + 0/1/>1
+        fail-closed + guarded row 约束 + match+row INVALID + 确定性 exact
+        identity only (无 fuzzy/regex/LLM/alias)."""
+        payload = self._query("matrix.field_locator")
+        self.assertEqual(payload["state"], "SUPPORTED")
+        text = " ".join(payload["constraints"] + payload["conflicts"])
+        for code in ("MATRIX_FIELD_LOCATOR_AMBIGUOUS",
+                     "MATRIX_FIELD_LOCATOR_NOT_FOUND",
+                     "MATRIX_FIELD_ROW_GUARD_REQUIRED",
+                     "MATRIX_FIELD_ROW_GUARD_MISMATCH",
+                     "MATRIX_FIELD_ROW_OUT_OF_RANGE",
+                     "MATRIX_FIELD_LOCATOR_INVALID"):
+            self.assertIn(code, text, f"query 缺缺陷码 {code}")
+        for word in ("legacy 单标签", "match", "row: N, expect"):
+            self.assertIn(word, text, f"query 缺三形式词 {word!r}")
+        for word in ("fuzzy", "regex", "LLM", "alias", "exact identity"):
+            self.assertIn(word, text, f"query 缺确定性边界词 {word!r}")
+
+
+class CapabilityQueryConsistencyTests(unittest.TestCase):
+    """契约与行为一致 (P1-01 AC, 本票最重要的断言): 查询声称的规则必须与真实
+    compile 行为一致 — 用真实 duplicate-label fixture (make_matrix_locator_workdir)
+    编译验证; literal_fallback 状态与 MATRIX_ROLLOUT 活常量一致 (drift guard);
+    查询与 FILLSPEC matrix 章节措辞同源。"""
+
+    def _query(self, key: str) -> dict:
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+                 "--capability", key],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=td)
+            self.assertEqual(r.returncode, 0, r.stderr[-500:])
+            return json.loads(r.stdout)
+
+    def _locator_fail_codes(self, field_map) -> list[str]:
+        """真实层级参数表 fixture (A=section 重复 / B=sub-label 重复 /
+        C=unit 消歧) 上编译 field_map, 返回缺陷码列表."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            wd = make_matrix_locator_workdir(tmp)
+            wd["workdir"] = tmp
+            spec = copy.deepcopy(MATRIX_LOCATOR_BASE_SPEC)
+            spec["fingerprints"] = {
+                "source_structure": wd["manifest"]["fingerprints"]["source_structure"],
+                "target_structure": wd["manifest"]["fingerprints"]["target_structure"]}
+            spec["mapping"]["targets"][0]["matrix"]["field_map"] = field_map
+            spec["validation"]["key_outputs"] = []
+            return compile_fail_codes(wd, spec)
+
+    def test_query_duplicate_rejected_matches_real_compile(self):
+        """查询声称 duplicate → REJECTED (AMBIGUOUS): 真实 legacy 重复
+        `source: Cooling` compile 必须 FAIL exit 3 MATRIX_FIELD_LOCATOR_AMBIGUOUS
+        (禁首命中 — 若查询说谎或编译器回退首命中, 本测试变红)."""
+        payload = self._query("matrix.field_locator")
+        text = " ".join(payload["constraints"] + payload["conflicts"])
+        self.assertIn("MATRIX_FIELD_LOCATOR_AMBIGUOUS", text)
+        codes = self._locator_fail_codes(
+            [{"source": "Cooling", "target": "Cooling"}])
+        self.assertIn("MATRIX_FIELD_LOCATOR_AMBIGUOUS", codes)
+
+    def test_query_composite_underdisambiguated_matches_real_compile(self):
+        """查询声称消歧不足的 match → REJECTED (AMBIGUOUS): 真实
+        A=Cooling+B=Capacity 命中两行 → compile FAIL MATRIX_FIELD_LOCATOR_AMBIGUOUS."""
+        payload = self._query("matrix.field_locator")
+        text = " ".join(payload["constraints"] + payload["conflicts"])
+        self.assertIn("MATRIX_FIELD_LOCATOR_AMBIGUOUS", text)
+        codes = self._locator_fail_codes(
+            [{"source": {"match": {"A": "Cooling", "B": "Capacity"}},
+              "target": {"match": {"A": "Cooling", "B": "Capacity"}}}])
+        self.assertIn("MATRIX_FIELD_LOCATOR_AMBIGUOUS", codes)
+
+    def test_literal_fallback_state_matches_live_rollout_constant(self):
+        """matrix.literal_fallback 状态由 MATRIX_ROLLOUT 活常量派生: 测试读同一
+        常量断言状态 — 常量被翻转 (fail_closed=True) 时状态同向变化, 不会静默
+        漂移 (drift guard)."""
+        payload = self._query("matrix.literal_fallback")
+        expected = ("SUPPORTED"
+                    if compile_fill.MATRIX_ROLLOUT["literal_fallback_fail_closed"]
+                    else "NOT_ROLLED_OUT")
+        self.assertEqual(payload["state"], expected)
+        self.assertIn("BULK_SOURCE_DERIVED_LITERAL_FALLBACK",
+                      " ".join(payload["constraints"] + payload["conflicts"]))
+
+    def test_field_locator_never_claims_fuzzy_regex_llm(self):
+        """matrix.field_locator 不得声称 fuzzy/regex/LLM/alias 支持 — 查询显式
+        把它们列为排除 (确定性 exact identity only)."""
+        payload = self._query("matrix.field_locator")
+        text = " ".join(payload["constraints"] + payload["conflicts"])
+        for word in ("fuzzy", "regex", "LLM", "alias"):
+            self.assertIn(word, text)
+        self.assertIn("exact identity", text)
+        self.assertIn("无", text)  # 显式否定词
+
+    def test_unknown_key_message_lists_known_keys(self):
+        """未知 key → exit 3 + CAPABILITY_KEY_UNKNOWN + key 列表至少含一个
+        已知 key (短路不产生有用答案的拼写错误)."""
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "compile_fill.py"),
+                 "--capability", "matrix.bogus"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=td)
+            self.assertEqual(r.returncode, 3)
+            payload = json.loads(r.stderr)
+            self.assertEqual(payload["code"], "CAPABILITY_KEY_UNKNOWN")
+            self.assertTrue(payload["available_keys"])
+            self.assertIn("matrix", payload["available_keys"])
+
+    def test_fillspec_matrix_three_forms_consistent_with_query(self):
+        """FILLSPEC matrix 章节三形式 + fail-closed 措辞与查询输出同源: 查询
+        提及与 FILLSPEC 相同的缺陷码/形式词; literal fallback 开关措辞两侧
+        一致 (drift guard — 文档与查询不得漂移)."""
+        payload = self._query("matrix.field_locator")
+        qtext = " ".join(payload["constraints"] + payload["conflicts"])
+        fillspec = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+            encoding="utf-8")
+        m = re.search(r"^### 矩阵映射 \(matrix\).*?(?=^### )", fillspec,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "FILLSPEC 缺矩阵映射小节")
+        section = m.group(0)
+        for code in ("MATRIX_FIELD_LOCATOR_AMBIGUOUS",
+                     "MATRIX_FIELD_LOCATOR_NOT_FOUND",
+                     "MATRIX_FIELD_ROW_GUARD_MISMATCH",
+                     "MATRIX_FIELD_ROW_OUT_OF_RANGE",
+                     "MATRIX_FIELD_ROW_GUARD_REQUIRED",
+                     "MATRIX_FIELD_LOCATOR_INVALID"):
+            self.assertIn(code, section, f"FILLSPEC 矩阵小节缺 {code}")
+            self.assertIn(code, qtext, f"能力查询缺 {code}")
+        self.assertIn("literal_fallback_fail_closed", section)
+        self.assertIn("BULK_SOURCE_DERIVED_LITERAL_FALLBACK", section)
+        lf = self._query("matrix.literal_fallback")
+        self.assertIn("BULK_SOURCE_DERIVED_LITERAL_FALLBACK",
+                      " ".join(lf["constraints"] + lf["conflicts"]))
+
+
 class ProbeScaffoldTests(unittest.TestCase):
     """make_probe_spec.py: skeleton spec with fingerprints/inputs auto-filled
     from the manifest — the boilerplate elimination that makes --probe cheap."""
@@ -5166,6 +5397,20 @@ class DocCoverageGuardTests(unittest.TestCase):
         section = self._fillspec_section("能力映射表")
         for word in ("一等", "变通", "暂无"):
             self.assertIn(word, section)
+
+    def test_fillspec_capability_query_stub(self):
+        """FILLSPEC 矩阵映射小节后有「能力查询 (capability query)」stub (P1-01
+        reference 目标): `--capability` / CAPABILITY_KEY_UNKNOWN / 三态词在 —
+        查询的 reference 字段指向一个读者能找到的锚点."""
+        text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(encoding="utf-8")
+        m = re.search(r"^### 能力查询 \(capability query\)", text, re.MULTILINE)
+        self.assertIsNotNone(m, "FILLSPEC.md 缺 ### 能力查询 (capability query) stub")
+        nxt = re.search(r"^### ", text[m.end():], re.MULTILINE)
+        section = text[m.end():m.end() + (nxt.start() if nxt else len(text))]
+        for word in ("--capability", "CAPABILITY_KEY_UNKNOWN",
+                     "SUPPORTED | REJECTED | NOT_ROLLED_OUT",
+                     "matrix.field_locator"):
+            self.assertIn(word, section, f"能力查询 stub 缺词 {word!r}")
 
     def test_fillspec_error_code_table_has_duplicate_target_write(self):
         """DUPLICATE_TARGET_WRITE 必须在「常见编译错误速查」表内 (防章节误删)."""

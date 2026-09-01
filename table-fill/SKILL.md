@@ -477,7 +477,11 @@ round4); 列宽未知 → 豁免 + `PRECISION_KEEP_WIDTH_UNVERIFIED` 警告。
   Table Fill / Prepare / Compiler / Executor / OfficeCLI 机制行为) 时, 才按需
   读取 `references/CAPABILITY_EVIDENCE.md` (唯一详细 policy 源) 并沿其终局
   算法执行:
-  1. 找与问题有直接 **Evidence Fit** 的 Standard Evidence Path (支持/拒绝/
+  1. **机制语法/细粒度边界问题** (如 "matrix.field_locator 支持什么语法?") →
+     **直接运行** `python scripts/compile_fill.py --capability <key>` → 短 JSON
+     dispositive 答案 → **停止探索** (不再读 FILLSPEC 全文 / tests / probe /
+     rescue; 见 references/CAPABILITY_EVIDENCE.md §2 新行)。其余问题找与问题有
+     直接 **Evidence Fit** 的 Standard Evidence Path (支持/拒绝/
      rollout 状态 → capability contract / `compile_fill.py --capabilities`;
      OfficeCLI 接口 → `officecli help`; 同形机械陷阱 → KNOWN_TRAPS;
      Draft 值/结构/渲染 → readback / 结构验证 / Render QA);

@@ -1858,6 +1858,189 @@ MATRIX_BLOCK_SEMANTICS_KEYS = ("clone_roles", "rows", "columns", "formulas",
 # >1 → MATRIX_FIELD_LOCATOR_AMBIGUOUS (替换旧"首命中"; deterministic ≠
 # unambiguous)。旧 MATRIX_FIELD_LABEL_NOT_FOUND 收敛进 LOCATOR_NOT_FOUND。
 
+# ── Capability namespace (P1-01 fine-grained capability query) ──────────
+# 单一事实源: `--capability <key>` 的应答由本结构派生 — 每条 key 的约束尽量由
+# 既有常量/schema 派生 (MATRIX_ROLLOUT / MATRIX_AXES / locator 三形式与缺陷码族
+# / transform 名; 来源注释在每个 key 下方), 无常量的 key 用 terse 约束串。
+# `--capabilities` (PROBE_CASES 探针矩阵)、FILLSPEC 能力表、contract tests 与
+# 本表共同验证同一份契约 — 不允许第二份手写真相。
+
+def _capability_literal_fallback() -> dict:
+    """matrix.literal_fallback 状态直接由 MATRIX_ROLLOUT 活常量派生 (D8):
+    翻转开关本 key 自动换态, 不维护第二份真相。当前 False → NOT_ROLLED_OUT
+    (bulk source-derived literal sets 仍是编译警告)。"""
+    fail_closed = MATRIX_ROLLOUT["literal_fallback_fail_closed"]
+    return {
+        "state": "SUPPORTED" if fail_closed else "NOT_ROLLED_OUT",
+        "constraints": [
+            ("fail-closed 已启用 (MATRIX_ROLLOUT.literal_fallback_fail_closed=True): "
+             "大量 source-derived literal sets → BULK_SOURCE_DERIVED_LITERAL_FALLBACK "
+             "(exit 3); 正确路径 = matrix 物化"
+             if fail_closed else
+             "fail-closed 未启用 (MATRIX_ROLLOUT.literal_fallback_fail_closed=False): "
+             "大量 source-derived literal sets 烘焙成绝对坐标 → 编译警告 "
+             "BULK_SOURCE_DERIVED_LITERAL_FALLBACK (warn-only, 不禁止)"),
+            "审计条件: 值型 sets 条数 ≥ BULK_LITERAL_MIN_TOTAL 且 ≥ "
+            "BULK_LITERAL_SOURCE_DERIVED_RATIO 的字面值出现在任一展平源 CSV 值池",
+        ],
+        "conflicts": [
+            "bulk literal sets 绕开 grid 不是主填充路径 (matrix 物化优先; "
+            "BULK_SOURCE_DERIVED_LITERAL_FALLBACK)",
+        ],
+        "reference": "FILLSPEC#矩阵映射-matrix",
+    }
+
+
+CAPABILITY_CONTRACT: dict[str, dict] = {
+    "matrix": {
+        "state": "SUPPORTED",
+        # 派生: MATRIX_AXES (field_axis=rows / record_axis=columns) +
+        # grid_record 形状 (SKILL §1.5); 非 (rows, columns) 朝向 → 编译缺陷
+        # MATRIX_ORIENTATION_NOT_ROLLED_OUT (_matrix_axes_ok)。
+        "constraints": [
+            f"grid_record 的 column-record matrix: field_axis={MATRIX_AXES['field_axis']} "
+            f"/ record_axis={MATRIX_AXES['record_axis']} (canonical matrix shape)",
+            "二维映射用 mapping.targets[].matrix 一等表达 (field_map × record_map "
+            "→ 目标格) + source lineage (plan.source_trace / source_trace.json)",
+            "matrix 目标禁与 clone_roles/rows/columns/formulas/merges/group_merges/"
+            "nulls/remove_rows/blocks/base_last_row 并存 → MATRIX_MIXED_WITH_BLOCK_SEMANTICS",
+        ],
+        "conflicts": [
+            "其它轴朝向 → REJECTED (MATRIX_ORIENTATION_NOT_ROLLED_OUT)",
+            "matrix + pptx 目标 → REJECTED (PPTX_CAPABILITY_NOT_ROLLED_OUT)",
+        ],
+        "reference": "FILLSPEC#矩阵映射-matrix",
+    },
+    "matrix.field_locator": {
+        "state": "SUPPORTED",
+        # 派生: ticket 01 locator V2 — _locator_structure_ok (三形式 +
+        # MATRIX_FIELD_LOCATOR_INVALID / ROW_GUARD_REQUIRED) +
+        # _resolve_matrix_row (0/1/>1 fail-closed + ROW_OUT_OF_RANGE /
+        # ROW_GUARD_MISMATCH); 确定性 exact identity (D2/D7 边界)。
+        "constraints": [
+            "每侧 locator 三形式可混用: string (legacy 单标签) | "
+            "{match: {列: 文本}} | {row: N, expect: {列: 文本}}",
+            "匹配 = 去首尾空白后精确相等 (trim 后 exact identity), 多列 AND — "
+            "确定性 only, 无 contains/fuzzy/regex/LLM/alias 推断",
+            "0 命中 → MATRIX_FIELD_LOCATOR_NOT_FOUND; 1 → resolve; >1 → "
+            "MATRIX_FIELD_LOCATOR_AMBIGUOUS (禁首命中, fail-closed)",
+            "guard row: row 必配 expect (裸 row → MATRIX_FIELD_ROW_GUARD_REQUIRED); "
+            "行号超界 → MATRIX_FIELD_ROW_OUT_OF_RANGE; 事实与 expect 不符 → "
+            "MATRIX_FIELD_ROW_GUARD_MISMATCH",
+            "match+row 并存 / 空 dict / 非字符串非 dict / 键非 Excel 列字母 → "
+            "MATRIX_FIELD_LOCATOR_INVALID",
+        ],
+        "conflicts": [
+            "duplicate label → REJECTED (MATRIX_FIELD_LOCATOR_AMBIGUOUS) — "
+            "单标签重复必须消歧 (composite 加列 / row+expect 守卫)",
+            "消歧不足的 match 命中 >1 行 → REJECTED (MATRIX_FIELD_LOCATOR_AMBIGUOUS)",
+        ],
+        "reference": "FILLSPEC#矩阵映射-matrix",
+    },
+    "matrix.record_map": {
+        "state": "SUPPORTED",
+        # 派生: record_map 条目 = {record, source_column, target_column}
+        # (validate_matrix); 写集只落在 record_map 声明的 target_column;
+        # 列字母非法/超宽 → MATRIX_COLUMN_INVALID (与 locator 列同规则),
+        # 缺必要字段 → MATRIX_RECORD_MAP_INVALID。
+        "constraints": [
+            "record_map 条目 = {record, source_column, target_column}",
+            "写集只落在 record_map 声明的 target_column (模板 schema 列 A/B/C 永不在写集)",
+            "列字母非法或超出该侧展平宽 → MATRIX_COLUMN_INVALID (message 标 side)",
+        ],
+        "conflicts": [
+            "条目缺必要字段 → MATRIX_RECORD_MAP_INVALID",
+        ],
+        "reference": "FILLSPEC#矩阵映射-matrix",
+    },
+    "matrix.transforms": {
+        "state": "SUPPORTED",
+        # 派生: 内置 trim / round2 / round4 (round_value) + 自定义函数经
+        # mapping.transforms (build_transforms: regex_replace / strip /
+        # controlled_translation); 未定义名 → TRANSFORM_UNKNOWN (_resolve_transform,
+        # 与 columns[] 同求值路径)。
+        "constraints": [
+            "内置: trim (首尾空白剥离) / round2 / round4 (数值精度)",
+            "自定义函数在 mapping.transforms 定义: controlled_translation (整值精确 "
+            "匹配, 未命中原样通过) / regex_replace / strip",
+            "transform 名未定义 → TRANSFORM_UNKNOWN; 矩阵与列映射共享同一求值路径",
+        ],
+        "conflicts": [
+            "controlled_translation 前若词表键无空白须先 trim (顺序敏感, 确定性)",
+        ],
+        "reference": "FILLSPEC#矩阵映射-matrix",
+    },
+    "matrix.literal_fallback": _capability_literal_fallback(),
+    "inplace": {
+        "state": "SUPPORTED",
+        # 派生: validate_inplace_declaration / validate_inplace_geometry /
+        # build_operations phase 5-6 — 每目标至多一个 inplace 块且必须终末;
+        # 溢出 → 区后 overflow clone add + 编译器推导 Trim; sets 落占位区 → 拒绝
+        # (INPLACE_REGION_OVERLAP / STRUCTURAL_OP_OUT_OF_ZONE 相关)。
+        "constraints": [
+            "mode: inplace 消费既有占位行 (不克隆追加); 每目标至多一个且必须终末块",
+            "溢出 → 区后 overflow clone add + 编译器推导 Trim; 占位残留须显式处理",
+            "pptx 不支持 mode: inplace (PPTX_CAPABILITY_NOT_ROLLED_OUT)",
+        ],
+        "conflicts": [
+            "sets 落在 inplace 占位区 → 拒绝 (区行归 inplace 块所有)",
+        ],
+        "reference": "FILLSPEC#v25-row-layout-mode--inplace-占位区",
+    },
+    "inplace.placeholder_ownership": {
+        "state": "SUPPORTED",
+        # 派生: 终末 inplace 块拥有占位区行 — 前置块结构行/remove 打到占位区 →
+        # INPLACE_REGION_OVERLAP; 前置块 remove_rows ≤ base_last_row →
+        # STRUCTURAL_OP_OUT_OF_ZONE; 残留占位值验证 (validate_placeholder_residue)。
+        "constraints": [
+            "inplace 块拥有占位区行: 区内行操作由编译器推导 (Trim/overflow 克隆)",
+            "前置块结构行/remove_rows 打到占位区 → INPLACE_REGION_OVERLAP",
+            "前置块 remove_rows ≤ base_last_row → STRUCTURAL_OP_OUT_OF_ZONE",
+            "保留/生成的占位残留值必须显式处理 (placeholder residue 验证)",
+        ],
+        "conflicts": [
+            "用户手工行操作进占位区 → REJECTED (编译器 owns 区行)",
+        ],
+        "reference": "FILLSPEC#v25-row-layout-mode--inplace-占位区",
+    },
+    "task.assembly": {
+        "state": "SUPPORTED",
+        # 派生: Task Orchestration — assemble_task.py packaging-only (SKILL
+        # §Task Orchestration / references/TASK_ORCHESTRATION.md); final gate
+        # fail-closed (--set/--confirm/--promote); 无 FILLSPEC 常量 → terse 串。
+        "constraints": [
+            "assemble_task.py 只做 packaging: clone/copy sheet、rename、保留格式",
+            "禁止字段映射 / 业务 transform / lookup / 纠错 / 任何数据语义操作",
+            "多 run 各自通过 Run Gate 后才可组装; final gate fail-closed "
+            "(--set 呈现 / --confirm 正向确认 / --promote 交付)",
+            "每 run 一个命名 sheet; per-run 独立输出始终是合法形态 "
+            "(N 文件, 或 1 workbook / N sheets)",
+        ],
+        "conflicts": [
+            "多 run 绝不并发写同一 final workbook",
+        ],
+        "reference": "FILLSPEC#能力查询-capability-query",
+    },
+    "semantic_gate": {
+        "state": "SUPPORTED",
+        # 派生: SKILL §6 Semantic Gate (双 Gate 分离, 独立 PASS/FAIL) /
+        # semantic_gate.py — 扫最终 XLSX; 声明的 rule_id 必须在 selected MOD
+        # 规则表 (sha256 校验); 任一 violation → exit 3。
+        "constraints": [
+            "semantic_gate.py 扫最终生成的 XLSX (gate 锁定的 validated_draft), "
+            "不是 fill_spec / mapping / plan",
+            "semantic_policy.json 声明的 rule_id 必须在 selected MOD 规则表 "
+            "(sha256 校验), 否则 fail-closed exit 3",
+            "任一 violation → exit 3 (fail-closed); 全绿 → exit 0; "
+            "独立 PASS/FAIL 于 Structural Gate (禁止合并)",
+        ],
+        "conflicts": [
+            "无证据不得宣称 semantic green (receipt 缺失/STALE → UNVERIFIED)",
+        ],
+        "reference": "FILLSPEC#能力查询-capability-query",
+    },
+}
+
 
 def _matrix_axes_ok(block: dict, side: str, defects: list) -> bool:
     if (block.get("field_axis"), block.get("record_axis")) != \
@@ -3840,6 +4023,37 @@ def probe_spec(spec: dict, manifest: dict, workdir: Path) -> dict:
             "defects": []}
 
 
+def query_capability(key: str) -> dict | None:
+    """Fine-grained capability query (P1-01): one answer record for `--capability`.
+
+    纯契约查询 — 只读 CAPABILITY_CONTRACT (单一事实源, 由既有常量/schema 派生),
+    不读 workdir / workbook / manifest / spec, 不需要 Prepare。"""
+    entry = CAPABILITY_CONTRACT.get(key)
+    if entry is None:
+        return None
+    return {
+        "capability": key,
+        "state": entry["state"],
+        "constraints": list(entry.get("constraints", [])),
+        "conflicts": list(entry.get("conflicts", [])),
+        "reference": entry["reference"],
+    }
+
+
+def capability_key_unknown(key: str) -> None:
+    """Unknown capability key → exit 3 + 短 JSON defect (stderr, 同错误契约),
+    答带可用 key 列表 (短输出, 不 dump FILLSPEC 全文)。"""
+    keys = sorted(CAPABILITY_CONTRACT)
+    sys.stderr.write(json.dumps({
+        "status": "ERROR",
+        "code": "CAPABILITY_KEY_UNKNOWN",
+        "message": f"unknown capability key {key!r}",
+        "available_keys": keys,
+        "corrective_action": "Use one of the listed capability keys",
+    }, ensure_ascii=False, indent=2))
+    sys.exit(3)
+
+
 def run_probe_cases(workdir: Path) -> list[dict]:
     """Execute the contract probe matrix (PROBE_CASES) on a fresh synthetic
     workdir and report what the compiler itself accepts/rejects.
@@ -3882,7 +4096,22 @@ def main() -> None:
                         help="run the contract probe matrix and report acceptance per "
                              "combination (the FILLSPEC「组合行为契约」/「能力映射表」claims, "
                              "as the compiler itself sees them)")
+    parser.add_argument("--capability", metavar="KEY",
+                        help="pure contract query: answer one fine-grained capability "
+                             "key from CAPABILITY_CONTRACT (e.g. matrix.field_locator) "
+                             "as short JSON — no workdir/workbook/spec needed")
     args = parser.parse_args()
+
+    if args.capability:
+        if any((args.spec is not None, args.workdir is not None,
+                args.probe, args.capabilities)):
+            parser.error("--capability is a pure contract query — "
+                         "cannot combine with --spec/--workdir/--probe/--capabilities")
+        entry = query_capability(args.capability)
+        if entry is None:
+            capability_key_unknown(args.capability)
+        print(json.dumps(entry, ensure_ascii=False, indent=2))
+        sys.exit(0)
 
     if args.capabilities:
         import tempfile as _tmp
@@ -3900,7 +4129,8 @@ def main() -> None:
         sys.exit(0)
 
     if args.spec is None or args.workdir is None:
-        parser.error("--spec and --workdir are required (or use --capabilities)")
+        parser.error("--spec and --workdir are required "
+                     "(or use --capabilities / --capability <key>)")
 
     spec = load_spec(args.spec)
     manifest = load_manifest(args.workdir)

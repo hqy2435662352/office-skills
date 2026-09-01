@@ -212,6 +212,7 @@ non-dispositive) ≠ 能力状态 (三态) ≠ 工作流动作 (使用/适配/AS
 | Capability Question 域 | Standard Evidence Path | 结论作用域 |
 |---|---|---|
 | 正式支持、明确拒绝、rollout 状态 | capability contract (FILLSPEC 能力映射表等) / `compile_fill.py --capabilities` | 契约声明范围, 可跨 Run |
+| 机制语法/细粒度边界 (locator 三形式、重复 label、transform 名、guard 约束等) | `compile_fill.py --capability <key>` (P1-01 细粒度能力查询; namespace 见 FILLSPEC「能力查询」) | 契约声明范围, 可跨 Run |
 | 当前具体 FillSpec 是否被 Compiler 接受 | **formal compile**; 仅合格架构分叉可用一次 `--probe` (第 3 节) | 当前具体 spec |
 | OfficeCLI 命令、属性、参数、公开元素接口 | `officecli help <format> <element>` | help 直接声明范围 |
 | 已实测 OfficeCLI/机械陷阱 | 直接同形的 KNOWN_TRAPS 条目 | 条目同形事实, 不泛化 |
@@ -307,10 +308,15 @@ defect、复杂组合、首次出现、特性数量多、缺少同形 Canonical 
 在 Capability Question 出现时, 沿以下终局算法执行 (每步结论都以证据作用域
 为限):
 
-1. 找到与问题具有直接 **Evidence Fit** 的 Standard Evidence Path (第 2 节);
-2. **Known Supported** → 直接使用; 正常 Run Verification 仍全部执行;
-3. **Known Rejected** → 不尝试; 寻找 Known Equivalent Adaptation (约束保持);
-4. **Capability Unknown**:
+1. **机制语法/细粒度边界** Capability Question (如 "matrix.field_locator 支持
+   什么语法?") — 若 capability namespace 含该 key → 直接运行
+   `compile_fill.py --capability <key>` (第 2 节新行) → dispositive 答案
+   (state / constraints / conflicts) 即关闭问题 → **停止探索** — 不再读
+   FILLSPEC 全文 / tests / fixture 链 / probe / rescue / 包装;
+2. 找到与问题具有直接 **Evidence Fit** 的 Standard Evidence Path (第 2 节);
+3. **Known Supported** → 直接使用; 正常 Run Verification 仍全部执行;
+4. **Known Rejected** → 不尝试; 寻找 Known Equivalent Adaptation (约束保持);
+5. **Capability Unknown**:
    - a. **非 task-blocking** → 忽略未知, 继续任务;
    - b. **标准流水线可回答** → 继续正常流水线 (compile / draft / readback /
      结构验证 / Render QA) 取得证据;

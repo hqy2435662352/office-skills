@@ -374,6 +374,25 @@ matrix-correct 用法的物化写入不是 sets → 零 literal 告警; 合法�
 转换); validate → Gate assertions (`validation` 三件套, ticket 07 消费)。
 契约测试 `tests/test_matrix_fillspec.py` -> AttentionMapAlignmentTests 背书。
 
+### 能力查询 (capability query)
+
+机制语法/边界问题 (如 "matrix.field_locator 支持什么语法?") 用纯契约查询终结 —
+不读 tests/fixtures、不需 workdir/workbook (应答由 `compile_fill.py` 顶部
+`CAPABILITY_CONTRACT` 派生, 单一事实源, 与 `--capabilities` 探针矩阵 /
+contract tests 同源):
+
+```bash
+python scripts/compile_fill.py --capability matrix.field_locator
+```
+
+输出短 JSON `{capability, state, constraints, conflicts, reference}`; `state` ∈
+`SUPPORTED | REJECTED | NOT_ROLLED_OUT`; 未知 key → exit 3 `CAPABILITY_KEY_UNKNOWN`
++ 可用 key 列表。namespace: `matrix` / `matrix.field_locator` / `matrix.record_map`
+/ `matrix.transforms` / `matrix.literal_fallback` / `inplace` /
+`inplace.placeholder_ownership` / `task.assembly` / `semantic_gate` — 每条应答的
+`reference` 指向本文件对应小节 (组装见 SKILL「Task Orchestration」, 语义门见
+SKILL §6 Execution Gate)。
+
 ### rows: 单源与多源合并
 
 ```yaml
