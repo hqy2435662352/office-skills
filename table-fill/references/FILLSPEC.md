@@ -319,7 +319,7 @@ fill_spec.yaml)。
 **物化契约**: 每个 (field_map[i], record_map[j]) 产生一个目标格 —
 `plan.operations` 是 `set {value}` 写 (与既有 value writes 同形,
 executor / readback / validate 机制零改动), `plan.writes` 数 ==
-|field_map| × |record_map| (契约测试断言); readback 期待由**同一物化过程**
+|field_map| × |record_map| (编译器机械保证); readback 期待由**同一物化过程**
 派生 (禁止手写 checks)。
 
 **source lineage 一等输出 (硬性)**: 每条 matrix 写入携带
@@ -372,7 +372,8 @@ matrix-correct 用法的物化写入不是 sets → 零 literal 告警; 合法�
 **MOD Attention Map 对齐 (D6)**: resolve → `record_map` (哪些 record 被解析
 进目标产品列); map → `field_map`; transform → `transform_chain` (可执行受控
 转换); validate → Gate assertions (`validation` 三件套, ticket 07 消费)。
-契约测试 `tests/test_matrix_fillspec.py` -> AttentionMapAlignmentTests 背书。
+该对齐即契约本身 — 权威 = `compile_fill.py --capability matrix.*` 探针矩阵
+(与本节同源, 不指向具体测试类)。
 
 ### 能力查询 (capability query)
 
@@ -528,8 +529,9 @@ reason `invalid_format` = 不是列字母; `out_of_range` = 列字母超出该 l
 
 ## 组合行为契约 (问题组织式)
 
-> 按 Agent 提问方式组织: 一个问题一小节 + 权威答案。**本章节每条声明都有编译
-> 用例背书** (`tests/test_optimization.py`: FillSpecContractTests) — 文档声称
+> 按 Agent 提问方式组织: 一个问题一小节 + 权威答案。**本章节每条声明都以
+> compile_fill.py 实际编译行为为准**（`--capabilities` / `--capability <key>`
+> 探针矩阵与本节同源）— 文档声称
 > "能编译"必须能编译, 声称"按错误码拒绝"必须按错误码拒绝。FILLSPEC 按特性组织,
 > 本章节按问题组织: 找不到答案时先查这里, **不要读 compile_fill.py 源码**。
 >
@@ -560,7 +562,7 @@ merges + aggregates 对」(聚合锚点=合并锚点, 见 Q12/Q19), 普通标签
 
 > 注: 早期撰写期文档假设"merges × per_row 同列 → DUPLICATE_TARGET_WRITE";
 > 实测 merges 只写 merge 属性、不注册值写入, 同列共存**编译通过**
-> (`test_merges_and_per_row_formula_same_column_ok` 背书) — 按"文档向行为
+> (formal compile 实测) — 按"文档向行为
 > 收敛"原则以实测为准。若未来要求拒绝, 需在 Compiler 侧新增检查 (另开 ticket)。
 
 ### Q2: 算术派生列 (FLD-006 减法) 的标准模式?
@@ -709,7 +711,7 @@ formulas:
 
 | 边界 | 违反 → |
 |---|---|
-| **聚合列不进 `nulls`** | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 逐行清空先注册锚点格 empty, 聚合再写锚点公式注册 nonempty, 锚点双写) — 这是被拒 fixture 的真实触发因素 |
+| **聚合列不进 `nulls`** | ❌ `DUPLICATE_TARGET_WRITE` (特征 "first as empty" — nulls 逐行清空先注册锚点格 empty, 聚合再写锚点公式注册 nonempty, 锚点双写) — 这是被拒 spec 的真实触发因素 |
 | **不与 group_merges 同列** | ❌ `DUPLICATE_TARGET_WRITE` (Q1 — 组锚点写与聚合锚点写都落块首行) |
 | **范围不越块** (rows 相对块内数据行) | ❌ `AGG_RANGE_INVALID` |
 | **不与 per_row 公式同列** | ❌ `DUPLICATE_TARGET_WRITE` (Q1 — 首行锚点格双写) |
@@ -719,10 +721,10 @@ formulas:
   组边界由 group_by 物化值决定) 或 `blocks[]` 每组合一块 + 块级 `1:{n}`
   (见能力映射表「每组合计 (动态边界)」行)。
 - 历史纠偏 (2026-08-13): 曾误判「硬编码范围必然漂移 → 正确路径只有拆块」;
-  实际拒绝 fixture 的触发因素是**聚合列进了 nulls**, 与"硬编码范围"无关 —
-  最小变异实证 (被拒 fixture 只把聚合列移出 nulls 列、其余不动 → 编译通过,
-  `tests/test_optimization.py` → `test_per_group_total_trigger_minimal_mutation`);
-  capabilities 矩阵同时背书通过形态 (`per_group_total_explicit_ranges` = accept)。
+  实际拒绝 spec 的触发因素是**聚合列进了 nulls**, 与"硬编码范围"无关 —
+  最小变异实证 (被拒 spec 只把聚合列移出 nulls 列、其余不动 → formal
+  compile 通过); `compile_fill.py --capabilities` 探针矩阵同时确认通过形态
+  (`per_group_total_explicit_ranges` = accept)。
 
 ### Q14: 每组合计 (group_aggregates) 怎么写？
 
@@ -813,9 +815,9 @@ formulas:
 
 - 修复路径: 值类需求预计算进 `columns`; 公式/合并类需求用 xlsx 平台表达;
   行数不足用 python-pptx **一次性**加行 (禁止在 officecli 操作后重新 import)。
-- 背书: `tests/test_optimization.py` (CapabilityMappingContractTests) +
-  探针矩阵 `pptx_*` 行 + 真实 PPTX E2E (`tests/test_pptx_e2e.py`, 缺模板/
-  officecli 时显式 skip)。
+- 权威: `compile_fill.py --capabilities` 探针矩阵 `pptx_*` 行 (与本节同源) —
+  编译期拒绝即运行时真行为; 真实 PPTX E2E 属 Skill Development 资产, 不在
+  Task Mode 导航内。
 
 ### Q19: `aggregates` / `group_aggregates` 会自动创建合并区吗? 聚合列非锚点残留怎么覆盖?
 
@@ -870,16 +872,15 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
   无害的 scheme=none); 只有旧**非**锚点格 (新组锚点落点) 才需要本次补丁。
 - **`font.color: dk1` 旁注**: 残余的主题深色1 (dk1, 近黑) 与默认文字色一致,
   非缺陷, 不作为清除目标 — 过度归一化反而破坏有意使用的主题配色。
-- 回归测试: `tests/test_optimization.py` AnchorStyleInheritanceTests 断言 inplace
-  锚点 `font.scheme == "none"` 且 plan 声明 `strip_scheme_none`; 无字体样式场景
-  断言不声明; `tests/test_mxp_e2e.py` 端到端断言执行后 draft styles.xml 无
-  scheme val='none' 残留。
+- **契约 (机械事实)**: inplace 合并锚点最终 style `font.scheme == "none"` 且
+  plan 声明 `strip_scheme_none: true`; 无字体样式场景不声明; 执行后 draft
+  styles.xml 无 scheme val='none' 残留 (失败 → `SCHEME_STRIP_FAILED`)。
 
 ## 执行顺序保证 (Execution Order Contract)
 
 > 执行机制疑问 (add 之后 remove 的目标是谁? 执行器会不会重排/翻译?) 的权威
-> 答案 — 答案在本契约, **不要读 compile_fill.py 源码**。每条声明有编译用例
-> 背书 (`tests/test_optimization.py`: ExecutionOrderContractTests)。本契约同时
+> 答案 — 答案在本契约, **不要读 compile_fill.py 源码**。每条声明以
+> compile_fill.py 实际编译行为为准 (执行顺序由编译器机械物化)。本契约同时
 > 派生进每个 plan: execution_plan.json `mechanical_facts` + mapping.md「执行
 > 机械事实」栏由编译器机械计算 (removes 与 add 区关系 / 锚点链依赖 / shift
 > 结论), 非自由文本 — 读 plan 即读契约结论, 不用手工模拟。
@@ -945,8 +946,8 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
 > 新增 MOD 规则入库时对照此表: 判断"这条业务规则能否表达、用什么模式表达"。
-> 支持状态以 compile_fill.py 实际行为为准, 每条表达模式都有编译用例背书
-> (`tests/test_optimization.py`: CapabilityMappingContractTests)。
+> 支持状态以 compile_fill.py 实际行为为准 — `--capabilities` / `--capability
+> <key>` 探针矩阵与本节同源, 每条表达模式的接受性由编译行为裁定。
 
 | MOD 规则类型 | 标准表达模式 | 支持状态 |
 |---|---|---|
@@ -961,7 +962,7 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 | 常量 | `columns.value` | 一等 |
 | 查表 | `mapping.lookups` + `columns.lookup` | 一等 |
 | Column-Record Matrix 参数表 (字段行 × 产品列) | `matrix` — `field_map × record_map` → Compiler 物化目标格 + source lineage (`plan.source_trace` + `source_trace.json`); 受控翻译/trim 进 transform_chain | **一等** (ticket 06; 仅同构 field_axis=rows / record_axis=columns 的 canonical matrix shape; 其它朝向 → `MATRIX_ORIENTATION_NOT_ROLLED_OUT`) |
-| 受控翻译 / 词表 (宽片→wide fin、Heating pump→Cooling and Heating、Z 码 trim) | `mapping.transforms` `function: controlled_translation` + `translations` 表 / 内置 `trim`, 引用进 `matrix.field_map[].transforms` 或 `columns[].transforms` | 一等 (sanctioned 用例, 编译契约测试背书) |
+| 受控翻译 / 词表 (宽片→wide fin、Heating pump→Cooling and Heating、Z 码 trim) | `mapping.transforms` `function: controlled_translation` + `translations` 表 / 内置 `trim`, 引用进 `matrix.field_map[].transforms` 或 `columns[].transforms` | 一等 (sanctioned 用例, 以 `compile_fill.py --capability matrix.transforms` 探针为准) |
 | 大量 source-derived 表值烘成 literal sets 绕过 grid | `blocks: []` + 绝对坐标 literal sets (316 个烘焙 literal 病理) | ⚠️ 编译审计 `BULK_SOURCE_DERIVED_LITERAL_FALLBACK` (默认警告; Matrix rollout 开关下 fail-closed — 审计非路由依据); 正确路径 = `matrix` 物化 |
 | pptx 分组合并 / 占位区 / 公式 / 合并 / 置空 / 删行 | — | **暂无**: `PPTX_CAPABILITY_NOT_ROLLED_OUT` (spike 夹具验证后 rollout; 曾静默丢弃, issue 06 起编译期拒绝); pptx 当前支持 = 列值填充 + DOM-path sets; 行越界 → `PPTX_TARGET_ROWS_OUT_OF_BOUNDS` |
 
@@ -993,8 +994,8 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 直接消费, 不再克隆追加。**完整可实例化骨架 (含分组合并 + 绝对写 + numberformat) 见
 `combination_patterns.yaml` → `preformatted_quotation_inplace`** — 真实
 Validated Draft E2E 同形、数据中立, 按 fragment 内参数替换表一次实例化即编译
-(机械契约测试: `tests/test_optimization.py` → PreformattedQuotationPatternContractTests;
-完整 Canonical Pattern 准入边界见 catalog 头部说明):
+(实例化为正式 spec 后走 formal compile 验证; 完整 Canonical Pattern 准入
+边界见 catalog 头部说明):
 
 ```yaml
 mapping:

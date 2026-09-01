@@ -71,7 +71,7 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 | `mapping.md` | Derived | Compiler 生成的人类审查视图 (编辑 spec, 从不编辑它) |
 | `validated_draft.*` | Derived Result | 已执行并通过验证的候选交付文件 |
 | `draft_receipt.json` | Evidence | 输入哈希 (执行时重算 + 绑定比对) / Spec/Plan/Draft 哈希 + 验证结果 |
-| `task_shape.json` | Agent 判定 | Task Shape Check (Routing V2) 分流判定, 三字段: `task_shape` (值域 `grid_record`/`form_content`/`mixed`/`uncertain`) + `route` (`fillspec`/`officecli_native`/`combined`) + `evidence` (短 snake_case code, 最小充分); 与 `prepare_manifest.json` 机器事实分层，不含 confidence/hash/QA/execution history |
+| `task_shape.json` | Agent 判定 | Task Shape Check (Routing V2) 分流判定, 三字段契约: `task_shape` (值域 `grid_record`/`form_content`/`mixed`/`uncertain`) + `route` (`fillspec`/`officecli_native`/`combined`) + `evidence` (短 snake_case code, 最小充分); 兼容扩展: 可选记录 `record_axis` (`rows`/`columns`, evidence/diagnostic 层, 不改变三字段契约, 见 §1.5 Axis-Neutral Grid 契约); 与 `prepare_manifest.json` 机器事实分层，不含 confidence/hash/QA/execution history |
 | `.gate3_pending` | Skill-only Marker | 流程提示, 不是可信授权状态 |
 | final output | Delivery | Validated Draft 的提升副本 (哈希一致) |
 
@@ -83,7 +83,8 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 `prepare_run.py` (outline → premod_evidence) → Task Shape Check → `mod_nominate.py`
 → 用户裁决 → [--mod 落盘 → 规则加载] → digest 生成 → `fill_spec.yaml` (LLM 撰写)
 → `compile_fill.py` (plan+mapping+验证) → `execute_batch.py` (唯一一次填充) →
-Validated Draft + receipt → Execution Gate (唯一 Human Gate) → `promote_output.py`
+Validated Draft + receipt → Semantic Gate (双 Gate 分离, 独立 PASS/FAIL) →
+Execution Gate (唯一 Human Gate) → `promote_output.py`
 (hash 验证复制)
 
 ### 1. Prepare — `prepare_run.py` (两个阶段)
@@ -116,6 +117,41 @@ python scripts/prepare_run.py --workdir <dir> --flatten \
   flatten 不需手工重跑; 唯一动作 = 更新 spec 的 target_structure 指纹
   (抄 repair 输出 JSON 的 `fingerprints.target_structure`, 或 `--patch-spec`
   一步完成) + 重编译 (见 FILLSPEC Q16)。
+
+### 1.1 Task Topology Check（Prepare Outline/Manifest 后、业务映射前 —— 硬性）
+
+**Task Topology（这次业务有几个 run）与 Task Shape（每 run 什么结构）是两个
+正交的独立判定** —— 先定 run 数、再逐 run 判 shape。顺序颠倒即回到「单 run
+思维里绕 18 分钟才想起 Task 机制」的失败模式（埃及客户参数表复盘）。
+
+**判定时点（硬性顺序）**：
+
+```text
+Input Intake → Prepare Outline/Manifest（已产出 outline + prepare_manifest）
+  → Topology Check（源 sheet × 产品系列/产品线/输出形态的正交）
+  → 建立 Task/Run skeleton
+  → 每 run 再独立执行 Task Shape / MOD Resolution / FillSpec
+```
+
+**零新增探测（硬性）**：Topology Check 只用**已有 outline/manifest 事实 +
+任务文本** —— 不加任何新探测、新脚本、新 probe。用户指令出现「多系列 /
+多产品线 / 每 X 一个」即足以规划 run 数；**不需要理解业务细节**（EER、
+压缩机、Z 码、容量映射等一律不读、不推导）。
+
+**skeleton 形态**：落盘为 task.yaml 骨架 `{task: {…}, runs: […]}` —— 每条
+run 只含 `id` + source 引用（`file` / `sheets`）+ target 引用（`template` /
+`sheet` / `output`）；`shared_source` / `shared_template` 是**跨 run 相同的
+(file, sheet) 需求由 run 清单派生**的共享事实，task.yaml **不设独立共享声明
+节**（与 TASK_ORCHESTRATION §1.1 一致）。**业务映射永远不在 task.yaml**，
+只在各 run 的 `runs/<id>/fill_spec.yaml`（MOD 规则指导撰写）。
+
+**禁止（Topology Check 阶段）**：任何字段映射 / selector / 转化推导 —— 本
+阶段只数 run、只列引用；「哪个值填到哪格」一律后置到各 run 的 Task Shape /
+MOD Resolution / FillSpec。
+
+**单 run 任务**：Topology Check 产出 1-run skeleton（同样合法、通过同一静态
+校验）或**明确记录跳过** —— 对单 run 任务不强制 Task 层，仍走上方五个公开
+命令。
 
 ### 1.4 Business Reasoning Barrier（硬性）
 
@@ -155,7 +191,8 @@ Prepare Stage B (flatten+premod evidence) 完成后、MOD 提名之前, 先按 *
 
 ```text
 Prepare B (读毕 premod_evidence, Agent 本来就要读)
-   ├─ Obvious Grid (稳定 header + 重复 record 行 + 可克隆数据区)
+   ├─ Obvious Grid (稳定 schema axis + 重复 record axis + 可克隆数据区,
+   │      record_axis ∈ {rows, columns})
    │     └─► Level 0 FAST PATH: grid_record/fillspec, evidence=["obvious_grid"],
    │          立即进 MOD — 0 新增动作, 禁止继续 routing 分析
    └─ 仅出现明确异常信号 → Exception Routing:
@@ -169,7 +206,7 @@ Prepare B (读毕 premod_evidence, Agent 本来就要读)
 
 | task_shape | 含义 | 合法 route | 典型 evidence |
 |---|---|---|---|
-| `grid_record` | 稳定 header + 重复 record 行; 目标可克隆/可重复数据区; 映射以列↔列为主; 输出行数由源记录数驱动 | `fillspec` (Fast Path) / `officecli_native` (Direct) | `obvious_grid` / `bounded_explicit_edit`+`no_material_grid_benefit` |
+| `grid_record` | 稳定 schema axis + 重复 record axis, `record_axis ∈ {rows, columns}` (Row-Record Grid 与 Column-Record Matrix Grid 同属); 目标可克隆/可重复数据区; 映射以列↔列为主 (row-grid) 或 行↔行为主 (column-grid/matrix); 输出单元数由源记录数驱动 | `fillspec` (Fast Path) / `officecli_native` (Direct) | `obvious_grid` / `bounded_explicit_edit`+`no_material_grid_benefit` |
 | `form_content` | 固定内容区 (merged form regions), 无可克隆数据行模板; 源内容需跨格/跨行组合 | `officecli_native` | `content_composition` / `layout_or_object_work` |
 | `mixed` | substantial grid workload + 明显可分离 non-grid workload | `combined` | `substantial_grid_workload`+`separable_non_grid_workload` |
 | `uncertain` | 无明确信号 (临时判定态, 不是稳定类型) | — (不落执行 route) | `insufficient_routing_evidence` / `conflicting_workload_signals` / `task_intent_ambiguous` |
@@ -179,10 +216,45 @@ Prepare B (读毕 premod_evidence, Agent 本来就要读)
 officecli_native 的组合执行, **不是第三引擎**。evidence 一律短 snake_case code、
 最小充分证据 (不写长句论据)。
 
+#### Axis-Neutral Grid 契约 (grid_record 定义, 双轴锚点)
+
+`grid_record` = **稳定 schema axis + 重复 record axis** 的二维数据,
+`record_axis ∈ {rows, columns}`:
+
+- **Schema/Record 双轴**: 列头行 (row-grid) 或左侧字段标签列 (column-grid/
+  matrix) 衡量 **schema axis**; 产品列 (column-grid) 或重复记录行 (row-grid)
+  衡量 **record axis**。
+- **Row-Record Grid** (record 在行: 报价明细类) 与 **Column-Record Matrix
+  Grid** (record 在列 = "schema axis=rows、record axis=columns": 参数表/横排
+  对比表类) **同为 `grid_record`**, 不是两种 shape。
+- **Cardinality 锚点 (扩列)**: 目标主体重复输出单元数量由源 records 数量/
+  筛选结果驱动 — **N records → N target rows** (line grid) 或 **N target
+  columns** (matrix grid); **固定行数本身不构成 form 证据**; 外围结构 (顶部
+  metadata / Total / 底部 Notes / 纵向 group merge / inplace 占位区) 不改变
+  Grid 身份。
+- **Grouped-grid 吸收 (上一轮契约保留)**: 纵向 merge 若仅用于多条 records
+  共享组级展示值 (Type/Category/Family/Panel…), 不构成 `form_content` 信号;
+  存在稳定 schema axis + 连续重复 record axis 时仍优先判定 `grid_record`,
+  **merge 数量本身不得作为 Non-Grid 依据**。
+- **Form 对照**: 典型 `form_content` 是有限、预定义、cardinality 固定的语义
+  slot (姓名→B3、日期→F4…); 分界是 **slot cardinality 固定** vs
+  **record cardinality 数据驱动**, 不是 merge 的存在与否。
+- **task_shape 值域不变**: `matrix` / `column-grid` / `grouped-grid` 只是
+  帮助解读的**结构属性/evidence 标签**, 不是新 shape 值 — 最终 shape 仍是
+  `grid_record`, 值域仍是 `grid_record`/`form_content`/`mixed`/`uncertain`
+  四值。兼容扩展: `task_shape.json` 可记录 `record_axis` (`rows`/`columns`,
+  evidence/diagnostic 层), **不改变三字段契约**, 也不重定义 task_shape.json
+  的 schema 权威性 (它是 Agent 撰写的 artifact)。
+- **禁止**: 以记录数量阈值作为路由依据 (任何形式, 数量既不是 Grid 的优点
+  也不是 form 的证据); 禁止新增分类器/评分层/第二层路由判定; 判定只依赖
+  task 指令 × premod_evidence, Fast Path 0 新增动作不变, 不追加任何探测。
+
 #### Level 0 — Obvious Grid Fast Path (默认主路径, 不是 fallback)
 
-读毕 premod_evidence 即明显常规 Grid — 稳定 header + 重复 record 行 + 目标可克隆数据区,
-映射以列↔列为主, 输出行数由源记录数驱动 (如四案例 Case 1 复杂报价单) → **立即**
+读毕 premod_evidence 即明显常规 Grid — 稳定 schema axis + 重复 record axis
+(record_axis ∈ {rows, columns}) + 目标可克隆/可重复数据区, 映射以列↔列为主
+(row-grid) 或 行↔行为主 (column-grid/matrix), 输出单元数由源记录数驱动
+(如四案例 Case 1 复杂报价单; Column-Record Matrix 参数表同属此行) → **立即**
 `grid_record` + `fillspec`, evidence 固定 `["obvious_grid"]`, 直接进入原 **MOD
 Resolution → FillSpec → Compile** 流程 — 95% 任务运行路径零变化, 不追加任何
 探测。
@@ -255,6 +327,7 @@ Prepare → mixed decomposition → Grid 数据/结构执行 + readback/结构�
 | Case | task_shape | route | evidence |
 |---|---|---|---|
 | 复杂报价单 (数十~数百 records + lookup/formula/clone/aggregate) | `grid_record` | `fillspec` | `["obvious_grid"]` |
+| Column-Record Matrix 参数表 (字段在行、产品 record 在列; 横排对比形态) | `grid_record` | `fillspec` | `["obvious_grid"]` |
 | 3~5 个固定 cell 映射 (甚至 30 cell 固定区域复制, 无 record-driven 语义) | `grid_record` | `officecli_native` | `["bounded_explicit_edit","no_material_grid_benefit"]` |
 | 087 (多格内容重组/图片/版式/固定 merged form) | `form_content` | `officecli_native` | `["content_composition","layout_or_object_work"]` |
 | 产品明细 80 records + Logo/客户名/备注/行高 | `mixed` | `combined` | `["substantial_grid_workload","separable_non_grid_workload"]` |
@@ -264,9 +337,11 @@ Prepare → mixed decomposition → Grid 数据/结构执行 + readback/结构�
 Fast Path 无疑问, 0 新增动作。
 
 每次 run (含 Fast Path) 落极简 `task_shape.json` (见下), 记录 `task_shape` +
-`route` + `evidence` 三字段。`form_content` 在 FillSpec 语境为 `NOT_APPLICABLE`
-(产品层 SUPPORTED, 引擎层 NOT_APPLICABLE — 不是 UNSUPPORTED, 不是 Known
-Rejected)。
+`route` + `evidence` 三字段 (axis-neutral 下可另记 evidence/diagnostic 字段
+`record_axis`: rows/columns, 不改变三字段契约, 见「Axis-Neutral Grid 契约」;
+不允许把 task_shape 写成本票禁止的新值)。`form_content` 在 FillSpec 语境为
+`NOT_APPLICABLE` (产品层 SUPPORTED, 引擎层 NOT_APPLICABLE — 不是 UNSUPPORTED,
+不是 Known Rejected)。
 
 #### form_content 工作流 (officecli native 路径)
 
@@ -284,6 +359,103 @@ Rejected)。
 正常任务**不默认人审**。条件 ASK 仅限: 覆盖原文件、不可恢复删除、多种合理语义
 无法判断、明显版面溢出且无压缩策略。form_content 路径**不继承** execution_gate /
 promote / receipt / FillSpec plan/draft 哈希三元组 — 只为 QA 证据与交付呈报负责。
+
+### 1.6 Runtime Governance / Evidence Scope Guard（Ticket 09 硬契约）
+
+table-fill 开始后（Input Intake 之后）的**运行时治理硬契约** — 按**行为**
+执行，违反任一即越界。第一版**不建文件读取防火墙**（spec Out of Scope）：
+落实机制 = **本契约文字 + contract test + session replay**；MOD 侧双源由
+§2「Canonical MOD Resolver 契约」（Ticket 05）机械代偿，不依赖本节。
+
+#### Runtime / Development Asset Boundary + 双 Mode 契约（Skill Development vs Table-Fill Task Mode）
+
+tests / fixtures / benchmark expected / historical snapshots 的合法性由**当前
+Mode** 决定，不由"读取目的"决定：
+
+- **Skill Development Mode**（用户明确把主要目标改为诊断/修改/扩展/评测
+  table-fill）：tests / fixtures / benchmark expected / historical snapshots
+  **才是该开发工作的 SoT**（Skill Development / Regression Oracle — 合法
+  机制 SoT / regression evidence）——用于确认
+  机制能力（FillSpec 怎么写、某 capability 是否存在、编译器应如何报错）；
+  开发文档 ↔ tickets ↔ tests 之间正常互相引用（本 Mode 不受下方 Task Mode
+  禁令约束）。
+- **Table-Fill Task Mode**（业务热路径）：tests / fixtures / benchmark
+  expected / historical snapshots **不属于任何合法 Evidence Path** — 即使
+  目的只是"确认机制 HOW"（FillSpec 怎么写、某 capability 是否存在、编译器
+  应如何报错）**也不构成例外**。测试里的历史确认值（映射、lookup、expected
+  values、rename/换算规则、分组、客户/国家事实、筛选结果）**不是当前业务
+  事实的来源**；**「test 夹具里这么写」不作来源解释**。机制能力问题一律走
+  下方 Runtime Navigation Table（`compile_fill.py --capability <key>` /
+  `--capabilities` / FILLSPEC 对应章节 / KNOWN_TRAPS 条目 / `officecli
+  help`），不以读 tests/fixtures 作为答案。
+
+**合法业务事实来源枚举** — Runtime 业务事实只允许来自以下六类：
+
+1. **用户指令** — 当前任务文本与用户的明确回答；
+2. **Primary** — staged 源文件（经 manifest 绑定的 flattened 产物）；
+3. **Template** — 目标模板的结构/指纹/样式事实；
+4. **selected MOD** — `mod_resolution.json` 裁决的 canonical 版本；
+5. **MOD 受控规则与 lookup** — MOD 规则表声明的受控翻译词表 / 字段政策 /
+   lookup 索引；
+6. **用户显式指定资产** — 用户明确指定为输入或参考的文件/答案。
+
+**Mode 开关（唯一）**: 进入 Skill Development Mode 的**唯一开关 = 用户显式
+把主要目标改为诊断/修改/扩展/评测 table-fill（Skill Development 语境）**；
+在 Table-Fill Task Mode 下，任何"目的性"理由都**不构成例外** — "只是确认
+HOW"、"只读不写"、"只看能力是否存在"在 Task Mode 下一律禁止读取
+tests/fixtures；用户未显式切换前，业务热路径上该规则不松动。
+
+**Runtime Navigation Table（问题 → 去处；Task Mode 下唯一合法去处）**:
+
+| 问题 | 去处 |
+|---|---|
+| 机制语法 / 能力边界（如 matrix.field_locator 支持什么语法） | `compile_fill.py --capability <key>` |
+| 组合接受性 / rollout 状态 | `compile_fill.py --capabilities` |
+| 具体 spec 是否被接受 | formal compile（`compile_fill.py --spec …`）/ 仅架构分叉用一次 `--probe` |
+| FillSpec 语法 / schema / 代码 | FILLSPEC 对应章节（按问题定位） |
+| 已实测机械陷阱 | KNOWN_TRAPS 条目 |
+| OfficeCLI 接口 / 参数语义 | `officecli help <format> <element>` |
+| 当前 draft 值 / 结构 / 渲染 | readback / 结构验证 / Render QA |
+| **tests/fixtures** | **Task Mode 禁止**（仅 Skill Development Mode 可读） |
+
+#### Source Scope Guard（用户声明来源边界）
+
+用户声明来源边界（如「不要看 X 目录外业务文件」）时，semantic/filesystem
+search 限制在 **declared scope + table-fill runtime code/docs + selected
+MOD**：业务答案只在这些来源内寻找。**禁止无授权 `Get-ChildItem -Recurse`
+级全盘递归搜索** legacy skill / 历史输出作为业务答案 — 越界搜索被**记录 /
+阻止**（给出诊断；严重度达到会污染证据边界时 fail-closed）。
+
+#### Runtime Tool Contract（禁止无授权 openpyxl 直写业务）
+
+table-fill 开始后**禁止无授权 openpyxl 直写业务执行** — 业务填充的唯一执行器
+是 `execute_batch.py`（§5）；Python 仅限 Skill Development / diagnostics /
+tests（用 openpyxl 构建机制测试夹具属 Skill Development，不冲突）。officecli
+子进程调用必须经 `_officecli.officecli()` 适配器（不变量 6 保持：禁止裸
+subprocess / PowerShell 管道）。
+
+#### Exploration Stop Rule（探索预算与停止条件）
+
+- **obvious_grid → routing probes = 0** — 既有 Fast Path stop-rule 保留
+  （§1.5「Level 0 — Obvious Grid Fast Path」：0 新增动作，立即进 MOD）；
+- 非 obvious 允许**有限预算**：仅限既有 uncertain 受限补观察（view html +
+  ≤2 次定向 get/query）+ **结构补充 probe ≤ 1 次**（只用于回答 task shape
+  问题，与 §3 的 Capability Probe 无关，不用于解题分析）；
+- 预算耗尽仍不确定 → **ask / ambiguous**（evidence 用
+  `insufficient_routing_evidence` / `conflicting_workload_signals` /
+  `task_intent_ambiguous`，临时判定态）；
+- **禁止无限 view / render / script / glob / legacy search 直到「感觉理解」**
+  — 探索必须带预算与停止条件，任何「再看一眼就懂」的循环都在预算之内，
+  预算之外一律 ask/ambiguous。
+
+#### Barrier Enforcement（Task Shape / MOD Resolution 完成前的闸门）
+
+**Task Shape / MOD Resolution 完成前不允许开始 field mapping / business
+selector / output generation** — 业务推导必须以「Task Shape 判定 + MOD 裁决
+落盘（`mod_resolution.json` status ∈ {resolved, none}）」为前提。与 §1.4
+Business Reasoning Barrier 的「禁止做」清单呼应（**不重复改写**该清单）；§1.1
+Topology Check 阶段的禁止同此 — shape 未定 / MOD 未裁决时的任何映射尝试都是
+越界探索，不是合法起点。
 
 ### 2. MOD Resolution — `mod_nominate.py` (条件中断)
 
@@ -328,11 +500,37 @@ MOD 文件格式与捕获流程见 `references/MOD_TEMPLATE.md` / `mod_capture.p
 
 - **提名阶段 (mod_nominate.py 输出)**: 每个候选只给「候选名 + 命中/待复验
   信号 + 业务逻辑摘要 + 裁决选项」— **不含完整规则集**;
-- **用户裁决后**: 才加载**选中** MOD 的完整规则 (`mod_resolution.json` 候选的
-  `rules` 字段或 MOD 文件全文) 注入 FillSpec 撰写上下文;
+- **用户裁决后**: 才经 **canonical resolver** 从**选中** MOD 的 canonical
+  文件全文加载完整规则 (见下方「Canonical MOD Resolver 契约」) 注入 FillSpec
+  撰写上下文;
 - **多候选 (ambiguous)**: 裁决选项仍附带各候选的**规则证据摘要** (关键映射/
   公式链差异, 足够裁决判断), 完整规则在选定后加载 — 不加载全量规则直接呈现
   裁决。
+
+**MOD 生命周期与 route 解耦 (Ticket 05 契约, 硬性)**: MOD 适用性由**业务
+语义**决定, 不因执行 route (executor 选择) 消失。生命周期固定为 **Prepare →
+Pre-MOD Evidence → Task Shape → MOD Nomination/Resolution → 加载 selected
+MOD 规则 → 业务推导 → 选择/执行 executor** (fillspec / officecli_native /
+combined 视 shape 而定)。`form_content` 命中业务 MOD 时 MOD **仍然生效** —
+**「form_content → 跳过 MOD」不再是合法路径**; FillSpec 语境
+`NOT_APPLICABLE` 只表示引擎层不适用 (产品层 SUPPORTED / 引擎层
+NOT_APPLICABLE, 不是 UNSUPPORTED、不是 Known Rejected), **不是业务规则不
+适用**: 命中的业务治理规则 (Z 码身份/字段白名单/受控翻译/CJK 扫描) 照常
+加载并进入业务推导。
+
+**Canonical MOD Resolver 契约 (Ticket 05, 硬性)**: `mod_nominate.py` 写出的
+`mod_resolution.json` 每条候选/选定记录至少含 `{name, canonical_path,
+revision, sha256}` — `canonical_path` 一律为**目录表派生** (`references/` +
+MOD_INDEX 的 Path 列), `sha256` = 写盘时 canonical 文件内容哈希。脚本与
+Agent **只消费 canonical resolver 返回的 canonical 版本**: 规则加载经
+`load_rules_for_selected_mod()` → resolver 读取 canonical_path 锁定的文件并
+校验 sha256, 不匹配/缺失/畸形 → **fail-closed** (exit 3, 结构化 defect +
+corrective_action, 绝不回退到同名副本); `--check-canonical` 可机械复核整份
+裁决记录。旧记录 (缺新字段) → re-resolve from catalog (记录
+`resolution_action`), 目录表无法解析 → fail-closed 并点名缺失字段。**禁止
+glob 同名文件, 禁止把 scratch / history / legacy skill 副本作为推理依据或
+规则来源**。两段加载保持不变: 提名阶段只给候选名 + 命中/待复验信号 + 业务
+逻辑摘要 (不含完整规则集), 用户裁决后才经 resolver 加载 full rules。
 
 选中 MOD 完整规则注入后, 映射关系、公式链、路由、字段继承、校验规则全部
 进入 spec 撰写上下文:
@@ -400,6 +598,22 @@ Schema 见 `references/FILLSPEC.md`, 可复制模板见 `assets/fill_spec_templa
   `columns[].props`/`sets[].props` 白名单 V1=numberformat。
   schema_version 2→2.5 (mode 缺省 = append, 向后兼容)。全量 schema 见
   references/FILLSPEC.md「v2.5: Row Layout Mode」。
+- **Matrix 一等表达 (ticket 06)**: Column-Record Matrix (字段行 × 产品列,
+  `grid_record` 的一种) 用 `mapping.targets[].matrix` 声明 — `source`/`target`
+  轴朝向 (v1 仅同构 field_axis=rows / record_axis=columns) + `field_map`
+  (源标签→目标标签, label 列机械查找) + `record_map` (产品记录列);
+  Compiler 物化 `field_map × record_map → 目标格` 为 value 写, 并产出
+  **source lineage 一等输出** (`plan.source_trace` + workdir
+  `source_trace.json`: 每格 {target, source, transform_chain})。transform 链
+  含内置 `trim`、受控翻译 (`mapping.transforms` 函数
+  `controlled_translation` + `translations` 词表)、round2/round4。
+  **literal sets 边界**: `sets:` 只留客户名/日期/固定 title/显式 user
+  override/fixed footer; 把大量源表值烘成 literal sets 绕过 grid →
+  编译审计告警 `BULK_SOURCE_DERIVED_LITERAL_FALLBACK` (默认 warn, Matrix
+  rollout 开关下 fail-closed — 审计非路由依据, 记录数量阈值禁令仍只约束
+  routing)。MOD Attention Map 对齐: resolve→`record_map` / map→`field_map` /
+  transform→`transform_chain` (可执行受控转换) / validate→Gate assertions
+  (`validation` 三件套, ticket 07 消费)。详见 FILLSPEC「矩阵映射 (matrix)」。
 - **布局决策先查决策树**: inplace vs clone-append vs 收缩 三选一以 digest
   样式粒度事实为第一判定条件 (带样式→inplace, 裸行→clone-append, 占位行
   自然下沉), 不凭占位块存在性猜 — 见 FILLSPEC「布局决策树」。
@@ -582,8 +796,40 @@ python scripts/execute_batch.py --plan execution_plan.json \
 
 ### 6. Execution Gate (唯一 Human Gate, MANDATORY, fail-closed)
 
+**两 Gate 分离 (Ticket 07 契约)**: **Structural Gate**（文件可开、目标格写入
+正确、merge/style intact、write/readback 一致 — execute_batch 的 validate +
+issue delta + readback + 结构 readback）与 **Semantic Gate**（MOD 业务规则、
+外发政策、source lineage、受控翻译、模板旧值、安全泄漏）是**两个独立
+PASS/FAIL，禁止合并为单一「PASS」**；一个 FAIL 不得掩盖另一个。**readback
+全绿 ≠ 业务正确** —— Semantic Gate 的检查对象 = **最终生成的 XLSX**
+（gate 时锁定的 validated_draft 文件本身），不是 fill_spec / mapping.md /
+Agent 推理 / planned transforms。
+
+**Semantic Gate 相位**（结构验证之后、`execution_gate.py --set` 之前）:
+
+```bash
+python scripts/semantic_gate.py --workdir <dir> [--policy semantic_policy.json]
+```
+
+- 策略 `<workdir>/semantic_policy.json` = Agent 对 selected MOD validation
+  政策的**可执行翻译**（每 check 声明 rule_id，如 SEC-003 / ID-001 / TRN-001 /
+  FLD-004 / VAL-002）；**每个声明 rule_id 必须存在于 selected MOD 的规则表**
+  （经 canonical resolver 读取 + sha256 校验），否则 fail-closed (exit 3)。
+- 扫描 validators：CJK 泄漏 / internal_only 字段泄漏 / 首尾空白 / Z 码精确性 /
+  受控翻译（值 = 受控值表 或 lineage 可见的 controlled_translation 输出）/
+  模板旧值 / 未解析占位符 / source lineage 完整性。
+- 证据写 `<workdir>/semantic_receipt.json`：每个 check 输出
+  `{rule_id, range, cell_count, violations}`；失败时逐条 `{cell, value,
+  rule_id}`；受控翻译豁免记录 lineage 引用 (source_trace.json)。
+- 任一 violation → exit 3 (fail-closed)；全绿 → exit 0。
+- `execution_gate.py --set` 呈现 semantic 证据：receipt 缺失 → UNVERIFIED
+  呈现（fail-closed：**无证据不得宣称 semantic green**）；receipt 扫的是旧
+  draft → STALE 呈现（重跑 semantic_gate 后再呈现）。
+
 Present ALL of: MOD resolution 结果, 关键 mapping 与业务决策, 数据缺口与未决项,
-来源覆盖, Draft 验证结果 (readback/issue/validate), Draft SHA-256, timing。
+来源覆盖, Draft 验证结果 (readback/issue/validate), **Semantic Gate 结果
+(semantic receipt: checks / violations / scanned_file_sha256)**, Draft SHA-256,
+timing。
 **块标题候选预生成**: 新历史块标题如需用户确认, 从源元数据预生成候选
 (铜价/汇率基准如 `105000/6.7`、付款条件如 `DP AT SIGHT`、源文件名日期),
 随 Gate 一并呈现——用户只需选择/确认, 不用现场想。
@@ -628,21 +874,51 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 准备」改成「任务级一次 + 逐 run 物化」，并统一批量 run 的生命周期、聚合 Gate
 与计时。单 run 任务不需要 Task 层，仍走上方五个公开命令。
 
-三个入口脚本（任务级唯一命令面，run 层五个公开命令零改动）:
+三个入口脚本 + 一个组装入口（任务级唯一命令面，run 层五个公开命令零改动）:
 
 ```bash
 python scripts/prepare_task.py --task-root <task_dir> --validate|--init|--prepare|--run
 python scripts/gate_task.py      --task-root <task_dir> --set|--confirm
 python scripts/resume_task.py    --task-root <task_dir> --resume [--rebuild] | --supersede --map old=new
+python scripts/assemble_task.py  --task-root <task_dir> --set|--confirm|--promote
 ```
 
 - `task.yaml` 只描述编排（run 清单 + 输入输出引用 + 输出命名），**不承载业务
   映射** —— 映射/公式/校验永远在 `runs/<id>/fill_spec.yaml`（MOD 规则指导撰写）；
   业务映射确认后再写 task.yaml。
-- 完整契约（task model / cache / 调度 / 生命周期与恢复 / 聚合 Gate / CLI）见
-  `references/TASK_ORCHESTRATION.md` —— 本文件只给入口，机制细节不内嵌。
 - Task 层**不自动确认 Gate、不自动 promote**（fail-closed 不变）；中断恢复、
   输入事实变化后的 supersede 都走 `resume_task.py`。
+
+**Assembly（task 级，packaging-only）**: 多 run 各自独立通过 Run Gate
+（`/runs/<id>/validated_draft.xlsx`）后，`assemble_task.py` 把每 run 的
+validated sheet 组装为 task 级共享 `assembly/final.xlsx`（每 run 一个命名
+sheet，sheet 名来自 run 定义的输出命名）。**assembly 只做 packaging**：
+clone/copy sheet、rename、preserve formatting —— **禁止**字段映射、业务
+transform、lookup、纠错、任何数据语义操作；多 run 绝不并发写同一 final
+workbook。`assembly/final.xlsx` + `assembly/final_gate.json` 是 **task 级共享
+产物**，每 run 产物保持 run-scoped（ticket 08 边界）。final gate 与 execution
+gate 同构且 fail-closed：`--set` 呈现、`--confirm` 正向确认、`--promote`
+交付记录 —— 无证据不自动确认、无确认不自动 promote。**per-run 独立输出始终
+是合法形态**：任务定义二选一 —— 多 run → N 个文件，或多 run → 1 workbook /
+N sheets。完整契约见 `references/TASK_ORCHESTRATION.md`。
+
+**Run Isolation / Task Artifact Boundary（ticket 08）**:
+
+- **每次 run 独立 run root**：运行时产物（outline / premod evidence /
+  task_shape / mod_resolution / digest / spec / plan / mapping / draft /
+  receipt / timing / gate markers / scratch）全部位于自己的 `runs/<id>/`；
+  一条 run 永不隐式读取另一条 run 的 spec/gate/timing/scratch；历史 run
+  完整可追溯。
+- **污染目录 fail-closed**：prepare 检测到 workdir 已含本 run 生命周期产物
+  （spec / plan / gate marker / receipt 等）→ `WORKDIR_POLLUTED`（exit 3，
+  corrective action = 全新 run root 或显式 run-id 目录），绝不先读旧产物再
+  覆写；flatten 产物不是生命周期产物，增量 flatten 合法。
+- **timing 单次 run**：`run_timing.json` 只记录当前 run 自身的 machine +
+  agent 相位（task 级聚合只读汇总）。
+- **resume 显式 run id**：恢复依 `task_status.json` 索引按显式 run id 寻址，
+  禁止扫目录猜 run。
+- **task / run 边界**：`assembly/final.xlsx` + `assembly/final_gate.json` 是
+  task 级共享产物，`runs/<id>/` 内全部是 run 级产物 —— 二者绝不互当。
 
 ## PPTX 目标
 
@@ -750,8 +1026,8 @@ TASK MODE 内的 Skill 修改。
    触发条件再落码。
 2. **契约 Q&A**: 结论写进 FILLSPEC「组合行为契约」/「执行顺序保证」/
    能力映射表 — Agent 按问题定位的权威答案, 不再二次勘察。
-3. **contract test**: 以最小 fixture 固定该行为 (test_optimization.py 既有
-   契约测试面, 不新增基建) — 未来改动使行为回归时测试变红。
+3. **contract test**: 以最小 fixture 固定该行为 (复用既有契约测试面,
+   不新增基建) — 未来改动使行为回归时测试变红。
 
 **产出物 (三者同源, 缺一视为未完成)**: 缺陷码 + 契约条目 + 回归测试;
 KNOWN_TRAPS 同步沉淀机械事实 (重放 oracle), 不落 KNOWN_TRAPS 的转换不算
@@ -793,7 +1069,9 @@ python scripts/note_phase.py --workdir <dir> --phase <名称>
 ├── fill_spec.yaml                 ← Canonical 业务语义 (LLM 撰写)
 ├── execution_plan.json / mapping.md   ← Compiler 派生
 ├── validated_draft.<ext>          ← 已验证候选交付文件 (Gate 后提升)
-├── draft_receipt.json             ← 执行证据
+├── draft_receipt.json             ← 结构性执行证据 (Structural Gate)
+├── semantic_policy.json           ← Semantic Gate 执行策略 (Agent 撰写, 可执行 MOD 政策翻译)
+├── semantic_receipt.json          ← Semantic Gate 证据 (rule_id/range/cell_count/violations + cell/value/rule_id)
 ├── final_receipt.json             ← 提升证据
 ├── run_timing.json
 └── .gate3_pending                 ← 流程标记 (set/confirm 后消失)

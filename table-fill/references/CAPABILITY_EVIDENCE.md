@@ -226,7 +226,10 @@ non-dispositive) ≠ 能力状态 (三态) ≠ 工作流动作 (使用/适配/AS
 - **Canonical Pattern 不是 support/rejection 证据** — 它是首选构造路径
   (缺同形 Pattern 不产生 Capability Unknown; 见下节「默认可组合」)。
 - 源码、Skill 测试套件、fixture 和自行发明的实验**不是 TASK MODE Standard
-  Evidence Paths**。
+  Evidence Paths** — **即使目的只是"确认机制 HOW"也不构成例外**: Table-Fill
+  Task Mode 下 tests / fixtures / benchmark expected / historical snapshots
+  不属**任何**合法 Evidence Path (双 Mode 契约见 SKILL「Runtime / Development
+  Asset Boundary」)。
 - **默认可组合**: Known Supported 能力默认可组合, 除非权威契约明确声明冲突
   或约束; 具体组合的 ownership、geometry、range、duplicate-write 由
   **formal compile** 验证, 不手动模拟 Compiler。
@@ -292,7 +295,8 @@ defect、复杂组合、首次出现、特性数量多、缺少同形 Canonical 
   不产生第二次 Rescue。
 
 **TASK MODE 禁区 (硬性)**: 不读实现源码、不运行/检视 Skill 测试套件、
-不创建 fixture 链、不修改 Skill、不追无关变体。
+不创建 fixture 链、不修改 Skill、不追无关变体 — **该禁令不因"只是确认机制
+HOW"而松动** (Task Mode 下 tests/fixtures 不属任何合法 Evidence Path)。
 
 **预算关系**:
 
@@ -313,6 +317,9 @@ defect、复杂组合、首次出现、特性数量多、缺少同形 Canonical 
    `compile_fill.py --capability <key>` (第 2 节新行) → dispositive 答案
    (state / constraints / conflicts) 即关闭问题 → **停止探索** — 不再读
    FILLSPEC 全文 / tests / fixture 链 / probe / rescue / 包装;
+   **dispositive 答案之后, 不得以"只是确认 HOW / 想更放心"为由追加任何通道**
+   (Task Mode 下 tests/fixtures 不属任何合法 Evidence Path, 见 SKILL 双
+   Mode 契约);
 2. 找到与问题具有直接 **Evidence Fit** 的 Standard Evidence Path (第 2 节);
 3. **Known Supported** → 直接使用; 正常 Run Verification 仍全部执行;
 4. **Known Rejected** → 不尝试; 寻找 Known Equivalent Adaptation (约束保持);

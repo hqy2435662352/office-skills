@@ -571,7 +571,7 @@ class ModNominateTests(unittest.TestCase):
         r = mod_nominate.resolve(
             entries, mods, "报价汇总 迁移",
             ["- 表头: Z码 | 数量 | 报价 | 原型机成本",
-             "- 数据块: 无自动候选 (LLM 依摘要与业务上下文判定)"], [])
+             "- 标题型数据块: 无自动候选（不代表不存在重复记录区）"], [])
         self.assertEqual(r["status"], "conflict")
         self.assertIn("批次块", r["why"])
         r = mod_nominate.resolve(entries, mods, "报价汇总 迁移", [], [])
@@ -5015,6 +5015,7 @@ class CapabilityQueryTests(unittest.TestCase):
         """每个 namespace key: exit 0 + 五字段 JSON; state 三态; constraints/
         conflicts 是 terse 短串 (非长篇 prose); reference 指向 FILLSPEC;
         输出短 (无 FILLSPEC 全文 dump)."""
+        # 先算每 key 的平均文本长度, 再断言单个约束串长度 (保持 terse)
         for key in self.NAMESPACE:
             r = self._run(key)
             self.assertEqual(r.returncode, 0,
@@ -5455,7 +5456,10 @@ class DocCoverageGuardTests(unittest.TestCase):
         q18 = section[m.end():]
         self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", q18)
         self.assertIn("PPTX_TARGET_ROWS_OUT_OF_BOUNDS", q18)
-        self.assertIn("test_pptx_e2e.py", q18)
+        # Ticket 04 (P1-02): 权威 = --capabilities 探针矩阵 pptx_* 行
+        # (不再导航具体测试路径 — 编译期拒绝即运行时真行为)
+        self.assertIn("探针矩阵", q18)
+        self.assertIn("pptx_*", q18)
 
     def test_skill_md_pptx_support_matrix(self):
         """SKILL.md PPTX 小节声明支持矩阵 (issue 06) — frontmatter「任意方向」
@@ -5484,6 +5488,85 @@ class DocCoverageGuardTests(unittest.TestCase):
         text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
         self.assertIn("precision: keep", text)
         self.assertIn("scratch", text)
+
+    # ── Ticket 04 (P1-02): Task-Mode Development-Evidence Firewall ──
+
+    def _runtime_docs(self) -> dict[str, str]:
+        """Runtime-facing docs 集合 (Ticket 04 静态契约扫描对象):
+        SKILL + references/{FILLSPEC, CAPABILITY_EVIDENCE, KNOWN_TRAPS,
+        TASK_ORCHESTRATION}.md — 不扫 Skill Development 资产
+        (issues / ADRs / tests / tickets)."""
+        return {
+            "SKILL.md": self._skill_md_text(),
+            "FILLSPEC.md": (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(
+                encoding="utf-8"),
+            "CAPABILITY_EVIDENCE.md": self._capability_evidence_text(),
+            "KNOWN_TRAPS.md": (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(
+                encoding="utf-8"),
+            "TASK_ORCHESTRATION.md": (SKILL_ROOT / "references" /
+                                      "TASK_ORCHESTRATION.md").read_text(
+                encoding="utf-8"),
+        }
+
+    def test_runtime_docs_no_test_path_navigation(self):
+        """Runtime-facing docs 零具体 test path 导航 (Ticket 04 AC3): 五个
+        Runtime 文档不得出现 `tests\\test_xxx` / `tests/test_xxx` /
+        `_fixtures` / 裸 `test_*.py` 文件名 — Task Mode 下 tests/fixtures 不属
+        任何合法 Evidence Path, 文档不得把 Agent 导航向开发资产 (零豁免区;
+        Skill Development 资产 issues / ADRs / tests 不在扫描对象内)."""
+        patterns = [
+            (r"tests[\\/]test_", "tests\\test_ / tests/test_ 导航"),
+            (r"_fixtures", "_fixtures 导航"),
+            (r"test_[A-Za-z0-9_]+\.py", "裸 test_*.py 文件名"),
+        ]
+        for name, text in self._runtime_docs().items():
+            for pat, label in patterns:
+                m = re.search(pat, text)
+                if m is not None:
+                    self.fail(
+                        f"{name} 含 {label} 引用: "
+                        f"…{text[max(0, m.start() - 40):m.start() + 60]}…")
+
+    def test_skill_md_task_mode_tests_forbidden_dual_mode(self):
+        """SKILL 双 Mode 契约 (Ticket 04 AC1): Table-Fill Task Mode 下
+        tests/fixtures 不属任何合法 Evidence Path, 即使目的只是"确认机制 HOW"
+        也不构成例外; 唯一开关 = 用户显式把主要目标切换为 Skill Development."""
+        text = self._skill_md_text()
+        for word in ("Skill Development Mode", "Table-Fill Task Mode",
+                     "双 Mode 契约", "不属于任何合法 Evidence Path",
+                     "确认机制 HOW", "不构成例外", "Mode 开关（唯一）"):
+            self.assertIn(word, text, f"SKILL.md 缺双 Mode 契约词 {word!r}")
+        m = re.search(
+            r"^#### Runtime / Development Asset Boundary.*?"
+            r"(?=^#### Source Scope Guard)",
+            text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(
+            m, "SKILL.md 缺 Runtime / Development Asset Boundary 块")
+        block = m.group(0)
+        self.assertIn("唯一开关", block)
+        self.assertIn("用户显式", block)
+        self.assertIn("不构成例外", block)
+        # 六类合法业务事实来源保留 (与 1a guard 同域, 防整块被误删)
+        self.assertIn("合法业务事实来源枚举", block)
+
+    def test_skill_md_runtime_navigation_table(self):
+        """SKILL Runtime Navigation Table (Ticket 04 AC5): 问题 → 去处, 含
+        --capability / --capabilities / FILLSPEC 章节 / KNOWN_TRAPS /
+        officecli help / readback·结构验证·Render QA; 最后一行
+        tests/fixtures → Task Mode 禁止 (加粗)."""
+        text = self._skill_md_text()
+        self.assertIn("Runtime Navigation Table", text)
+        for cell in ("compile_fill.py --capability <key>",
+                     "compile_fill.py --capabilities",
+                     "FILLSPEC 对应章节", "KNOWN_TRAPS 条目",
+                     "officecli help", "readback", "结构验证", "Render QA"):
+            self.assertIn(cell, text,
+                          f"Runtime Navigation Table 缺去处 {cell!r}")
+        m = re.search(
+            r"^\|\s*\*\*tests/fixtures\*\*\s*\|\s*\*\*Task Mode 禁止\*\*.*$",
+            text, re.MULTILINE)
+        self.assertIsNotNone(
+            m, "Navigation Table 缺最后一行 tests/fixtures → Task Mode 禁止")
 
     def _skill_md_text(self) -> str:
         return (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
