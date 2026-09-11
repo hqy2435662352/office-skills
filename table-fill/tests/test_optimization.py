@@ -5340,8 +5340,9 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("pptx_*", q18)
 
     def test_skill_md_pptx_support_matrix(self):
-        """SKILL.md PPTX 小节声明支持矩阵 (issue 06) — frontmatter「任意方向」
-        与能力边界不再矛盾 (静默丢弃措辞被 fail-closed 替代)."""
+        """SKILL.md PPTX 小节声明支持矩阵 (issue 06) — 描述与能力边界不再矛盾
+        (静默丢弃措辞被 fail-closed 替代; 「任意方向」措辞已由 ADR 0022 从
+        描述与 compatibility 移除)."""
         text = self._skill_md_text()
         self.assertIn("PPTX_CAPABILITY_NOT_ROLLED_OUT", text)
         self.assertIn("不再静默丢弃", text)

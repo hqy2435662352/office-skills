@@ -10,10 +10,11 @@ description: >
   target.
 license: MIT
 compatibility: >
-  Required: officecli (on PATH), Python 3.10+ (PyYAML). No openpyxl, no pandas,
-  no python-pptx in the pipeline — officecli 子进程调用一律经 _officecli.officecli()
-  适配器 (规则见「不变量 6」)。Must co-load: officecli-xlsx; Recommended:
-  officecli-win (Windows subprocess encoding workaround)
+  Required: officecli (on PATH), Python 3.10+ (PyYAML). 不需要 openpyxl / pandas;
+  python-pptx 仅用于「PPTX 目标」记录的一次性加行 (其后永久关闭), 不是通用管线。
+  officecli 子进程调用一律经 _officecli.officecli() 适配器 (细则见「不变量」)。
+  Co-load: officecli-xlsx; pptx 目标加 officecli-pptx; Windows/中文路径加
+  officecli-win (subprocess encoding)。
 metadata:
   drift-risk: high
   mod-nomination: true
@@ -29,6 +30,7 @@ metadata:
 
 状态编号 (S0–S8) 只是导航辅助, **不是契约**; 契约是阶段名与顺序关系: Workspace before Topology · Compile before Review · Review before Execute。
 
+**严格按照以下SOP执行：**
 ```
 S0 Workspace Init → S1 Topology → S2 Task Shape → S3 MOD Resolution →
 S4 FillSpec First Draft → S5 Compile/Repair → S6 Spec Review →
