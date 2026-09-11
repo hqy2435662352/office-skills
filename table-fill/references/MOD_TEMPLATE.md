@@ -127,7 +127,7 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 |--------|----------|-------------|
 | **Rule ID** | yes | Stable identifier within this MOD (e.g. `R01`, `RTE-001`). |
 | **Group** | yes | `business_transformation` / `mapping` / `validation` / `other`. |
-| **Gate** | yes | `mod_gate` (提名裁决后即生效) 或 `execution_gate` (L3 后呈现). |
+| **Gate** | yes | `mod_gate` (提名裁决后即生效) 或 `execution_gate` (deliver 前 Spec Review 呈现). |
 | **Description** | yes | Human-readable rule statement. |
 | **Applies to** | yes | Scope expression. |
 | **Notes** | no | Implementation hints. 禁止承载裁决方式与单次运行事实数字（见「规则变更治理」）. |
@@ -153,7 +153,7 @@ FillSpec 上下文（无状态机, 无 gate_confirmed）。MOD Resolution 用 di
 ## Gate 语义
 
 - `mod_gate` 规则: 用户提名裁决后生效, 指导 L1-L3 全流程。
-- `execution_gate` 规则: L3 完成时随 Execution Gate 呈现给用户, 属验收核对项
+- `execution_gate` 规则: deliver 前的 Spec Review 随摘要呈现给用户, 属验收核对项
   （如 VAL-001 行覆盖核对、VAL-002 公式链核对）。
 
 ## ⚠️ 捕获去污染原则（硬性要求）

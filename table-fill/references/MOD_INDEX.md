@@ -20,7 +20,7 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
 | **MOD Name** | yes | Unique, stable identifier. |
 | **Aliases** | no | Comma-separated shorthand names a user may supply. Case-insensitive match. |
 | **Scope Signals (+)** | yes | 表事实信号 (提名阶段可验证的: semantic_type/target_title/source_pattern/target_pattern/product_domain/sheet_marker/dimension_set(premod_evidence 已喂时); 待L2复验的: measure_set/formula_chain/block_layout/unit_convention/time_granularity). 格式 `signal_kind::value`. |
-| **Exclusion Signals (-)** | no | **表事实**排除信号 (agent 可判定的可观察事实)。非表事实项 (客户上下文/用户意图) 不得列入, 由用户在 Gate 裁决。无 evaluator 的未知排除条件不默认放行 — 记入 `pending_exclusions`, 阻断自动 resolved (fail-closed, 询问用户)。 |
+| **Exclusion Signals (-)** | no | **表事实**排除信号 (agent 可判定的可观察事实)。非表事实项 (客户上下文/用户意图) 不得列入, 由用户在 Spec Review 裁决。无 evaluator 的未知排除条件不默认放行 — 记入 `pending_exclusions`, 阻断自动 resolved (fail-closed, 询问用户)。 |
 | **MOD File Path** | yes | Relative from `table-fill/references/`. File `MOD_<name>.md`. |
 | **Revision** | yes | Monotonic integer. Incremented on every confirmed MOD update. |
 | **Visibility** | yes | `public` (de-identified, ships with office-skills) or `private` (customer-owned). |
@@ -48,8 +48,10 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
 ## Registered MODs
 
 | MOD Name | Aliases | Scope Signals (+) | Exclusion Signals (-) | Path | Revision | Visibility |
-|---|---|---|---|---|---|---|
-| _(no MOD registered — 暂无注册 MOD: 私有客户 MOD 不随发布推送, 见「Adding a MOD」捕获流程)_ | | | | | | |
+| MOD_tcl_quotation_summary_migration | tcl-quote-migration | semantic_type::quotation,target_title::报价汇总,source_pattern::毛利表*,target_pattern::报价汇总*,dimension_set::product_sku,formula_chain::net_price_to_total_margin,block_layout::repeated_24_role_history_blocks | 目标缺少24角色表头指纹; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | MOD_tcl_quotation_summary_migration.md | 7 | private |
+| MOD_tcl_cost_reply_to_quotation_summary_block | tcl-email-quote-block | semantic_type::cost_reply_to_quotation_summary_block,source_pattern::*核价邮件*,target_pattern::*报价*,dimension_set::product_sku,measure_set::prototype_cost,formula_chain::net_price_to_total_margin,block_layout::repeated_quotation_history_blocks | 目标缺少客户Sheet重复批次块或Z码和原型机成本角色; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | MOD_tcl_cost_reply_to_quotation_summary_block.md | 4 | private |
+| MOD_tcl_pricing_block_to_customer_quotation | tcl-customer-quotation | semantic_type::pricing_block_to_customer_quotation,target_title::Quotation,target_pattern::*报价单*,dimension_set::customer_quotation_six_fields,block_layout::customer_quote_header_data_total_terms | 目标缺少客户报价六角色表头指纹; 目标为客户参数表（含系列标题/参数名行/Z码角色，无价格/报价/核价角色） | MOD_tcl_pricing_block_to_customer_quotation.md | 5 | private |
+| MOD_tcl_internal_parameter_to_customer_parameter_sheet | tcl-param-sheet, tcl-internal-param-to-customer | semantic_type::internal_parameter_to_customer_parameter_sheet,source_pattern::*型谱*,source_pattern::*参数*,target_pattern::*客户版*,target_pattern::*client*,dimension_set::product_line_capacity_zcode,block_layout::series_title_zcode_parameter_rows,product_domain::air_conditioning_export | 目标含报价/核价/价格角色; 目标缺少客户参数表角色指纹（系列标题/参数名行/Z码）; 源无稳定产品身份（产品线-容量-Z码） | MOD_tcl_internal_parameter_to_customer_parameter_sheet.md | 3 | private |
 
 
 
@@ -70,10 +72,11 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
    覆盖记 `overridden_exclusions`；`--mod NONE` 写 `resolved` + `selected: NONE`）—
    `mod_resolution.json` 从此是**最终裁决记录**（Barrier 解锁的字面文件检查 +
    编译器 C2/C3/C4 依据）。
-5. **规则裁决后加载 (两段加载)**: 用户选定后, 才从**选中** MOD 文件全文
-   (或 `mod_resolution.json` 的 `rules` 字段) 加载完整规则, 注入 FillSpec
-   撰写上下文 — 映射/公式链/路由/继承/校验规则进入 spec 撰写上下文, 不再
-   猜测映射关系。选中 → `selected_mod` 写入 fill_spec.yaml (无状态机,
+5. **规则裁决后加载 (两段加载)**: 用户选定后, 才**经 canonical resolver**
+   从**选中** MOD 的 canonical 文件全文 (canonical_path + revision + sha256
+   锁定, 见 SKILL.md §2「Canonical MOD Resolver 契约」) 加载完整规则, 注入
+   FillSpec 撰写上下文 — 映射/公式链/路由/继承/校验规则进入 spec 撰写上下文,
+   不再猜测映射关系。选中 → `selected_mod` 写入 fill_spec.yaml (无状态机,
    无 gate_confirmed); NONE → 与现行无 MOD 流程一致。**硬性要求不变**:
    候选规则进入 spec 撰写上下文前必须已加载 — 改变的是加载时机与粒度,
    不是是否加载。**加载顺序挂在 Barrier 解锁程序上**: `resolved + 某 MOD` →
@@ -81,8 +84,9 @@ Each row registers one MOD. 提名脚本 (`mod_nominate.py`) 只读本表 + MOD 
    (`structure_digest.py`, 目标 sheet 加 `--target`); `NONE`/`status=none` →
    直接生成 digest (见 SKILL.md §1.4/§2)。
    > **执行 vs 治理文档边界**: 执行任务只消费 `mod_resolution.json` 的
-   > `summary`/信号 + **选中 MOD 文件全文** (两段加载第二段: 完整规则从
-   > MOD 文件全文解析, 由 `mod_nominate.load_rules_for_selected_mod()` 提供)。
+   > `summary`/信号 + **选中 MOD 的 canonical 文件全文** (canonical resolver,
+   > 两段加载第二段: 完整规则从 canonical 文件全文解析并校验 sha256, 由
+   > `mod_nominate.load_rules_for_selected_mod()` 提供)。
    > **不读 `MOD_TEMPLATE.md`** — 那是"新建/修改 MOD 文件"的治理规范, 与执行无关
    > (2026-08-12 实测: 误读全文浪费数分钟)。
 6. **L2 复验**: 结构类信号在 premod_evidence 上给出真 hit/miss 或 pending（见步骤 1）;

@@ -37,10 +37,12 @@ Two-phase rule loading (SKILL.md 硬性契约): nomination output carries per
 candidate only hits/pending/missed/fired_exclusions/summary — never the full
 rule set (ambiguous candidates additionally carry a compact rule_evidence
 summary sufficient for adjudication). After the user picks a MOD, the full
-rules are loaded via `load_rules_for_selected_mod()` (MOD file full text)
-and injected into the FillSpec authoring context. The hard requirement
-"candidate rules must be loaded before writing the spec" is unchanged —
-only load timing and granularity moved.
+rules are loaded via `load_rules_for_selected_mod()` — through the canonical
+resolver (Ticket 05): only the canonical MOD file full text
+(canonical_path + revision + sha256 locked) is read, never a same-name
+scratch/legacy copy — and injected into the FillSpec authoring context. The
+hard requirement "candidate rules must be loaded before writing the spec" is
+unchanged — only load timing and granularity moved.
 
 The agent then applies the user's explicit choice (MOD NONE / a named MOD)
 and writes `selected_mod` into fill_spec.yaml.
@@ -76,7 +78,7 @@ if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 from _officecli import (  # noqa: E402
-    ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
+    ensure_utf8_stdio as _utf8_stdio, fail,
     sha256_file,
 )
 from _mod_catalog import (  # noqa: E402
@@ -85,6 +87,10 @@ from _mod_catalog import (  # noqa: E402
     parse_mod_index,
     parse_mod_rules,
     rule_to_dict,
+)
+from _mod_resolver import (  # noqa: E402 — Ticket 05 canonical resolver
+    ModCanonicalError,
+    resolve_canonical,
 )
 
 SEMANTIC_KEYWORDS = {
@@ -192,12 +198,42 @@ def parse_rule_table(text: str) -> list[dict]:
         return []
 
 
-def load_rules_for_selected_mod(mods_dir: Path, path: str) -> list[dict]:
-    """两段加载第二段: 用户裁决后, 从选中 MOD 文件全文加载完整规则,
-    注入 FillSpec 撰写上下文 (映射/公式链/路由/继承/校验规则)。
-    提名输出不含完整规则集 — 硬性要求「候选规则进入 spec 撰写上下文前
-    必须已加载」由本函数 + 调用纪律保证。"""
-    return parse_mod_file(mods_dir, path).get("rules", [])
+def load_rules_for_selected_mod(mods_dir: Path, path: str | None = None, *,
+                                resolution: dict | None = None,
+                                entries: list[dict] | None = None) -> list[dict]:
+    """两段加载第二段: 用户裁决后, 从选中 MOD 的 **canonical** 文件全文加载
+    完整规则 (Ticket 05 canonical resolver 契约), 注入 FillSpec 撰写上下文
+    (映射/公式链/路由/继承/校验规则)。提名输出不含完整规则集 — 硬性要求
+    「候选规则进入 spec 撰写上下文前必须已加载」由本函数 + 调用纪律保证。
+
+    只消费 resolver 返回的 canonical 版本:
+    - `resolution` (推荐): mod_resolution.json 的候选/选定条目
+      `{name, canonical_path, revision, sha256}` — 经 resolve_canonical 读取
+      canonical_path 锁定的文件并校验 sha256; 不匹配/缺失/畸形 → fail-closed
+      (ModCanonicalError, 结构化 defect + corrective_action)。
+    - `path` (+ 可选 `entries`): 向后兼容旧调用 (旧记录缺新字段 → 目录表
+      re-resolve, resolution_action 被记录; 目录表无法解析 → fail-closed)。
+      entries 提供时 path 必须 == 目录表 Path 列 (同名副本 → fail-closed)。
+    """
+    if resolution is not None:
+        resolved = resolve_canonical(
+            mods_dir,
+            name=resolution.get("name"),
+            canonical_path=resolution.get("canonical_path"),
+            revision=resolution.get("revision"),
+            sha256=resolution.get("sha256"),
+            entries=entries,
+        )
+    elif path is not None:
+        resolved = resolve_canonical(mods_dir, path=path, entries=entries)
+    else:
+        raise ModCanonicalError(
+            "MOD_CANONICAL_FIELDS_MISSING",
+            "load_rules_for_selected_mod 缺 MOD 引用 — 必须给 resolution "
+            "({name, canonical_path, revision, sha256}) 或 path",
+            "从 mod_resolution.json 取选定候选的 canonical_path/sha256 传入, "
+            "或补 path")
+    return parse_rule_table(resolved["content"])
 
 
 def _rule_evidence(rules: list[dict]) -> list[dict]:
@@ -228,11 +264,17 @@ def _evaluate_entry(entry: dict, mods_dir: Path, evidence: str,
             missed.append(sig)
     fired_excl, unverifiable_excl = exclusion_checks(
         entry["exclusion"], evidence, digests, outlines)
+    # Ticket 05: 每条候选记录锁定 canonical 版本 — canonical_path 一律来自
+    # 目录表 (entry["path"], 即 references/ + Path 列), sha256 = 写入时
+    # canonical 文件内容哈希 (文件缺失 → None, 消费方 resolver 会 fail-closed)。
+    mod_file = mods_dir / entry["path"]
     return ({
         "name": entry["name"],
         "display_name": meta.get("display_name") or entry["name"],
         "revision": entry["revision"],
         "visibility": entry["visibility"],
+        "canonical_path": entry["path"],
+        "sha256": sha256_file(mod_file) if mod_file.is_file() else None,
         "hits": hits,
         "pending": pending,
         "missed": missed,
@@ -541,15 +583,20 @@ def exclusion_checks(exclusion: str, evidence: str, digests: list[str],
 
 
 def filename_evidence_from_manifest(workdir: Path) -> tuple[str, bool]:
-    """Return (filename_evidence_text, degraded) from prepare_manifest.json.
+    """Return (filename_evidence_text, degraded) from the compile-facing manifest.
 
-    原始业务文件名 (files[].source 的 basename) 与 staged 暂存名 (files[].staged)
-    一并进入证据 — MOD 信号按「业务文件名」匹配, 不再对 stage_files.py 强制的
-    ASCII 暂存命名敏感 (2026-08-27 走查修复: source_pattern::毛利表* 曾因 evidence
-    只有 staged 名 source_maoli.xlsx 而 miss)。
+    T12 收敛: 唯一消费面 = prepare_manifest.json (workspace_init 工作区由
+    派生视图承载同一 files[].source/staged 事实 — canonical 权威在
+    workspace_manifest.json; prepare_run 旧工作区原生即此文件)。
 
-    降级规则: manifest 缺失 / 不可读 → 返回 ("", True), 不失败; 调用方据此在
-    stderr 打一次 WARNING, 证据退化为 task + --files + outline (旧行为)。
+    原始业务文件名 (basename) 与 staged 暂存名 (staged) 一并进入证据 — MOD
+    信号按「业务文件名」匹配, 不再对 stage_files.py 强制的 ASCII 暂存命名
+    敏感 (2026-08-27 走查修复: source_pattern::毛利表* 曾因 evidence 只有
+    staged 名 source_maoli.xlsx 而 miss)。
+
+    降级规则: prepare_manifest.json 缺失/不可读 → 返回 ("", True), 不失败;
+    调用方据此在 stderr 打一次 WARNING, 证据退化为 task + --files +
+    outline (旧行为)。
     """
     manifest_path = workdir / "prepare_manifest.json"
     if not manifest_path.is_file():
@@ -567,6 +614,38 @@ def filename_evidence_from_manifest(workdir: Path) -> tuple[str, bool]:
         if staged:
             names.append(staged)
     return " ".join(names), False
+
+
+def manifest_derived_args(workdir: Path) -> tuple[list[str], list[str]]:
+    """从 prepare_manifest.json 派生 outline 与 digest(evidence) 文件名
+    (提名证据完全来自初始化产物, 无需任何额外探测 — ticket 02 验收 2;
+    T12 收敛: 唯一消费面 = compile-facing 派生视图, 同一事实)。
+
+    返回 (outline_files, digest_files):
+      - outline_files = manifest `outlines` 全部 outline 文件名
+      - digest_files = manifest `flattened[].evidence`
+        (*_premod_evidence.md, MOD 提名阶段的 pre-mod 证据视图)
+
+    无 prepare_manifest.json → 返回 ([], []); 调用方据此回退显式
+    --outline/--digest 参数 (旧行为, 不失败)。
+    """
+    manifest_path = workdir / "prepare_manifest.json"
+    if not manifest_path.is_file():
+        return [], []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return [], []
+    outlines: list[str] = []
+    for outline_name in (manifest.get("outlines") or {}).values():
+        if outline_name:
+            outlines.append(outline_name)
+    digests: list[str] = []
+    for e in manifest.get("flattened") or []:
+        evidence = e.get("evidence")
+        if evidence:
+            digests.append(evidence)
+    return outlines, digests
 
 
 def evidence_text(task: str, files: str, outline_arg: str, workdir: Path) -> str:
@@ -636,7 +715,11 @@ def signal_matched(kind: str, value: str, evidence: str, digests: list[str],
         if base and base.lower() in evidence.lower():
             return True
         for part in value.split(","):
-            if any(fnmatch.fnmatch(fn, part.strip())
+            # 命名层大小写不敏感 (2026-09-02, ticket 02): 文件名模式匹配
+            # 显式 lower 双侧 — 单个 `*client*` 即覆盖 *CLIENT*/*Client*/*client*
+            # 变量, 不依赖 fnmatch 的平台相关 normcase (Windows 大小写折叠), 也
+            # 不靠 MOD 内容写多个大小写变体。
+            if any(fnmatch.fnmatch(fn.lower(), part.strip().lower())
                    for fn in re.findall(r"[^\s,]+\.(?:xlsx|pptx|docx)", evidence)):
                 return True
         return False
@@ -701,6 +784,7 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
         chosen = candidates[0]
         return {"status": "resolved", "selected": chosen["name"],
                 "selected_revision": chosen["revision"], "candidates": candidates,
+                **_selected_lock(chosen),
                 "why": "explicit MOD name or alias matched the catalog and no "
                        "exclusion signal fired"}
     hit_count = len([c for c in candidates if c["hits"]])
@@ -722,8 +806,22 @@ def resolve(entries: list[dict], mods_dir: Path, evidence: str,
     chosen = candidates[0]
     return {"status": "resolved", "selected": chosen["name"],
             "selected_revision": chosen["revision"], "candidates": candidates,
+            **_selected_lock(chosen),
             "why": "exactly one candidate, every signal hit, nothing missed, "
                    "no exclusion fired, nothing pending"}
+
+
+def _selected_lock(chosen: dict) -> dict:
+    """Ticket 05: 选定条目的 canonical 锁定字段 (canonical_path + sha256)。
+
+    与既有 `selected` / `selected_revision` 并列写出 — C2/C3 编译校验仍只读
+    `selected` / `selected_revision` (语义不变), 新字段供 canonical resolver
+    与 --check-canonical 消费。NONE 裁决短路 (无 MOD → 无锁定字段)。
+    """
+    return {
+        "selected_canonical_path": chosen.get("canonical_path"),
+        "selected_sha256": chosen.get("sha256"),
+    }
 
 
 def _adjudicated_from(result: dict, out: Path) -> str | None:
@@ -809,6 +907,7 @@ def build_adjudication_record(result: dict, mod_name: str, entries: list[dict],
         "selected": chosen["name"],
         "selected_revision": chosen["revision"],
         "candidates": fresh_candidates,
+        **_selected_lock(chosen),
         "why": f"user adjudication recorded — keep {chosen['name']} "
                "(keeping the candidate despite its exclusion signals, if any)",
     }
@@ -820,6 +919,63 @@ def build_adjudication_record(result: dict, mod_name: str, entries: list[dict],
     if af is not None:
         record["adjudicated_from"] = af
     return record
+
+
+def check_canonical_record(record: dict, entries: list[dict],
+                           mods_dir: Path) -> dict:
+    """--check-canonical: 校验裁决记录里每条候选/选定引用都指向 canonical
+    版本 (Ticket 05 / spec D5)。
+
+    只消费 resolver 返回的 canonical 版本: 每条候选/选定记录经
+    resolve_canonical 按 {name, canonical_path, revision, sha256} 读取并校验
+    sha256 — 任一 mismatch/missing/malformed → ModCanonicalError
+    (fail-closed, 调用方转 exit 3)。成功返回 {"status":"ok", "checked":[...]}。
+    """
+    if record.get("status") == "none":
+        return {"status": "ok", "checked": [],
+                "note": "status=none — 无候选/选定 MOD 可校验"}
+    checked: list[dict] = []
+    for cand in record.get("candidates") or []:
+        if not isinstance(cand, dict):
+            raise ModCanonicalError(
+                "MOD_CANONICAL_MALFORMED",
+                "candidates 条目不是 mapping — 裁决记录畸形",
+                "重新运行 mod_nominate.py 生成裁决记录")
+        resolved = resolve_canonical(
+            mods_dir,
+            name=cand.get("name"),
+            canonical_path=cand.get("canonical_path"),
+            revision=cand.get("revision"),
+            sha256=cand.get("sha256"),
+            entries=entries,
+        )
+        checked.append({
+            "role": "candidate",
+            "name": resolved["name"],
+            "canonical_path": resolved["canonical_path"],
+            "revision": resolved["revision"],
+            "sha256": resolved["sha256"],
+            "resolution_action": resolved["resolution_action"],
+        })
+    selected = record.get("selected")
+    if selected and str(selected).strip().upper() != "NONE":
+        resolved = resolve_canonical(
+            mods_dir,
+            name=selected,
+            canonical_path=record.get("selected_canonical_path"),
+            revision=record.get("selected_revision"),
+            sha256=record.get("selected_sha256"),
+            entries=entries,
+        )
+        checked.append({
+            "role": "selected",
+            "name": resolved["name"],
+            "canonical_path": resolved["canonical_path"],
+            "revision": resolved["revision"],
+            "sha256": resolved["sha256"],
+            "resolution_action": resolved["resolution_action"],
+        })
+    return {"status": "ok", "checked": checked}
 
 
 def main() -> None:
@@ -842,6 +998,12 @@ def main() -> None:
                         help="裁决记录模式: 指定用户裁决的 MOD 名或 NONE。"
                              "缺省 = 提名语义 (行为与旧版完全一致)。"
                              "传入即改为裁决记录语义, 机械写出 final decision record。")
+    parser.add_argument("--check-canonical", action="store_true",
+                        help="canonical 校验模式 (Ticket 05): 读取 --out 指向的"
+                             "裁决记录, 校验每条候选/选定引用的 canonical 文件"
+                             "(canonical_path + revision + sha256); 任一不匹配/"
+                             "缺失 → exit 3 (结构化 defect + corrective_action)。"
+                             "与 --mod 互斥 (校验在裁决之后独立跑)。")
     args = parser.parse_args()
 
     skill_root = Path(__file__).resolve().parent.parent
@@ -851,18 +1013,57 @@ def main() -> None:
         fail("INDEX_NOT_FOUND", f"MOD_INDEX.md 不存在: {index}",
              "检查 --index 路径")
 
-    evidence = evidence_text(args.task, args.files, args.outline, args.workdir)
+    entries = parse_index(index)
+
+    if args.check_canonical:
+        # canonical 校验模式 (Ticket 05): 读 --out 指向的裁决记录, 校验每条
+        # 候选/选定引用都指向 canonical 版本 — fail-closed (exit 3)。
+        # 本分支独立于证据管线 (不打印 manifest 降级 WARNING, stderr 只含
+        # 结构化 JSON / fail defect)。
+        rec_path = args.out
+        if not rec_path.is_absolute():
+            rec_path = args.workdir / rec_path
+        if not rec_path.is_file():
+            fail("MOD_RESOLUTION_MISSING",
+                 f"裁决记录不存在: {rec_path} (--check-canonical 需要先有 "
+                 "mod_nominate.py 写出的 mod_resolution.json)",
+                 "先运行提名 + --mod 裁决写盘, 再跑 --check-canonical")
+        try:
+            record = json.loads(rec_path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("not a mapping")
+        except (OSError, ValueError):
+            fail("MOD_RESOLUTION_MISSING",
+                 f"裁决记录不可读/非法 JSON: {rec_path}",
+                 "重新运行 mod_nominate.py 生成裁决记录")
+        try:
+            summary = check_canonical_record(record, entries, mods_dir)
+        except ModCanonicalError as e:
+            fail(e.code, e.message, e.corrective_action)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        sys.exit(0)
+
+    # ticket 02 + T12: 提名证据完全来自初始化产物 (compile-facing manifest)。
+    # 未显式传 --outline/--digest 时从 prepare_manifest.json 派生 outline +
+    # flatten evidence (*_premod_evidence.md) — 无需任何额外探测; 传了则显式
+    # 参数优先 (兼容旧调用与 prepare_run 工作区)。
+    manifest_outline, manifest_digest = manifest_derived_args(args.workdir)
+    outline_arg = args.outline or ",".join(manifest_outline)
+    digest_arg = args.digest or ",".join(manifest_digest)
+
+    evidence = evidence_text(args.task, args.files, outline_arg, args.workdir)
     filename_evidence, degraded = filename_evidence_from_manifest(args.workdir)
     if filename_evidence:
         evidence = " ".join([evidence, filename_evidence])
     if degraded:
-        print("[MOD_NOMINATE] WARNING — prepare_manifest.json 不存在, "
+        print("[MOD_NOMINATE] WARNING — 未发现 prepare_manifest.json "
+              "(workspace_init 派生视图 / prepare_run 产物均缺失); "
               "文件名证据仅限 --files 传入的暂存名; "
               "原始业务文件名模式 (如 source_pattern::毛利表*) 可能 miss",
               file=sys.stderr)
-    digests = load_digests(args.digest, args.workdir)
-    outlines = load_outlines(args.outline, args.workdir)
-    entries = parse_index(index)
+    digests = load_digests(digest_arg, args.workdir)
+    outlines = load_outlines(outline_arg, args.workdir)
+
     explicit = explicit_mod_mentions(entries, args.task)
     if len(explicit) > 1:
         # 显式多 MOD 名: 与 resolve() 同形输出 (候选含摘要, 附裁决用规则证据
