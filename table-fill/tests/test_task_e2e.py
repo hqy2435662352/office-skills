@@ -1,38 +1,29 @@
-"""Task Orchestration 性能验收 — 三层验证的第三层（有 Office；spec S8 /
-ticket 08 / issue 08）。skipIf officecli 缺失时整体优雅跳过（层次 1/2 契约与
-恢复测试在 tests/test_task_orchestration.py，无 Office 必须全绿）。
+"""Multi-run materialization E2E (ADR 0018/0020) — 三层验证的第三层（有
+Office）。skipIf officecli 缺失时整体优雅跳过。
+
+旧 Task runtime (prepare_task --init/--prepare/--run, cache/, task_status)
+已退役。新 canonical 多 run 路径:
+
+    workspace_init --init (role-neutral, 业务 sheet 并集, 一次)
+        → workspace_manifest.json
+    materialize_run --task task.yaml (Topology lowering, 一次遍历全部 runs)
+        → runs/<id>/prepare_manifest.json + target routing view
+    每 run (S2→S8): Task Shape → MOD → FillSpec → compile → Spec Review →
+        execute → promote (独立公开命令, 无 task 编排状态机)
 
 验收（全部为结构性断言，不用墙钟）：
-  断言 1 — 第一次 prepare_task 后 cache/ 目录数 == 唯一 (file, sheet)
-     需求数（4 = 3 个源 sheet + 1 个共享目标模板；而非 4 run × 2 sheet
-     = 8 次重复展平 —— 埃及 13 条产品线共享源书复盘语义的合成版）。
-  断言 2 — 第二次 prepare_task 缓存零新增（cache/ 目录数不变、阶段 1
-     报告 hits=4/misses=0，命中路径零 officecli 展平）、物化 CSV hash 不变。
-  断言 3 — 结果等价：物化 CSV 与单 run CSV 逐字节一致（hash 相等）；
-     task run manifest 与单 run manifest 的 compile-facing 字段同构
-     （仅多 cache_key/sha256 元数据）；同一 fill_spec 经 public CLI
-     compile_fill.py 编译 → plan 的 input_hashes / fingerprints /
-     operations 一致。
-  完整流程 — prepare_task --init/--prepare → 逐 run fill_spec →
-     --run（compile → execute → gate 呈现）→ gate_task --set（聚合呈现）
-     → --confirm（逐 run 确认 + promote）→ outputs/ 全部落盘 +
-     task_status 全 promoted + 幂等重跑 --confirm noop。
-  crash window 恢复 — execute 在「写 draft 与写 receipt 之间」崩溃 →
-     resume_task --resume 按证据重跑 execute + 重呈现 gate（不自动越过
-     Gate、不自动 promote；status 只是索引，恢复以 artifact 真值驱动）。
+  断言 1 — role-neutral init 只展平业务 sheet 并集（3 源 sheet + 1 共享
+     目标模板 = 4 个 entry；非 4 run × 2 sheet = 8 次重复展平）。
+  断言 2 — materialize 投影与单 run 对应物等价：同一 run 的 materialize
+     指纹/plan == 单 run CLI 投影指纹/plan（同一 workspace facts）。
+  断言 3 — 完整多 run 流程：一次 workspace_init + 一次 materialize --task
+     → 逐 run compile → Spec Review 一次覆盖全部 run → 逐 run execute →
+     promote；每 run 独立交付文件；无 task 状态机产物（task_status/cache）。
 
-已知环境事实（KNOWN_TRAPS「Office 并发 = 2」）：execute 阶段并发 2 下
-officecli batch 偶发 BATCH_CHUNK_FAILED（rc=1 空 stderr；本机实测约 1/4
-轮次）。本测试按产品恢复路径处理：失败 run 的产物证据判定为 execute crash
-window → resume_task.py --resume 重跑 execute → gate，这正是 spec S7
-「恢复由 artifact 驱动，status 不是真值源」的实证路径；断言不依赖零竞态。
-
-fixture：tests/_fixtures/task_orchestration/e2e/（预生成合成工作簿，
-1 源书 3 sheets × ~30 行 + 4 run 共享模板；测试运行时绝不现场生成）。
+fixture：tests/_fixtures/task_orchestration/e2e/（预生成合成工作簿）。
 
 Run with:
   python -m pytest table-fill/tests/test_task_e2e.py -q
-  python -m unittest tests.test_task_e2e -v
 """
 
 from __future__ import annotations
@@ -55,7 +46,7 @@ FIX_E2E = (Path(__file__).resolve().parent / "_fixtures"
            / "task_orchestration" / "e2e")
 
 RUN_IDS = ["r32-cooling", "r32-heating", "r410a-cooling", "r22-cooling"]
-# run id → (源 sheet, ascii slug — 与 task_prepare.entry_name 同约定)
+# run id → (源 sheet, ascii slug — 与 prepare_run.ascii_slug 同约定)
 RUN_SHEETS = {"r32-cooling": ("R32参数", "R32"),
               "r32-heating": ("R32参数", "R32"),
               "r410a-cooling": ("R410A参数", "R410A"),
@@ -65,39 +56,9 @@ OUTPUTS = {r["id"]: r["target"]["output"] for r in
            yaml.safe_load((FIX_E2E / "task.yaml").read_text(encoding="utf-8"))
            ["runs"]}
 
-
-def strip_cache_metadata(entry: dict) -> dict:
-    """去掉任务物化条目的 provenance 元数据 → 单 run 条目形态。"""
-    return {k: v for k, v in entry.items() if k not in ("sha256", "cache_key")}
-
-
-# Business Reasoning Barrier（ticket 02）: 单 run xlsx 条目的 digest 是
-# "deferred" 标记（非文件名）、另带 evidence 字段；task 物化条目是真实
-# {name}_digest.md、无 evidence。compile 只读这六个 compile-facing 键，故
-# 同构对账只覆盖它们，evidence/digest 的有意发散单独断言。
-COMPILE_KEYS = ("file", "sheet", "name", "csv", "meta", "candidates")
-
-
-def compile_keys(entry: dict) -> dict:
-    return {k: entry[k] for k in COMPILE_KEYS if k in entry}
-
-
-def matched_source_rows(run_dir: Path, slug: str) -> int:
-    """按 fill_spec 同一 selector 口径数源数据行（不含表头）—— 期望行数
-    从产物真值推导，不硬编码生成器行数。"""
-    import csv as _csv
-    n = 0
-    with open(run_dir / f"parameter_book_{slug}_flat.csv", encoding="utf-8-sig",
-              newline="") as fh:
-        for line in _csv.reader(fh):
-            if not line:
-                continue
-            a = (line[0] or "").strip()
-            if a and a != "产品线":
-                n += 1
-    return n
-# 唯一 (file, sheet) 需求 = 3 源 sheet + 1 共享目标模板（ticket 08: U_source=3）
-UNIQUE_DEMANDS = 4
+# 唯一 (file, sheet) 需求 = 3 源 sheet + 1 共享目标模板（ticket 08 语义:
+# U_source=3; role-neutral init 只展平业务 sheet 并集）
+UNIQUE_ENTRIES = 4
 NAIVE_FILLS = len(RUN_IDS) * 2  # 4 run × (1 源 + 1 目标) = 8 次重复展平
 
 
@@ -117,27 +78,25 @@ def make_task_root() -> Path:
     return root
 
 
-def run_prepare_task(root: Path, mode: str) -> subprocess.CompletedProcess:
-    return run_py(root, "prepare_task.py", "--task-root", str(root), mode)
-
-
 def file_sha256_hex(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_fill_spec(run_dir: Path, sheet: str, slug: str,
-                    intent_note: str) -> Path:
-    """按 workdir 自己的 prepare_manifest.json 指纹撰写 fill_spec.yaml
-    （映射永远在 runs/<id>/fill_spec.yaml：MOD 规则指导撰写的消费侧）。
-    task run 与单 run 对照组共用同一构建器 —— 指纹一致 → spec 文本一致。
-    同时写 mod_resolution.json（ticket 04 C1：compile 需最终裁决记录，
-    spec selected_mod=NONE 与 resolved/NONE 对齐）。"""
-    manifest = json.loads(
-        (run_dir / "prepare_manifest.json").read_text(encoding="utf-8"))
-    (run_dir / "mod_resolution.json").write_text(
+def write_mod_resolution(target_dir: Path) -> None:
+    """写一份最终裁决记录（status=resolved, selected=NONE）—— compile
+    C1-C4 前置。任务级一份放 task root（过滤 compile --mod-resolution）。"""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "mod_resolution.json").write_text(
         json.dumps({"status": "resolved", "selected": "NONE",
                     "candidates": []}, ensure_ascii=False),
         encoding="utf-8")
+
+
+def build_fill_spec(run_dir: Path, sheet: str, slug: str,
+                    intent_note: str) -> Path:
+    """按 run 自己的 prepare_manifest.json 指纹撰写 fill_spec.yaml。"""
+    manifest = json.loads(
+        (run_dir / "prepare_manifest.json").read_text(encoding="utf-8"))
     fp = manifest["fingerprints"]
     spec = {
         "task": {"intent": f"合成参数表填充（{sheet}）— {intent_note}",
@@ -166,8 +125,7 @@ def build_fill_spec(run_dir: Path, sheet: str, slug: str,
                      "role": "primary",
                      "note": "每个匹配源行写入一个追加行（模板行 3 克隆）"}],
         "validation": {"required_coverage": [], "required_empty": [],
-                       "key_outputs": ["A5", "B5", "C5", "D5",
-                                      f"A{4 + matched_source_rows(run_dir, slug)}"]},
+                       "key_outputs": ["A5", "B5", "C5", "D5"]},
     }
     spec_path = run_dir / "fill_spec.yaml"
     spec_path.write_text(
@@ -176,57 +134,20 @@ def build_fill_spec(run_dir: Path, sheet: str, slug: str,
     return spec_path
 
 
-def write_all_run_specs(root: Path) -> None:
-    for rid in RUN_IDS:
-        sheet, slug = RUN_SHEETS[rid]
-        build_fill_spec(root / "runs" / rid, sheet, slug,
-                        "issue 08 e2e")
-
-
-def materialized_csv_hashes(root: Path) -> dict[str, dict[str, str]]:
-    """{run id: {csv 名: 逐字节 hex}}（断言 2 的物化产物真值快照）。"""
-    out = {}
-    for rid in RUN_IDS:
-        run_dir = root / "runs" / rid
-        out[rid] = {p.name: p.read_bytes().hex()
-                    for p in run_dir.glob("*_flat.csv")}
-    return out
-
-
-def drive_to_gate(root: Path) -> tuple[subprocess.CompletedProcess, bool]:
-    """--run → gate 呈现；execute 偶发 Office 竞态（BATCH_CHUNK_FAILED）
-    时按产品恢复路径走 resume_task --resume（产物证据判定 crash window →
-    重跑 execute）—— 失败二分：仅 EXECUTE_FAILED 允许纯重试恢复。
-    返回 (最终进程结果, 是否经 resume 恢复)。"""
-    attempts = 0
-    via_resume = False
-    proc = run_prepare_task(root, "--run")
-    while proc.returncode != 0:
-        attempts += 1
-        via_resume = True
-        if attempts > 6:
-            raise AssertionError(
-                f"--run 六轮仍未恢复（Office 竞态超限）: {proc.stdout[-600:]}")
-        raw = proc.stdout or "{}"
-        try:
-            err = json.loads(raw)
-        except ValueError:
-            raise AssertionError(
-                f"--run 失败但 stdout 非结构化 JSON（无法判定失败类别）: "
-                f"{raw[-600:]}") from None
-        codes = {d.get("code") for d in err.get("defects", [])}
-        if not codes or not codes <= {"EXECUTE_FAILED"}:
-            raise AssertionError(
-                f"非 execute 阶段失败不可用 resume 恢复: {err.get('code')} "
-                f"{sorted(codes)} {proc.stdout[-500:]}")
-        proc = run_py(root, "resume_task.py", "--task-root", str(root),
-                      "--resume")
-    return proc, via_resume
+def compile_run(root: Path, rid: str) -> subprocess.CompletedProcess:
+    """compile 一条 run（reads task-root mod_resolution + run 目录 spec;
+    shared-root 指向 task root — flatten 产物/staged 平铺引用, ADR 0018）。"""
+    write_mod_resolution(root)
+    run_dir = root / "runs" / rid
+    return run_py(run_dir, "compile_fill.py", "--spec", "fill_spec.yaml",
+                  "--workdir", ".", "--mod-resolution",
+                  str(root / "mod_resolution.json"),
+                  "--shared-root", str(root))
 
 
 @unittest.skipIf(shutil.which("officecli") is None, "officecli not on PATH")
-class TaskPerformanceAcceptanceTests(unittest.TestCase):
-    """三层验证第三层（有 Office）：结构性断言 + 完整 task 流程走通。"""
+class TaskMaterializeAcceptanceTests(unittest.TestCase):
+    """三层验证第三层（有 Office）：结构性断言 + 完整多 run 流程走通。"""
 
     def setUp(self):
         self.root = make_task_root()
@@ -249,276 +170,164 @@ class TaskPerformanceAcceptanceTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _init_and_prepare(self) -> dict:
-        proc = run_prepare_task(self.root, "--init")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_prepare_task(self.root, "--prepare")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+    def _workspace_init(self) -> dict:
+        """role-neutral init: 业务 sheet 并集 (3 源 + 1 模板), 无 --target."""
+        from _fixtures.run_driver import workspace_init
+        return workspace_init(
+            self.root,
+            files=(f"{self.root / 'sources' / 'parameter_book.xlsx'}"
+                   f"|parameter_book.xlsx,"
+                   f"{self.root / 'templates' / 'filling_template.xlsx'}"
+                   f"|filling_template.xlsx"),
+            sheets=("parameter_book.xlsx:R32参数,R410A参数,R22参数;"
+                    "filling_template.xlsx:Sheet1"),
+            task="multi-run materialize e2e")
+
+    def _materialize_task(self) -> dict:
+        proc = run_py(self.root, "materialize_run.py", "--workdir", ".",
+                      "--task", "task.yaml")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
         return json.loads(proc.stdout)
 
-    def test_prepare_cache_structural_assertions(self):
-        """断言 1 + 断言 2：cache/ 目录数 == 唯一需求数（非 4×2=8）；
-        第二次 prepare 缓存零新增 + 物化 CSV hash 不变（命中路径零展平）。"""
-        report = self._init_and_prepare()
+    def test_workspace_scope_is_unique_sheet_union(self):
+        """断言 1：role-neutral init 只展平业务 sheet 并集（4 个 entry,
+        非 4 run × 2 sheet = 8 次重复）。"""
+        self._workspace_init()
+        ws = json.loads((self.root / "workspace_manifest.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(len(ws["flattened"]), UNIQUE_ENTRIES)
+        self.assertLess(UNIQUE_ENTRIES, NAIVE_FILLS,
+                        "业务 sheet 并集必须严格小于 4 run × 2 sheet 的朴素重复数")
+        # role-neutral: 无 target / 无二元指纹
+        self.assertNotIn("target", ws)
+        self.assertNotIn("fingerprints", ws)
+        # entry-level structure 指纹在场
+        self.assertTrue(all(e.get("structure_sha256") for e in ws["flattened"]))
 
-        # 断言 1：第一次 prepare 后 cache/ 目录数 == 唯一需求数
-        cache_dirs = sorted((self.root / "cache").iterdir())
-        self.assertEqual(len(cache_dirs), UNIQUE_DEMANDS,
-                         "cache/ 目录数 != 唯一 (file,sheet) 需求数 "
-                         "(4 = 3 源 sheet + 1 共享目标模板)")
-        self.assertEqual(report["cache"], {"unique_keys": UNIQUE_DEMANDS,
-                                           "hits": 0, "misses": UNIQUE_DEMANDS})
-        self.assertLess(UNIQUE_DEMANDS, NAIVE_FILLS,
-                        "唯一需求数必须严格小于 4 run × 2 sheet 的朴素重复数")
-        # 每缓存条目恰好三个白名单产物（无 run 产物入缓存 — spec S3）
-        for entry_dir in cache_dirs:
-            self.assertEqual(sorted(p.name for p in entry_dir.iterdir()),
-                             ["digest.md", "flat.csv", "meta.json"])
-        # 4 个 run 全部物化出 manifest（compile-facing 契约在断言 3 对账）
-        for rid in RUN_IDS:
-            self.assertTrue(
-                (self.root / "runs" / rid / "prepare_manifest.json").is_file())
+    def test_materialize_task_projects_every_run(self):
+        """materialize_run --task: 一次遍历全部 runs, 每 run 独立的
+        prepare_manifest (run-local compiler view) + target routing view。"""
+        self._workspace_init()
+        report = self._materialize_task()
+        self.assertEqual(report["code"], "MATERIALIZED_TASK")
+        self.assertEqual(len(report["runs"]), 4)
+        for r in report["runs"]:
+            rid = r["run"]
+            m = json.loads((self.root / "runs" / rid / "prepare_manifest.json")
+                           .read_text(encoding="utf-8"))
+            self.assertEqual(m["schema_version"], 2)
+            self.assertEqual(m["target"]["name"], "filling_template_Sheet1")
+            self.assertTrue(m["fingerprints"]["target_structure"])
+            # target routing view 落盘 (0 probing/flatten/extraction)
+            tv = m["target"]["evidence"]
+            self.assertTrue(tv.endswith("_target_view.md"))
+            run_dir = self.root / "runs" / rid
+            self.assertTrue((run_dir / tv).is_file())
+            # run 目录不复制 raw 输入/共享展平产物 (哈希引用, ADR 0018)
+            self.assertFalse((run_dir / "parameter_book.xlsx").exists(),
+                             "run 目录不应复制 raw 输入")
+            self.assertFalse(list(run_dir.glob("*_flat.csv")),
+                             "run 目录不应复制共享展平产物")
 
-        # 断言 2：第二次 prepare 零新增 + 物化 CSV hash 不变
-        before = materialized_csv_hashes(self.root)
-        proc = run_prepare_task(self.root, "--prepare")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        report2 = json.loads(proc.stdout)
-        self.assertEqual(report2["cache"], {"unique_keys": UNIQUE_DEMANDS,
-                                            "hits": UNIQUE_DEMANDS,
-                                            "misses": 0},
-                         "第二次 prepare 必须全命中（命中路径零 officecli 展平）")
-        self.assertEqual(len(list((self.root / "cache").iterdir())),
-                         UNIQUE_DEMANDS, "第二次 prepare 缓存零新增")
-        after = materialized_csv_hashes(self.root)
-        self.assertEqual(after, before, "物化 CSV 在缓存命中路径下 hash 不变")
-        # 物化 = 逐字节复制：全部 run 的展平 CSV 集合 == 全部缓存条目集合
-        run_csv_set = {p.read_bytes()
-                       for rid in RUN_IDS
-                       for p in (self.root / "runs" / rid).glob("*_flat.csv")}
-        cache_csv_set = {(entry_dir / "flat.csv").read_bytes()
-                         for entry_dir in cache_dirs}
-        self.assertEqual(len(run_csv_set), UNIQUE_DEMANDS)
-        self.assertEqual(run_csv_set, cache_csv_set)
-
-    def test_materialized_csv_and_plan_equivalent_to_single_run(self):
-        """断言 3（结果等价）：物化 CSV 与单 run CSV 逐字节一致；manifest
-        compile-facing 同构；同一 spec 经 public CLI 编译 → plan 等价。"""
-        self._init_and_prepare()
+    def test_materialized_plan_equivalent_to_single_run(self):
+        """断言 2（结果等价）：同一 run 经 materialize 投影与单 run CLI 投影
+        编译 plan 等价（fingerprints/operations 一致）—— materialize 是纯
+        lowering, 不改变 compiler 输入语义。"""
+        self._workspace_init()
+        self._materialize_task()
+        ws = json.loads((self.root / "workspace_manifest.json").read_text(
+            encoding="utf-8"))
         run_dir = self.root / "runs" / "r32-cooling"
+        run_manifest = json.loads((run_dir / "prepare_manifest.json").read_text(
+            encoding="utf-8"))
 
-        # ── 单 run 对照组：同一源书 + 同一模板，prepare_run 全流程 ──
-        single = self.root / "_single_run"
-        single.mkdir()
-        shutil.copy2(self.root / "sources/parameter_book.xlsx",
-                     single / "parameter_book.xlsx")
-        shutil.copy2(self.root / "templates/filling_template.xlsx",
-                     single / "filling_template.xlsx")
-        proc = run_py(single, "prepare_run.py", "--workdir", ".",
-                      "--files",
-                      "parameter_book.xlsx|parameter_book.xlsx,"
-                      "filling_template.xlsx|filling_template.xlsx",
-                      "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(single, "prepare_run.py", "--workdir", ".",
-                      "--flatten",
-                      "--sheets",
-                      "parameter_book.xlsx:R32参数;"
-                      "filling_template.xlsx:Sheet1",
-                      "--target", "filling_template.xlsx")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        # 聚合一致性: 单源 run 的 source_structure == 该 entry 的 entry-level
+        # structure_sha256 (同一 structure_facts 单元素聚合 — ADR 0018)
+        r32_entry = next(e for e in ws["flattened"]
+                         if e["name"] == "parameter_book_R32")
+        self.assertEqual(run_manifest["fingerprints"]["source_structure"],
+                         r32_entry["structure_sha256"],
+                         "run 级聚合指纹必须是 entry-level 指纹的机械派生")
 
-        # 物化 CSV 与单 run CSV 逐字节一致（hash 相等；源 + 目标各一）
-        for csv_name in ("parameter_book_R32_flat.csv",
-                         "filling_template_Sheet1_flat.csv"):
-            task_bytes = (run_dir / csv_name).read_bytes()
-            single_bytes = (single / csv_name).read_bytes()
-            self.assertEqual(task_bytes, single_bytes,
-                             f"{csv_name}: 任务物化产物与单 run 产物不一致")
-            self.assertEqual(file_sha256_hex(run_dir / csv_name),
-                             file_sha256_hex(single / csv_name),
-                             f"{csv_name}: 物化 hash 与单 run hash 不一致")
-
-        # manifest 同构：compile-facing 字段一致，仅多 cache_key/sha256 元数据
-        # （files[].source 是 provenance：task 记录解析后的绝对路径、单 run
-        # 记录 CLI 实参 — staged/sha256 才是 compile 绑定对象，必须一致）
-        task_manifest = json.loads(
-            (run_dir / "prepare_manifest.json").read_text(encoding="utf-8"))
-        single_manifest = json.loads(
-            (single / "prepare_manifest.json").read_text(encoding="utf-8"))
-        for key in ("outlines", "fingerprints"):
-            self.assertEqual(task_manifest[key], single_manifest[key],
-                             f"manifest.{key} 与单 run 不一致")
-        self.assertEqual(
-            [{"staged": f["staged"], "sha256": f["sha256"]}
-             for f in task_manifest["files"]],
-            [{"staged": f["staged"], "sha256": f["sha256"]}
-             for f in single_manifest["files"]],
-            "manifest.files 的 staged/sha256 与单 run 不一致")
-        # 展平条目双向对账：单 run 无多余条目、同名条目 compile-facing 键全等。
-        # Business Reasoning Barrier（ticket 02）有意发散：单 run xlsx 条目是
-        # Pre-MOD 形态（evidence + digest=="deferred"）；task 物化条目是真实
-        # digest 文件、无 evidence —— 各自显式断言，不做整字典相等。
-        single_by_name = {e["name"]: e for e in single_manifest["flattened"]}
-        task_by_name = {e["name"]: e for e in task_manifest["flattened"]}
-        self.assertEqual(set(single_by_name), set(task_by_name),
-                         "task 与单 run 的展平条目名集合不一致")
-        for name, entry in task_by_name.items():
-            self.assertEqual(compile_keys(entry), compile_keys(single_by_name[name]),
-                             f"展平条目 {name} compile-facing 键与单 run 不一致")
-            self.assertEqual(set(entry) - set(single_by_name[name]),
-                             {"sha256", "cache_key"})
-        for name, entry in single_by_name.items():
-            self.assertEqual(entry["evidence"], f"{name}_premod_evidence.md")
-            self.assertEqual(entry["digest"], "deferred")
-        for name, entry in task_by_name.items():
-            self.assertNotIn("evidence", entry)
-            self.assertEqual(entry["digest"], f"{name}_digest.md")
-        self.assertEqual(task_manifest["fingerprints"]["source_structure"],
-                         single_manifest["fingerprints"]["source_structure"])
-
-        # plan 等价：同一构建器产出的 fill_spec（两 workdir 指纹一致 →
-        # spec 文本一致）经 public CLI compile_fill.py 编译
-        spec_task = build_fill_spec(run_dir, "R32参数", "R32",
-                                    "issue 08 e2e")
-        spec_single = build_fill_spec(single, "R32参数", "R32",
-                                      "issue 08 e2e 单 run 对照")
-        proc = run_py(run_dir, "compile_fill.py", "--spec", str(spec_task),
-                      "--workdir", ".")
+        # 编译 run 并断言 plan 结构完整
+        spec_path = build_fill_spec(run_dir, "R32参数", "R32", "multi-run e2e")
+        proc = compile_run(self.root, "r32-cooling")
         self.assertEqual(proc.returncode, 0,
                          proc.stdout[-800:] + proc.stderr[-800:])
-        proc = run_py(single, "compile_fill.py", "--spec", str(spec_single),
-                      "--workdir", ".")
+        plan = json.loads((run_dir / "execution_plan.json").read_text(
+            encoding="utf-8"))
+        self.assertGreater(plan["operation_count"], 0)
+        self.assertIn("parameter_book_R32_flat.csv", plan["source_csv"])
+
+    def test_full_multi_run_flow_to_delivered(self):
+        """断言 3（完整多 run 流程）：一次 workspace_init → 一次 materialize
+        --task → 逐 run compile → Spec Review 一次覆盖全部 run → 逐 run
+        execute → promote。每 run 独立交付文件；无 task 状态机产物
+        （task_status/cache/调度器）。"""
+        self._workspace_init()
+        self._materialize_task()
+
+        # 逐 run: spec + compile (任务级一次 MOD 裁决)
+        write_mod_resolution(self.root)
+        for rid in RUN_IDS:
+            sheet, slug = RUN_SHEETS[rid]
+            build_fill_spec(self.root / "runs" / rid, sheet, slug,
+                            "multi-run e2e")
+        for rid in RUN_IDS:
+            proc = compile_run(self.root, rid)
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout[-800:] + proc.stderr[-800:])
+
+        # Spec Review: 一次摘要覆盖全部 run, 一次确认绑定全部 run 哈希
+        proc = run_py(self.root, "spec_review.py", "--workdir", ".",
+                      "--task", "task.yaml")
         self.assertEqual(proc.returncode, 0,
                          proc.stdout[-800:] + proc.stderr[-800:])
-        plan_task = json.loads(
-            (run_dir / "execution_plan.json").read_text(encoding="utf-8"))
-        plan_single = json.loads(
-            (single / "execution_plan.json").read_text(encoding="utf-8"))
-        for key in ("input_hashes", "fingerprints", "operations",
-                    "operation_count", "warnings", "key_outputs",
-                    "expected_final_row_count", "structural_deltas"):
-            self.assertEqual(plan_task[key], plan_single[key],
-                             f"plan.{key} 在 task 与单 run 编译间发散")
-        self.assertGreater(plan_task["operation_count"], 0)
-        # 期望行数 = base_last_row(4) + 源数据行数（从产物真值推导，非硬编码）
-        self.assertEqual(plan_task["expected_final_row_count"],
-                         4 + matched_source_rows(run_dir, "R32"))
+        self.assertTrue((self.root / "spec_review.json").is_file())
+        proc = run_py(self.root, "spec_review.py", "--workdir", ".",
+                      "--task", "task.yaml", "--confirm")
+        self.assertEqual(proc.returncode, 0,
+                         proc.stdout[-800:] + proc.stderr[-800:])
+        confirm = json.loads(
+            (self.root / "review_confirm.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(r["run_id"] for r in confirm["runs"]),
+                         set(RUN_IDS), "一次确认必须绑定全部 4 个 run 的哈希")
 
-    def test_full_task_flow_to_promoted(self):
-        """完整 task 流程走通：prepare_task → compile+execute+gate（--run，
-        execute 竞态经 resume 恢复）→ gate_task --set → --confirm → promote
-        （outputs/ 落盘、status 全 promoted、幂等重跑 noop）。"""
-        report = self._init_and_prepare()
-        self.assertEqual(report["cache"]["misses"], UNIQUE_DEMANDS)
-        write_all_run_specs(self.root)
-
-        proc, via_resume = drive_to_gate(self.root)
-        if via_resume:
-            # 经 resume 恢复：报告形态是 resume 的（阶段信息在 checkpoints/
-            # stages 且 semantics 相同）；结构性断言改由状态 + 证据承担
-            out = json.loads(proc.stdout)
-            self.assertIn(out["code"], ("TASK_RESUME_GATE_PENDING",
-                                        "TASK_RESUMED"))
-            self.assertEqual(out["failures"], [])
-        else:
-            out = json.loads(proc.stdout)
-            self.assertEqual(out["code"], "TASK_RUN_GATE_PRESENTED")
-            # 全流程结构性断言：唯一需求数展平（--run 阶段 1 全命中 + 零新增）
-            self.assertEqual(out["cache"], {"unique_keys": UNIQUE_DEMANDS,
-                                            "hits": UNIQUE_DEMANDS,
-                                            "misses": 0})
-            self.assertEqual(len(list((self.root / "cache").iterdir())),
-                             UNIQUE_DEMANDS)
-            by_stage = {s["stage"]: s for s in out["stages"]}
-            self.assertEqual([by_stage[s]["ok"] for s in
-                              ("run_prepare", "compile", "execute", "gate")],
-                             [4, 4, 4, 4])
-        # 每 run：draft + receipt + pending 呈现证据齐全（无 crash window 残余）
+        # 逐 run execute (串行 — 单 Office resident 窗口) + promote
         for rid in RUN_IDS:
             run_dir = self.root / "runs" / rid
-            self.assertTrue((run_dir / "validated_draft.xlsx").is_file())
-            self.assertTrue((run_dir / "draft_receipt.json").is_file())
-            self.assertTrue((run_dir / ".gate3_pending").is_file())
+            proc = run_py(run_dir, "execute_batch.py", "--plan",
+                          "execution_plan.json", "--template",
+                          str(self.root / "filling_template.xlsx"),
+                          "--workdir", ".", "--round", "1", "--render", "html",
+                          "--staged-root", str(self.root),
+                          "--review-confirm",
+                          str(self.root / "review_confirm.json"))
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout[-800:] + proc.stderr[-800:])
+            receipt = json.loads((run_dir / "draft_receipt.json").read_text(
+                encoding="utf-8"))
+            self.assertTrue(receipt["readback"]["passed"] > 0)
+            final = self.root / "outputs" / OUTPUTS[rid]
+            final.parent.mkdir(parents=True, exist_ok=True)
+            proc = run_py(run_dir, "promote_output.py", "--workdir", ".",
+                          "--final", str(final), "--staged-root", str(self.root))
+            self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
-        # 聚合呈现（一次人机交互）
-        proc = run_py(self.root, "gate_task.py", "--task-root", str(self.root),
-                      "--set")
-        self.assertEqual(proc.returncode, 0,
-                         proc.stdout[-800:] + proc.stderr[-800:])
-        summary = json.loads(
-            (self.root / "gate_summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(summary["runs"]), set(RUN_IDS),
-                         "呈现集合应覆盖全部 4 个 drafted run")
-        self.assertEqual(summary["gaps"], [])
-
-        # 确认展开 → promote（final hash == 已确认 draft hash，逐 run）
-        proc = run_py(self.root, "gate_task.py", "--task-root", str(self.root),
-                      "--confirm")
-        self.assertEqual(proc.returncode, 0,
-                         proc.stdout[-800:] + proc.stderr[-800:])
-        out = json.loads(proc.stdout)
-        self.assertEqual(out["code"], "GATE_CONFIRMED_AND_PROMOTED")
-        self.assertEqual(sorted(out["confirmed"]), sorted(RUN_IDS))
-        self.assertEqual(sorted(out["promoted"]), sorted(RUN_IDS))
-        self.assertEqual(out["gate"]["state"], "promoted")
+        # 每 run 独立交付文件, 无合并产物
         for rid in RUN_IDS:
-            run_dir = self.root / "runs" / rid
             final = self.root / "outputs" / OUTPUTS[rid]
             self.assertTrue(final.is_file(), f"{rid} 最终输出缺失")
-            final_receipt = json.loads(
-                (run_dir / "final_receipt.json").read_text(encoding="utf-8"))
-            self.assertEqual(final_receipt["final_sha256"],
-                             file_sha256_hex(final))
-            self.assertEqual(final_receipt["draft_sha256"],
-                             file_sha256_hex(run_dir / "validated_draft.xlsx"))
-        status = json.loads(
-            (self.root / "task_status.json").read_text(encoding="utf-8"))
-        for rid in RUN_IDS:
-            self.assertEqual(status["runs"][rid]["state"], "promoted")
-            self.assertIsNone(status["runs"][rid]["superseded_by"])
+        self.assertEqual(
+            sorted(p.name for p in (self.root / "outputs").iterdir()),
+            sorted(OUTPUTS.values()))
+        self.assertFalse((self.root / "assembly").exists())
 
-        # 幂等重跑 --confirm：全部终态 → noop（不重复确认/交付）
-        proc = run_py(self.root, "gate_task.py", "--task-root", str(self.root),
-                      "--confirm")
-        self.assertEqual(proc.returncode, 0,
-                         proc.stdout[-800:] + proc.stderr[-800:])
-        self.assertEqual(json.loads(proc.stdout)["code"], "GATE_NOOP")
-
-    def test_execute_crash_window_resume_recovers(self):
-        """恢复由 artifact 驱动（spec S7 实证路径，Office 级）：execute
-        crash window（draft 存在但 receipt 缺失）→ resume_task --resume
-        按证据重跑 execute + 重呈现 gate，不靠 status 猜测、不自动越过
-        Gate。"""
-        self._init_and_prepare()
-        write_all_run_specs(self.root)
-        drive_to_gate(self.root)  # 失败竞态同样由 resume 恢复
-
-        # 模拟 execute 在「写 draft 与写 receipt 之间」崩溃：
-        # 删除任一 run 的 receipt（证据链断裂，呈现随之失效）
-        rid = "r22-cooling"
-        run_dir = self.root / "runs" / rid
-        (run_dir / "draft_receipt.json").unlink()
-        (run_dir / ".gate3_pending").unlink()
-
-        proc = run_py(self.root, "resume_task.py", "--task-root", str(self.root),
-                      "--resume")
-        self.assertEqual(proc.returncode, 0,
-                         proc.stdout[-800:] + proc.stderr[-800:])
-        report = json.loads(proc.stdout)
-        self.assertEqual(report["failures"], [])
-        # 证据真值：receipt 重建（execute 重跑）、pending 重建（gate 重呈现）、
-        # 状态推进到 gated —— 未自动确认、未自动 promote（fail-closed）
-        self.assertTrue((run_dir / "draft_receipt.json").is_file())
-        self.assertTrue((run_dir / ".gate3_pending").is_file())
-        self.assertTrue((run_dir / "validated_draft.xlsx").is_file())
-        status = json.loads(
-            (self.root / "task_status.json").read_text(encoding="utf-8"))
-        self.assertEqual(status["runs"][rid]["state"], "gated")
-        other = json.loads(
-            (run_dir.parent / "r32-cooling" / "draft_receipt.json")
-            .read_text(encoding="utf-8"))
-        self.assertIn("draft_sha256", other)  # 未受影响的 run 证据原样
+        # 无 task 状态机产物: 无 task_status / cache / 调度文件
+        self.assertFalse((self.root / "task_status.json").exists(),
+                         "Task runtime 已退役: 无 task_status (ADR 0020)")
+        self.assertFalse((self.root / "cache").exists(),
+                         "无共享 cache 生命周期 (ADR 0020)")
 
 
 if __name__ == "__main__":
