@@ -1,0 +1,19 @@
+# task_topology_1run.yaml — 单 run 任务的 1-run 拓扑骨架（Ticket 03 示例）
+#
+# 单 run 任务：Topology Check 产出 1-run skeleton（同样合法、通过同一静态
+#   校验与 --init）或明确记录跳过 —— 对单 run 任务不强制 Task 层，
+#   仍走单 run 的五个公开命令。本文件演示 1-run skeleton 形态：
+#   一个 run、共享事实退化为该 run 自身的引用，无任何业务映射键。
+task:
+  id: topology-1run-demo
+  customer: 合成演示
+  notes: 1-run skeleton — 单 run 不强制 Task 层，但 1-run 骨架同样可校验/可初始化
+runs:
+  - id: only-run
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_single.xlsx

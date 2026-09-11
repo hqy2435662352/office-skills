@@ -13,17 +13,28 @@ scripts/task_schema.py — Task Artifact Model（issue 01，spec S2）。
 它是契约测试 seam（spec Testing Decision #3）——prepare_task.py 及后续 task 层
 脚本全部经由这里读写三类文件。
 
-冻结语义（与 spec S7 失败二分一致）：
+冻结语义（与 spec S7 失败二分一致 + T04 输入事实边界）：
 - `--init` 写“声明快照”：run 清单 + 输入/输出引用 + task.yaml 指纹，frozen_at
-  记录封存时刻；此后任何脚本都不得静默重派生（task.yaml 变化 = 输入事实变化，
-  fail-closed → supersede / 显式恢复）。
+  记录封存时刻；此后任何脚本都不得静默重派生。
+- 冻结维度 = input fact state（spec D4 / T04）：run 清单 + 每条 run 的
+  source.file / source.sheets / target.template / target.sheet（执行契约 =
+  源/模板/sheet 角色）。非输入字段（target.output 输出命名、notes/customer
+  元数据、template_family 记录）变化不触发 MANIFEST_STALE — 输出改名不再
+  连锁删除重 init。
+- 输入文件内容 hash 漂移不由 check_frozen 承担（它是纯函数，不读文件）：
+  prepare prelude 的 SOURCE_HASH_DRIFT / CACHE_REF_DRIFT / FINGERPRINT_DRIFT
+  按 staged 文件 SHA-256 比对阻塞（fail-closed 不变）；MOD 裁决在 run 目录
+  mod_resolution.json（run 级、prepare 后产生），由 compile C2/C3 按 run
+  校验，不在本快照冻结结构内。
 - prepare 阶段（issue 02）是唯一被授权“补全”快照的写者：staged_files /
   outlines / flatten_cache_refs / fingerprints 四类容器由它在输入事实确定时
   一次性填齐 —— check_frozen 保证补全前引用关系仍与 task.yaml 一致。
 
-状态集合（spec S7 主路径 + superseded 终止分支）:
-  planned → prepared → compiled → drafted → gated → promoted
-  superseded（保留证据的终止分支）
+状态集合（v3 收敛：去 gate/promote/supersede）:
+  planned → prepared → compiled → drafted → delivered
+
+交付 = 哈希核对复制（verify 全绿自动交付，无 marker、无确认环节）。
+版本历史 = 文件版本命名，无迭代/替代抽象。
 
 业务映射永远不在 task.yaml 里：mapping/lookup/transform/formula/validation
 rule 只属于 runs/<id>/fill_spec.yaml。
@@ -50,9 +61,8 @@ TASK_STATUS_NAME = "task_status.json"
 MANIFEST_SCHEMA_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 
-# spec S7: 主路径状态 + superseded 终止分支
-RUN_STATES = ("planned", "prepared", "compiled", "drafted", "gated",
-              "promoted", "superseded")
+# v3 收敛: 主路径状态（去 gate/promote/superseded）
+RUN_STATES = ("planned", "prepared", "compiled", "drafted", "delivered")
 
 # task id / run id 会成为目录与文件名（run 目录 runs/<id>/），必须 ASCII 安全
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -77,10 +87,27 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# task.yaml 禁止携带的业务规则键（spec S2 #4: 业务映射永远在
-# runs/<id>/fill_spec.yaml，这里是 MOD Resolution 产物的消费方，不是生产方）
+# task.yaml 禁止携带的业务规则 / 状态键（spec S2 #4 + ticket 08 Task 不变量:
+# run 清单只允许 run 引用与共享输入引用三类字段; mapping/lookup/transform/
+# formula/validation 是业务映射, policy 是业务策略, status 是状态字段 ——
+# 任一出现即 fail-closed 拒绝, Task 永不重新长成 DSL）。业务映射永远在
+# runs/<id>/fill_spec.yaml（这里是 MOD Resolution 产物的消费方，不是生产方）。
 BUSINESS_RULE_KEYS = ("mapping", "lookup", "transform", "formula",
-                      "validation", "validation_rules")
+                      "validation", "validation_rules", "policy", "status")
+
+# Task 输入事实边界（spec D4 / T04）：
+#   - 冻结：每条 run 的 source.file / source.sheets / target.template /
+#     target.sheet。这些是执行契约（源/模板/sheet 角色）与 sheet 引用，
+#     变化 = Task 输入事实变化（MANIFEST_STALE，fail-closed）。
+#   - 不冻结：target.output（输出命名）、task.notes/customer（元数据）、
+#     template_family（仅记录，D6 不实现）—— 修改它们不触发 MANIFEST_STALE。
+#   - 文件内容 hash 漂移由 prepare prelude（SOURCE_HASH_DRIFT 等，按
+#     staged_files 登记 SHA-256 比对）承担；MOD 裁决（mod_resolution.json）
+#     在 run 目录、prepare 后产生，不在 task 冻结结构内（compile C2/C3 按
+#     run 校验）。输入事实改变 = 重新初始化（删除 derived 文件后 --init），
+#     无 supersede 抽象（版本历史 = 文件版本命名）。
+INPUT_FACT_DECL_FIELDS = (("source", "file"), ("source", "sheets"),
+                          ("target", "template"), ("target", "sheet"))
 
 
 # ── task.yaml 解析与加载 ──────────────────────────────────────────────
@@ -324,7 +351,10 @@ def derive_task_manifest(task: dict, yaml_sha256: str, *,
     """Task Prepare Snapshot 骨架：run 声明的输入/输出引用 + 待填充载体。
 
     语义 = “这个任务基于什么输入”；--init 落盘时记 frozen_at（封存时刻），
-    此后不静默重派生。四类事实容器由 prepare 阶段（issue 02，唯一授权写者）
+    此后不静默重派生。task 块的 yaml_sha256 是**信息性指纹**（记录本次
+    封存对应的 task.yaml 版本），不是冻结判据 —— 冻结判据是 runs 声明中的
+    输入事实字段（INPUT_FACT_DECL_FIELDS，见 check_frozen / spec D4）。
+    四类事实容器由 prepare 阶段（issue 02，唯一授权写者）
     在输入事实确定时一次性填齐：
       staged_files        登记文件 + SHA-256（形如 prepare_manifest 的 files 条目）
       outlines            每文件 outline 文本
@@ -366,7 +396,7 @@ def derive_task_status(task: dict, yaml_sha256: str, *,
         "schema_version": STATUS_SCHEMA_VERSION,
         "task": {"id": task["task"]["id"], "yaml": TASK_YAML_NAME,
                  "yaml_sha256": yaml_sha256},
-        "runs": {r["id"]: {"state": "planned", "superseded_by": None}
+        "runs": {r["id"]: {"state": "planned"}
                  for r in task["runs"]},
         "updated_at": updated_at or utc_now_iso(),
     }
@@ -398,22 +428,41 @@ def load_status(task_root) -> tuple[dict | None, dict | None]:
                         "修复或移除损坏文件后重试（status 只能由任务脚本写入）")
 
 
-def check_frozen(task: dict, yaml_sha256: str, manifest: dict) -> list[dict]:
-    """冻结一致性：manifest 与 task.yaml 的引用关系可追溯（run id 一一对应），
-    且 task.yaml 自封存后未被修改。返回缺陷清单；空 = 一致。
+def _decl_value(run: dict, section: str, key: str):
+    """run 声明的字段取值（source/target 下找）；缺节/缺键 → None（视为漂移）。"""
+    return (run.get(section) or {}).get(key)
 
-    task.yaml 内容变化 = 输入事实变化（fail-closed，不静默重派生）；恢复路径
-    由失败二分决定（supersede / 显式删除重建），见 spec S7。"""
+
+def check_frozen(task: dict, manifest: dict) -> list[dict]:
+    """冻结一致性：manifest 与 task.yaml 的输入事实声明可追溯（run id 一一
+    对应 + 输入事实字段一致），task.yaml 自封存后输入事实未被修改。返回缺陷
+    清单；空 = 一致。
+
+    冻结维度 = input fact state（spec D4 / T04）：
+      冻结：run 清单 + 每条 run 的 INPUT_FACT_DECL_FIELDS（source.file /
+            source.sheets / target.template / target.sheet —— 执行契约 =
+            源/模板/sheet 角色）。
+      不冻结：target.output（输出命名）、notes/customer（元数据）、
+            template_family（仅记录）—— 修改它们不 MANIFEST_STALE。
+      文件内容 hash 漂移（source/template 内容变化）不由本函数承担（纯函数，
+      不读文件）：prepare prelude 的 SOURCE_HASH_DRIFT / CACHE_REF_DRIFT /
+      FINGERPRINT_DRIFT 按 staged 文件 SHA-256 比对阻塞（fail-closed 不变）。
+      MOD 裁决（selected MOD + revision）在 run 目录 mod_resolution.json（run
+      级、prepare 后产生），不在本 task 冻结结构内 —— compile（C2/C3）按 run
+      校验。manifest 的 task.yaml 全文件指纹
+      （yaml_sha256）仍记录（信息性），不再是冻结判据。
+
+    恢复路径由失败二分决定（重新初始化 / 显式删除重建），见 spec S7。"""
     defects: list[dict] = []
     m_task = manifest.get("task") if isinstance(manifest, dict) else None
     if not isinstance(m_task, dict):
         defects.append(_d("MANIFEST_INVALID", "task_manifest.json 缺 task 块",
                           "移除损坏文件后重新 --init"))
-    elif m_task.get("yaml_sha256") != yaml_sha256:
+    elif m_task.get("id") != task["task"]["id"]:
         defects.append(_d("MANIFEST_STALE",
-                          "task.yaml 已变化，输入快照已封存（不静默重派生）",
-                          "失败二分：输入事实改变 → 已有产物走 supersede（issue 04）；"
-                          "尚无产物时，删除 task_manifest.json 与 task_status.json 后重新 --init",
+                          "manifest 记录的 task id 与当前 task.yaml 不一致"
+                          "（快照属于另一个任务）",
+                          "失败二分：输入事实改变 → 删除 task_manifest.json 与 task_status.json 后重新 --init",
                           at="task.yaml"))
     m_runs = manifest.get("runs") if isinstance(manifest, dict) else None
     if not isinstance(m_runs, dict):
@@ -429,25 +478,65 @@ def check_frozen(task: dict, yaml_sha256: str, manifest: dict) -> list[dict]:
                               "manifest 的 run id 与 task.yaml 不一致"
                               + (f"（缺: {missing}）" if missing else "")
                               + (f"（多: {extra}）" if extra else ""),
-                              "manifest 是脚本产物，禁止手改；删除后重新 --init 或走 supersede",
+                              "manifest 是脚本产物，禁止手改；删除后重新 --init",
                               at="task_manifest.json"))
+        else:
+            # run id 一一对应前提下的输入事实比对：非输入字段
+            # （target.output / notes / template_family）改动不在此列。
+            changed = []
+            for run in task["runs"]:
+                rid = run["id"]
+                old = m_runs.get(rid)
+                if not isinstance(old, dict):
+                    changed.append(rid)
+                    continue
+                for section, key in INPUT_FACT_DECL_FIELDS:
+                    if _decl_value(run, section, key) != _decl_value(old, section, key):
+                        changed.append(rid)
+                        break
+            if changed:
+                defects.append(_d(
+                    "MANIFEST_STALE",
+                    "task.yaml 的输入事实声明已变化"
+                    f"（{'、'.join(changed)}：source/template/sheet 引用）"
+                    "—— 输入快照已封存（不静默重派生）",
+                    "失败二分：输入事实改变 → 删除 task_manifest.json 与 task_status.json 后重新 --init",
+                    at="task.yaml"))
     return defects
 
 
-def check_status(task: dict, status: dict, yaml_sha256: str | None = None) -> list[dict]:
-    """运行时状态一致性：run id 一一对应 + 状态值 ∈ RUN_STATES +
-    与 task.yaml 的绑定指纹一致（手改侦测，与 check_frozen 同等严格）。"""
+def check_status(task: dict, status: dict,
+                 manifest: dict | None = None) -> list[dict]:
+    """运行时状态一致性：run id 一一对应 + 状态值 ∈ RUN_STATES + 与冻结快照
+    （manifest）同代绑定（手改侦测，与 check_frozen 同等严格）。
+
+    T04（spec D4）：绑定维度从「task.yaml 全文件 yaml_sha256」收敛为输入
+    事实边界 —— status 绑定冻结快照本身（task id 相同 + yaml_sha256 与
+    manifest 同代），不直接比对 task.yaml 全文件指纹：输出命名/notes 等非
+    输入修改不再触发 STATUS_STALE；输入事实修改由 check_frozen（声明）或
+    SOURCE_HASH_DRIFT（内容）先行阻塞，绝不走到这里还放行。
+    manifest 为 None 时跳过快照绑定检查（仅 run 清单 / 状态校验）。"""
     defects: list[dict] = []
     s_task = status.get("task") if isinstance(status, dict) else None
-    if yaml_sha256 is not None and not isinstance(s_task, dict):
+    if manifest is not None and not isinstance(s_task, dict):
         defects.append(_d("STATUS_INVALID", "task_status.json 缺 task 块",
                           "修复或移除损坏文件后重试（status 只能由任务脚本写入）"))
-    elif yaml_sha256 is not None and s_task.get("yaml_sha256") != yaml_sha256:
-        defects.append(_d("STATUS_STALE",
-                          "task_status.json 记录的 task.yaml 指纹与现文件不一致（陈旧或手改）",
-                          "status 只能由任务脚本写入；恢复被改动的 task 块，"
-                          "或按失败二分走 supersede（issue 04）",
-                          at="task_status.json"))
+    elif manifest is not None:
+        if s_task.get("id") != task["task"]["id"]:
+            defects.append(_d("STATUS_STALE",
+                              "task_status.json 绑定的 task id 与当前任务不一致"
+                              "（status 属于另一个任务或陈旧）",
+                              "status 只能由任务脚本写入；恢复被改动的 task 块，"
+                              "或按失败二分重新初始化",
+                              at="task_status.json"))
+        m_task = manifest.get("task") if isinstance(manifest, dict) else None
+        if (isinstance(m_task, dict)
+                and s_task.get("yaml_sha256") != m_task.get("yaml_sha256")):
+            defects.append(_d("STATUS_STALE",
+                              "task_status.json 与冻结快照不同代（陈旧或手改）",
+                              "status 只能由任务脚本写入；恢复被改动的 task 块，"
+                              "或按失败二分重新初始化",
+                              at="task_status.json"))
     s_runs = status.get("runs") if isinstance(status, dict) else None
     if not isinstance(s_runs, dict):
         defects.append(_d("STATUS_INVALID", "task_status.json 缺 runs 块",

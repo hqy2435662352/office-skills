@@ -1,0 +1,38 @@
+# task_topology_3runs.yaml — Ticket 03 的 3-run 拓扑骨架（data-neutral 示例）
+#
+# Task Topology Check（Prepare Outline/Manifest 后、业务映射前）的落盘形态：
+#   只有 run 清单 + 引用 —— 与同目录 task_text.md 的任务文本信号
+#   （3 个系列 / 每个系列一个）一一对应为 3 条 run。
+# shared_source / shared_template 是跨 run 相同的 (file, sheet) 需求，
+#   由 run 清单派生（本文件不设独立共享声明节 — TASK_ORCHESTRATION §1.1）。
+# 业务映射（哪个值填到哪格）永远不在此处，只在各 run 的
+#   runs/<id>/fill_spec.yaml（MOD 规则指导撰写）。
+task:
+  id: topology-3runs-demo
+  customer: 合成演示
+  notes: 拓扑骨架示例 — 3 个系列 / 每个系列一个输出，共享源书与客户模板
+runs:
+  - id: series-01
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_series_01.xlsx
+  - id: series-02
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_series_02.xlsx
+  - id: series-03
+    source:
+      file: sources/parameter_book.xlsx
+      sheets: [R32参数, R410A参数]
+    target:
+      template: templates/filling_template.xlsx
+      sheet: Sheet1
+      output: out_series_03.xlsx

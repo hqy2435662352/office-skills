@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from _officecli import (  # noqa: E402
-    ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
+    ensure_utf8_stdio as _utf8_stdio, fail,
     sha256_file,
 )
 from flatten_table import CLONE_ROLES  # noqa: E402
@@ -92,6 +92,58 @@ def col_letter(idx: int) -> str:
     return s
 
 
+def col_letter_idx(letter: str) -> int:
+    """列字母 → 0 基列索引 (B→1); 不合法的字母串退化为大数 (排最后)."""
+    idx = 0
+    for ch in letter.strip().upper():
+        if not ("A" <= ch <= "Z"):
+            return 10**9
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1 if idx else 10**9
+
+
+def parse_candidate_headers(csv_path: Path, header_band: dict) -> dict:
+    """候选列头: header band 最后一行 (数据起始行前一行) 的非空值 per column.
+
+    机械事实 (展示结构, 不裁决 shape)——如列头行含产品系列名 12K/18K/24K,
+    输出 `D=12K E=18K F=24K` 供 LLM 直接读出 record axis 候选。读取失败
+    静默返回 {} (可选事实, 不致命)。"""
+    if not csv_path or not csv_path.is_file():
+        return {}
+    target = header_band.get("data_start_row", 0) - 1
+    if target < 1:
+        return {}
+    cands: dict[int, str] = {}
+    try:
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            for line in reader:
+                if not line:
+                    continue
+                try:
+                    orig = int(line[-1].strip())
+                except (ValueError, IndexError):
+                    continue
+                if orig != target:
+                    continue
+                for idx, val in enumerate(line[:-1]):
+                    v = val.strip()
+                    if v:
+                        cands[idx] = v
+    except OSError:
+        return {}
+    return cands
+
+
+def value_columns(meta: dict) -> list[str]:
+    """有效值列: meta.columns 中 nonempty>0 的列字母清单 (按列序, 机械事实)."""
+    cols = meta.get("columns") or []
+    letters = [c.get("col") for c in cols
+               if isinstance(c, dict) and c.get("col")
+               and c.get("nonempty", 0) > 0]
+    return sorted(set(letters), key=col_letter_idx)
+
+
 def fmt_num(v) -> str:
     if isinstance(v, float):
         return f"{v:.4g}"
@@ -141,8 +193,23 @@ def build_digest(meta: dict, csv_path: Path, candidates: dict | None,
     if col_names:
         names = " | ".join(col_names.get(i, "?") for i in range(max(col_names) + 1))
         lines.append(f"- 表头: {names}")
-    elif hb:
+    if hb:
         lines.append(f"- 表头带: 行 {hb.get('header_rows')} 数据起始行 {hb.get('data_start_row')}")
+
+    # bbox 机械事实 (flatten meta, 无额外探测): 值域 vs 样式/列宽延伸域分开报告
+    if meta.get("value_bbox"):
+        lines.append(f"- value_bbox: {meta['value_bbox']}")
+    if meta.get("style_bbox"):
+        lines.append(f"- style_bbox: {meta['style_bbox']}")
+
+    # 轻量 axis evidence (展示结构, 不裁决 shape)
+    vcols = value_columns(meta)
+    if vcols:
+        lines.append("- 有效值列: " + " ".join(vcols))
+    cand_headers = parse_candidate_headers(csv_path, hb)
+    if cand_headers:
+        parts = [f"{col_letter(i)}={cand_headers[i]}" for i in sorted(cand_headers)]
+        lines.append("- 候选列头: " + " ".join(parts))
 
     blocks = meta.get("blocks") or []
     if blocks:
@@ -154,7 +221,7 @@ def build_digest(meta: dict, csv_path: Path, candidates: dict | None,
                 f"\"{title}\" (score {b.get('score', '?')})"
             )
     else:
-        lines.append("- 数据块: 无自动候选 (LLM 依摘要与业务上下文判定)")
+        lines.append("- 标题型数据块: 无自动候选（不代表不存在重复记录区）")
 
     merged = meta.get("merged_ranges") or []
     if merged:
@@ -282,8 +349,23 @@ def build_premod_evidence(meta: dict, csv_path: Path, candidates: dict | None,
     if col_names:
         names = " | ".join(col_names.get(i, "?") for i in range(max(col_names) + 1))
         lines.append(f"- 表头: {names}")
-    elif hb:
+    if hb:
         lines.append(f"- 表头带: 行 {hb.get('header_rows')} 数据起始行 {hb.get('data_start_row')}")
+
+    # bbox 机械事实 (flatten meta, 无额外探测): 值域 vs 样式/列宽延伸域分开报告
+    if meta.get("value_bbox"):
+        lines.append(f"- value_bbox: {meta['value_bbox']}")
+    if meta.get("style_bbox"):
+        lines.append(f"- style_bbox: {meta['style_bbox']}")
+
+    # 轻量 axis evidence (展示结构, 不裁决 shape)
+    vcols = value_columns(meta)
+    if vcols:
+        lines.append("- 有效值列: " + " ".join(vcols))
+    cand_headers = parse_candidate_headers(csv_path, hb)
+    if cand_headers:
+        parts = [f"{col_letter(i)}={cand_headers[i]}" for i in sorted(cand_headers)]
+        lines.append("- 候选列头: " + " ".join(parts))
 
     blocks = meta.get("blocks") or []
     if blocks:
@@ -294,7 +376,7 @@ def build_premod_evidence(meta: dict, csv_path: Path, candidates: dict | None,
                 f"(score {b.get('score', '?')})"
             )
     else:
-        lines.append("- 数据块: 无自动候选 (LLM 依摘要与业务上下文判定)")
+        lines.append("- 标题型数据块: 无自动候选（不代表不存在重复记录区）")
 
     merged = meta.get("merged_ranges") or []
     if merged:
