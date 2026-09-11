@@ -22,7 +22,7 @@ from pathlib import Path
 
 from _officecli import (  # noqa: E402
     ensure_utf8_stdio as _utf8_stdio, fail, officecli,
-    record_timing as _record_timing, sha256_file,
+    sha256_file,
 )
 
 

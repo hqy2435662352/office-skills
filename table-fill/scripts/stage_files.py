@@ -4,7 +4,7 @@ scripts/stage_files.py — Layer 0: stage input files into an ASCII workdir.
 
 Standard action (NOT conditional): every table-fill run copies all input files
 into an ASCII-only workdir with English names BEFORE Layer 1. This eliminates
-the three failure classes observed on Windows with Chinese paths:
+the four failure classes observed on Windows with Chinese paths:
   1. NON_ASCII_PATH — officecli batch/set fails with Access denied on Chinese
      paths ('get' may work, 'set'/'batch' will not).
   2. Read-only source files — copy2 preserves the read-only attribute, so the
@@ -12,6 +12,12 @@ the three failure classes observed on Windows with Chinese paths:
      every staged copy (and repairs stale read-only copies).
   3. Fragile names — spaces/parens/special chars in Chinese filenames break
      shell quoting; English names avoid the class entirely.
+   4. Extensionless staged names — officecli opens files by extension and
+      rejects a bare 'source_guili' with rc=1 + 'Unsupported file type: .' on
+      STDOUT (empty stderr — invisible to stderr-based error reporting). An
+      ASCII staged name without a suffix is therefore copied with the source
+      file's suffix appended (source_guili -> source_guili.xlsx). Names that
+      already carry a suffix are used verbatim.
 
 Idempotent: if the staged copy already exists with identical size+mtime, the
 copy is skipped (safe for repeated runs of the same task).
@@ -60,6 +66,19 @@ def _same_file(src: Path, dst: Path) -> bool:
         return False
 
 
+def _with_office_suffix(name: str, src: Path) -> str:
+    """Append the source suffix when the ASCII staged name has none.
+
+    officecli opens files by extension; an extensionless staged copy (e.g.
+    'source_guili') makes every officecli call fail with rc=1 +
+    'Unsupported file type: .' delivered on STDOUT — empty stderr, so the
+    shared adapter reports a silent rc=1. Suffixed names are verbatim."""
+    if Path(name).suffix:
+        return name
+    suffix = src.suffix
+    return name + suffix if suffix else name
+
+
 def stage_files(workdir: Path, entries: list[tuple[str, str]]) -> list[dict]:
     """Copy each (src, name) entry into workdir. Returns per-file records."""
     records = []
@@ -77,6 +96,7 @@ def stage_files(workdir: Path, entries: list[tuple[str, str]]) -> list[dict]:
                 "message": "source file not found",
             })
             continue
+        name = _with_office_suffix(name, src)  # 'source_guili' -> 'source_guili.xlsx'
         dst = workdir / name
         try:
             if dst.exists() and _same_file(src, dst):
@@ -137,7 +157,7 @@ def main():
         "file_count": len(records),
         "files": records,
         "corrective_action": "Fix the failing source paths / ASCII staged names, "
-                             "then re-run prepare_run",
+                             "then re-run workspace_init --init",
     }
     print(json.dumps(report, ensure_ascii=False, indent=2), file=sys.stderr)
 

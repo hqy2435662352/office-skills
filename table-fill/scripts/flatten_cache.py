@@ -121,7 +121,7 @@ def _classify_candidates(meta_path: Path, candidates_out: Path) -> None:
         "classify_columns.py",
         ["--meta", str(meta_path), "--output", str(candidates_out)],
         fail_code="CLASSIFY_FAILED",
-        fail_action="Read stderr and re-run prepare_task")
+        fail_action="Read stderr and re-run workspace_init")
 
 
 def _structure_digest(meta_path: Path, csv_path: Path, candidates_path: Path,
@@ -137,7 +137,7 @@ def _structure_digest(meta_path: Path, csv_path: Path, candidates_path: Path,
          "--candidates", str(candidates_path), "--out", str(digest_out)]
         + (["--target"] if is_target else []),
         fail_code="DIGEST_FAILED",
-        fail_action="Read stderr and re-run prepare_task")
+        fail_action="Read stderr and re-run workspace_init")
 
 
 def build_cache_entry(task_root: Path, staged_path: Path, sheet: str,
@@ -168,7 +168,7 @@ def build_cache_entry(task_root: Path, staged_path: Path, sheet: str,
             ["--input", str(staged_path), "--plan", str(plan),
              "--out-dir", str(entry_dir)],
             fail_code="FLATTEN_FAILED",
-            fail_action="Read stderr and re-run prepare_task (cache key 不变时"
+            fail_action="Read stderr and re-run workspace_init (cache key 不变时"
                         "会重展平该条目)")
         # 计划名 "flat" → {flat}_flat.csv / {flat}_meta.json → 白名单命名
         (entry_dir / "flat_flat.csv").replace(entry_dir / "flat.csv")
@@ -199,7 +199,7 @@ def materialize_entry(task_root: Path, key: str, run_dir: Path, *,
     if not cache_hit(cache_dir):
         fail("CACHE_ENTRY_MISSING",
              f"cache 条目缺失或残缺: {cache_dir}",
-             "重新运行 prepare_task（会按 key 重展平该条目）")
+             "重新运行 workspace_init（会重展平该条目）")
 
     artifacts = {
         "flat.csv": f"{name}_flat.csv",
@@ -237,5 +237,31 @@ def materialize_entry(task_root: Path, key: str, run_dir: Path, *,
         "digest": artifacts["digest.md"],
         "candidates": cand_name,
         "sha256": sha256_file(run_dir / artifacts["flat.csv"]),
+        "cache_key": key,
+    }
+
+
+def reference_entry(task_root: Path, key: str, *, staged_name: str,
+                    sheet: str, name: str, is_target: bool) -> dict:
+    """共享展平**引用条目**（ticket 08）：不把 cache 产物逐字节复制进 run 目录，
+    只返回带 `cache_key` + `sha256` 的条目（csv/meta/digest/candidates 为
+    run-local 约定名；compile/execute 按 cache_key 从 `cache/<key>/` 解析共享
+    展平产物）。返回形态与 materialize_entry 完全同构（csv/meta/digest/candidates
+    /sha256/cache_key/file/sheet/name），仅 sha256 直接取自 cache flat.csv
+    （逐字节一致，故哈希身份亦一致）。"""
+    cache_dir = cache_entry_dir(task_root, key)
+    if not cache_hit(cache_dir):
+        fail("CACHE_ENTRY_MISSING",
+             f"cache 条目缺失或残缺: {cache_dir}",
+             "重新运行 workspace_init（会重展平该条目）")
+    return {
+        "file": staged_name,
+        "sheet": sheet,
+        "name": name,
+        "csv": f"{name}_flat.csv",
+        "meta": f"{name}_meta.json",
+        "digest": f"{name}_digest.md",
+        "candidates": f"{name}_candidates.yaml",
+        "sha256": sha256_file(cache_dir / "flat.csv"),
         "cache_key": key,
     }

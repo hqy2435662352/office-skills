@@ -29,7 +29,9 @@ import os, sys, json, argparse, subprocess, stat, shutil, platform
 from datetime import datetime
 from pathlib import Path
 
-from _officecli import clean_residents, officecli  # noqa: E402
+from _officecli import (  # noqa: E402
+    clean_residents, officecli, officecli_search_locations, resolve_officecli,
+)
 
 CACHE_FILENAME = ".preflight_cache.json"
 
@@ -41,7 +43,7 @@ def check_python_version():
     - PEP 604 unions (X | Y, runtime-evaluated): structure_digest.py,
       mod_nominate.py (no __future__ annotations import)
     - dataclass(slots=True) (3.10 param): _mod_catalog.py, mod_capture.py
-    - PEP 585 builtin generics (list[], dict[]): note_phase.py, stage_files.py,
+    - PEP 585 builtin generics (list[], dict[]): stage_files.py,
       etc.
     - No 3.11+ features found (no match statements, no zip(strict=),
       no str.removeprefix/removesuffix, no typing 3.11+ features).
@@ -80,21 +82,38 @@ def check_ascii_path(workdir):
 
 
 def check_officecli():
-    """Verify officecli is on PATH and functional."""
+    """Verify officecli is resolvable and functional — via the SAME resolver
+    every runtime officecli() call uses (resolve_officecli), so Preflight PASS
+    means later officecli() calls resolve identically. Resolution order:
+    OFFICECLI_EXE override → PATH → %LOCALAPPDATA%/hermes/bin."""
+    exe = resolve_officecli()
+    if exe is None:
+        return {
+            "code": "OFFICECLI_NOT_FOUND",
+            "message": "officecli could not be resolved; searched: "
+                       + ", ".join(officecli_search_locations()),
+            "corrective_action": "Install officecli or set OFFICECLI_EXE to "
+                                 "its absolute path (Hermes fallback: "
+                                 "%LOCALAPPDATA%/hermes/bin/officecli.exe)."
+        }
     try:
         r = officecli("--version", timeout=10)
         if r.returncode != 0:
+            detail = (r.stderr or "").strip()[-200:]
             return {
                 "code": "OFFICECLI_NOT_FUNCTIONAL",
-                "message": f"officecli --version returned exit code {r.returncode}",
+                "message": (f"officecli --version returned exit code "
+                            f"{r.returncode} (resolved: {exe})"
+                            + (f": {detail}" if detail else "")),
                 "corrective_action": "Reinstall officecli or check PATH."
             }
         return None
     except FileNotFoundError:
+        # defense in depth — resolve_officecli() already handles resolution
         return {
             "code": "OFFICECLI_NOT_FOUND",
-            "message": "officecli is not on PATH.",
-            "corrective_action": "Install officecli: https://github.com/iOfficeAI/OfficeCLI/releases"
+            "message": f"officecli could not be spawned (resolved: {exe}).",
+            "corrective_action": "Reinstall officecli: https://github.com/iOfficeAI/OfficeCLI/releases"
         }
     except Exception as e:
         return {
@@ -149,14 +168,15 @@ def compute_fingerprint(workdir):
 
     Includes:
       - workdir (input to ASCII-path check)
-      - officecli binary (resolved via PATH) path + mtime + size — a binary
+      - officecli binary (resolved via resolve_officecli — OFFICECLI_EXE,
+        PATH or %LOCALAPPDATA%/hermes/bin) path + mtime + size — a binary
         reinstall/upgrade changes mtime/size → fingerprint mismatch → re-check
       - Python version
     Returns a JSON-serializable dict. Any component that cannot be resolved
-    (officecli not on PATH) is recorded as None so the fingerprint still
+    (officecli missing everywhere) is recorded as None so the fingerprint still
     changes when the tool appears later.
     """
-    exe_path = shutil.which("officecli")
+    exe_path = resolve_officecli()
     officecli_fp = None
     if exe_path:
         try:
@@ -171,6 +191,7 @@ def compute_fingerprint(workdir):
     return {
         "workdir": str(workdir),
         "officecli": officecli_fp,
+        "officecli_override": os.environ.get("OFFICECLI_EXE"),
         "python": platform.python_version(),
     }
 

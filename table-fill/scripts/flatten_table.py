@@ -64,12 +64,18 @@ def _checked_officecli_json(proc, *, context="", fail_on_error=True):
         return {}
 
     if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "").strip()[-400:]
+        # officecli reports failures with the error payload on STDOUT and an
+        # EMPTY stderr (quote_fill replay: 'Unsupported file type: .' came back
+        # rc=1, stdout JSON, stderr='' — stderr-only reporting hid the cause).
+        stdout_head = repr((proc.stdout or "")[:400])
+        stderr_tail = repr((proc.stderr or "").strip()[-400:])
         return _defect(
             "OFFICECLI_GET_FAILED",
             f"officecli get 失败 (rc={proc.returncode}) [{context}]: "
-            f"stderr={stderr_tail!r}",
-            "核对 sheet 名/范围参数与 outline 一致; 若 officecli 环境问题先 preflight。",
+            f"stdout={stdout_head} stderr={stderr_tail}",
+            "核对 sheet 名/范围参数与 outline 一致; officecli 错误详情在 stdout "
+            "JSON 里; 若报 Unsupported file type, staged 名必须带 officecli 可识别 "
+            "扩展名 (.xlsx/.xlsm/.docx/...)。",
         )
 
     try:
@@ -105,9 +111,31 @@ def officecli_get(filepath, sheet, range_str, depth=0):
 
 
 def officecli_outline(filepath):
-    """Get sheet metadata via officecli view outline."""
+    """Get sheet metadata via officecli view outline.
+
+    Raises OSError carrying officecli's own error text when the call fails:
+    officecli reports failures as rc!=0 — and sometimes rc=0 with JSON
+    {"success": false, "error": {...}} — with the payload on STDOUT and empty
+    stderr. Never treat rc alone, nor stdout-JSON alone, as success: a cached
+    error outline must not masquerade as facts (quote_fill replay: 9/6 outline
+    was 'Unsupported file type' JSON and S0 silently proceeded to flatten)."""
     result = officecli("view", str(filepath), "outline", "--json", timeout=30)
-    return json.loads(result.stdout)
+    if result.returncode != 0:
+        text = (result.stderr or "").strip() or (result.stdout or "").strip()
+        if not text:
+            text = ("officecli 无任何输出 (rc=1) — 可能是瞬态文件锁/防病毒扫描, "
+                    "重试一次")
+        raise OSError(
+            f"officecli view outline failed (rc={result.returncode}): {text[:400]}")
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        raise OSError("officecli view outline returned non-JSON stdout") from None
+    if isinstance(data, dict) and data.get("success") is False:
+        err = data.get("error") or {}
+        detail = err.get("error") if isinstance(err, dict) else err
+        raise OSError(f"officecli view outline failed: {str(detail)[:400]}")
+    return data
 
 
 # ── Dimension discovery via officecli (replaces openpyxl) ─────────────
@@ -786,6 +814,101 @@ def detect_style_granularity(filepath, sheet, blocks, flat_rows, num_cols):
             "clone_source_rows": clone_source_rows}
 
 
+def _styled_xfs_from_styles_xml(styles_xml: str) -> set:
+    """styles.xml cellXfs 中携带可见格式的样式索引集 (与 detect_style_granularity
+    同源启发式, 行为保持一致: 以非零 id 为信号, 裸 apply* 标志不计数)."""
+    styled_xfs = set()
+    mx = re.search(r"<cellXfs[^>]*>(.*?)</cellXfs>", styles_xml, re.S)
+    if mx:
+        for i, xf in enumerate(
+                re.findall(r"<xf\b.*?</xf>|<xf\b[^>]*/>", mx.group(1), re.S)):
+            if (re.search(r'borderId="[1-9]', xf)
+                    or re.search(r'fillId="(?:[2-9]|\d{2,})', xf)
+                    or re.search(r'fontId="[1-9]', xf)
+                    or re.search(r'numFmtId="(?!0"|164")', xf)
+                    or '<alignment' in xf):
+                styled_xfs.add(i)
+    return styled_xfs
+
+
+def _explicit_width_cols_from_xml(xl: str) -> list:
+    """worksheet XML `<cols>` 显式列宽覆盖的列索引列表 (同 detect_column_widths
+    解析逻辑, 直读同一份 xl 避免重复解包; 空宽度标签不算列宽)."""
+    width_cols = []
+    for m in re.finditer(r'<(?:x:)?col\b[^>]*?/>', xl):
+        tag = m.group(0)
+        minc = re.search(r'min="(\d+)"', tag)
+        maxc = re.search(r'max="(\d+)"', tag)
+        wm = re.search(r'width="([\d.]+)"', tag)
+        if not (minc and maxc and wm):
+            continue
+        w = float(wm.group(1))
+        if w <= 0:
+            continue
+        for ci in range(int(minc.group(1)), int(maxc.group(1)) + 1):
+            width_cols.append(ci - 1)
+    return width_cols
+
+
+def compute_bbox_facts(filepath, sheet, cells):
+    """值域/样式域 bbox 机械事实 (Ticket 01: value_bbox vs style_bbox 分离).
+
+    - value_bbox: 非空值单元格包围盒 (含标题/表头/数据值) — 业务范围首选依据;
+    - style_bbox: 携带样式 (font/border/fill/alignment/numFmt) 的单元格包围盒,
+      并纳入显式列宽 (`<cols>` width) 覆盖的列 — 格式/历史残留延伸常超出值域
+      (埃及案例: 业务值域 A1:F108, 样式/列宽延伸至 Z → A1:Z108)。
+
+    直读 xlsx XML (同 detect_row_gaps / detect_style_granularity), 不依赖任何
+    额外 officecli 探测; 解析失败静默降级。纯机械事实, 无分类/阈值/裁决。
+    返回 {"value_bbox": "A1:F12", "style_bbox": "A1:Z12"}; 无任何样式且无
+    显式列宽时只含 value_bbox; 完全失败 (无值或无 XML) 返回 None。
+    """
+    vr, vc = [], []
+    for cell in cells:
+        m = re.search(r"([A-Z]+)(\d+)$", cell.get("path", "") or "")
+        if not m:
+            continue
+        if (cell.get("text") or "").strip():
+            vc.append(col_letter_to_idx(m.group(1)))
+            vr.append(int(m.group(2)))
+    if not vr:
+        return None
+    facts = {
+        "value_bbox": f"{col_idx_to_letter(min(vc))}{min(vr)}:"
+                      f"{col_idx_to_letter(max(vc))}{max(vr)}",
+    }
+
+    zf, xl = _read_sheet_xml(filepath, sheet)
+    if zf is None:
+        return facts
+    try:
+        styles_xml = zf.read("xl/styles.xml").decode("utf-8", errors="replace")
+    except KeyError:
+        return facts
+    styled_xfs = _styled_xfs_from_styles_xml(styles_xml)
+    sr, sc = [], []
+    row_re = re.compile(r'<(?:x:)?row r="(\d+)"[^>]*?(?:/>|>(.*?)</(?:x:)?row>)', re.S)
+    for mrow in row_re.finditer(xl):
+        r = int(mrow.group(1))
+        for mc in re.finditer(r'<c r="([A-Z]+)\d+"[^>]*s="(\d+)"', mrow.group(2) or ""):
+            if int(mc.group(2)) in styled_xfs:
+                sr.append(r)
+                sc.append(col_letter_to_idx(mc.group(1)))
+    width_cols = _explicit_width_cols_from_xml(xl)
+    if not sr and not width_cols:
+        return facts  # 无样式/无列宽 → 只有 value_bbox
+    if sr:
+        s_min_r, s_max_r = min(sr), max(sr)
+    else:
+        # 仅列宽延伸 (无样式格): 行范围回退到值域行范围, 保证 bbox 是矩形
+        s_min_r, s_max_r = min(vr), max(vr)
+    all_cols = sc + width_cols
+    facts["style_bbox"] = (
+        f"{col_idx_to_letter(min(all_cols))}{s_min_r}:"
+        f"{col_idx_to_letter(max(all_cols))}{s_max_r}")
+    return facts
+
+
 def build_meta(filepath, sheet, cells, num_cols, num_rows, flat_rows, outline_data=None):
     """Structured metadata for Layer 2 — one call replaces the old manual
     outline/get/query exploration loop."""
@@ -819,6 +942,13 @@ def build_meta(filepath, sheet, cells, num_cols, num_rows, flat_rows, outline_da
     meta["column_width"] = detect_column_widths(filepath, sheet)
     meta["style_granularity"] = detect_style_granularity(
         filepath, sheet, meta["blocks"], flat_rows, num_cols)
+    # bbox 机械事实 (Ticket 01): 不入 structure_facts (指纹键为显式子集),
+    # 供 digest/pre-mod evidence 分开报告 value_bbox 与 style_bbox。
+    bbox = compute_bbox_facts(filepath, sheet, cells)
+    if bbox:
+        meta["value_bbox"] = bbox["value_bbox"]
+        if "style_bbox" in bbox:
+            meta["style_bbox"] = bbox["style_bbox"]
     for k in ("formulas", "errorCells", "tables", "charts", "oleObjects"):
         if k in outline and outline[k] is not None:
             meta["dimensions"][k] = outline[k]

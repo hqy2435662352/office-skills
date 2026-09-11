@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from _officecli import (  # noqa: E402
-    ensure_utf8_stdio as _utf8_stdio, fail, record_timing as _record_timing,
+    ensure_utf8_stdio as _utf8_stdio, fail,
     sha256_file,
 )
 
@@ -47,7 +47,9 @@ def main() -> int:
     try:
         outline = officecli_outline(str(args.input))
     except Exception as exc:
-        fail("OUTLINE_FAILED", str(exc), "Read officecli stderr and retry once", exit_code=3)
+        fail("OUTLINE_FAILED", str(exc),
+             "staged 名必须带 officecli 可识别扩展名 (.xlsx/.xlsm/.docx/.pptx); "
+             "若扩展名无误且 officecli 可运行则核对源文件格式", exit_code=3)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     results = []
