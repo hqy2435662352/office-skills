@@ -1,0 +1,24 @@
+# fillspec_patterns.yaml — Pattern Index (routing index, 不是能力文档)
+#
+# 定位：机器可读的 shape → pattern 路由索引，供 Agent 在已知 shape 时
+# 直接查到 canonical FillSpec pattern，不读 FILLSPEC 全文。
+#
+# 规则（SKILL §AUTHORING_READY 引用本文件）：
+#   已知 shape 时读取对应 pattern；不要因此读取 FILLSPEC 全文。
+#
+# 禁止放入：示例、schema 解释、exception、tutorial、capability 矩阵。
+# 形状由 tests/test_fillspec_pattern_index.py contract test 固定。
+#
+# 维护：shape 变更时同步更新此文件 + contract test。
+
+grid_record:
+  rows:
+    primary: columns
+  columns:
+    primary: matrix
+    fields:
+      - field_map
+      - record_map
+
+grouped_grid:
+  primary: blocks
