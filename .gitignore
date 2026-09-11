@@ -45,3 +45,70 @@ test_fixtures/
 # table-fill 本地私有物 (不随版本控制/发布推送)
 table-fill/references/MOD_tcl_*
 table-fill/evals/
+
+# ─────────────────────────────────────────────────────────────
+# 本地工作产物 (不入版本控制; 根目录 .md 文档保留可见)
+# ─────────────────────────────────────────────────────────────
+
+# docs 本地工作产物: 复盘案例 / PRD / 基准报告 / 交接记录
+/docs/test-cases/
+/docs/product/
+/docs/benchmark/
+/docs/handoff-*.md
+
+# 根目录: 日期命名的临时工作区 (workspace_init 产物)
+/2026*/
+/参数表处理/
+/参数表处理测试/
+/参数表提取测试0831/
+/汇总测试0807/
+/核价邮件填充毛利汇总测试0812/
+/jsonl handoff测试/
+/效率提升测试*/
+/table-fill v2效率提升测试0809/
+/v2.5效率提升测试0818/
+
+# 根目录: 测试/分析工作区与输出目录
+/_analysis_work/
+/0000_dsh_session_clean_demo/
+/dsh-clean-output/
+/session-cleaned/
+/html-to-pptx-officecli-test/
+/pptx issue/
+/pptx-baseline-test/
+/test_baseline_mxp_quotation/
+/Temptablefillevalmodrun2-*
+/research-pptarena/
+/table-fill-benchmark/
+/MXP报价单_20260806_可观测复现包_20260807*
+
+# 根目录: 备份、调试残留与一次性输出
+/_draft_failure.json
+/_dsh_sample.jsonl
+/_idx_filter.py
+/_idx_ours.patch
+/_scripts_diff_baseline.txt
+/_staged_diff_full.txt
+/.py
+/err.txt
+/p_err.txt
+/p_out.txt
+/p2_err.txt
+/p2_out.txt
+/p3_err.txt
+/p3_out.txt
+/out.json
+/plan_other.json
+/run_timing.json
+/slide1.png
+/测试配置.bat
+/启动cc-connect.bat
+/底层套件调研结果清单.xlsx
+/海外2026冷年推演--北非.pptx
+/海外2027冷年推演模板-V3.pptx
+/海外2027冷年推演模板-V3_正式版_已填_v3.pptx
+/table-fill_backup_*.zip
+
+# 技能分发 zip (构建产物)
+/table-fill/*.zip
+/codex-session-resume/*.zip
