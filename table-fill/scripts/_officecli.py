@@ -4,6 +4,12 @@ scripts/_officecli.py — shared Windows-safe officecli adapter (V2).
 
 The single home for every subprocess/encoding/timeout/file-lock concern that
 used to be reimplemented in each script:
+  - resolve_officecli(): single executable resolver shared by preflight and
+    every runtime caller — OFFICECLI_EXE override, then PATH, then the
+    Windows/Hermes fallback %LOCALAPPDATA%/hermes/bin. A resolution failure
+    is NEVER a bare FileNotFoundError or a silent 'rc=1, stderr=""': it
+    surfaces as a structured OFFICECLI_NOT_FOUND payload on the returned
+    CompletedProcess.stderr.
   - officecli():  UTF-8 subprocess wrapper (never raw PowerShell — GBK mangles
     Chinese text).
   - clean_residents(): on Windows, officecli leaves resident processes holding
@@ -26,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -47,16 +54,116 @@ def ensure_utf8_stdio() -> None:
             pass
 
 
+def officecli_search_locations() -> list:
+    """Search locations (in probe order) for the officecli executable.
+
+    Diagnostics for OFFICECLI_NOT_FOUND — deterministic, no state."""
+    locs = []
+    override = os.environ.get("OFFICECLI_EXE")
+    if override:
+        locs.append(f"OFFICECLI_EXE={override}")
+    locs.append("PATH")
+    la = os.environ.get("LOCALAPPDATA")
+    if la:
+        locs.append(str(Path(la) / "hermes" / "bin"))
+    return locs
+
+
+def resolve_officecli():
+    """Absolute path to the officecli executable, or None when unresolvable.
+
+    Single resolution shared by preflight and every runtime officecli() call
+    (invariant: Preflight PASS => later officecli() calls resolve identically).
+    Probe order:
+      1. OFFICECLI_EXE env override (must point at an existing file)
+      2. PATH lookup (shutil.which)
+      3. Windows/Hermes fallback: %LOCALAPPDATA%/hermes/bin — officecli
+         installs outside the standard PATH and the process launcher (e.g. an
+         agent host) may not have that directory in the inherited PATH.
+    """
+    override = os.environ.get("OFFICECLI_EXE")
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return os.path.abspath(str(p))
+        return None  # explicit override that does not exist — fail, don't fall back
+    found = shutil.which("officecli")
+    if found:
+        return os.path.abspath(found)
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            hermes_bin = Path(la) / "hermes" / "bin"
+            if hermes_bin.is_dir():
+                found = shutil.which("officecli", path=str(hermes_bin))
+                if found:
+                    return os.path.abspath(found)
+    return None
+
+
+def _not_found_result(args) -> "subprocess.CompletedProcess":
+    """Synthetic CompletedProcess (rc=1) carrying a structured resolution
+    payload on stderr — keeps the 'never raises / returns CompletedProcess'
+    contract while making the failure self-explanatory to every caller that
+    reports rc + stderr tail."""
+    payload = {
+        "status": "ERROR",
+        "code": "OFFICECLI_NOT_FOUND",
+        "message": "officecli executable could not be resolved",
+        "effective_path": os.environ.get("PATH", ""),
+        "searched": officecli_search_locations(),
+        "corrective_action": "Install officecli into PATH or set OFFICECLI_EXE "
+                             "to its absolute path (Hermes fallback: "
+                             "%LOCALAPPDATA%/hermes/bin/officecli.exe)",
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    return subprocess.CompletedProcess(
+        args=("officecli",) + tuple(args), returncode=1,
+        stdout="", stderr=text + "\n")
+
+
 def officecli(*args: str, timeout: int = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess:
-    """Run officecli with UTF-8 decoding. Returns CompletedProcess, never raises."""
-    return subprocess.run(
-        ["officecli", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+    """Run officecli with UTF-8 decoding. Returns CompletedProcess, never raises.
+
+    The executable comes from resolve_officecli() — the same resolver preflight
+    uses — so an unresolvable install shows up as an OFFICECLI_NOT_FOUND payload
+    (rc=1 + structured stderr with effective PATH and searched locations)
+    instead of a bare FileNotFoundError or an empty-stderr mystery.
+
+    A timeout is normalized to rc=124 + an OFFICECLI_TIMEOUT payload (subprocess
+    raises TimeoutExpired — catching it here keeps the never-raises contract;
+    subprocess.run already killed the child, and the killed officecli may have
+    left a resident holding file locks, so residents are cleaned first)."""
+    exe = resolve_officecli()
+    if exe is None:
+        return _not_found_result(args)
+    try:
+        return subprocess.run(
+            [exe, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            clean_residents()  # 被 kill 的 officecli 可能残留持有文件锁的 resident
+        except Exception:
+            pass  # 清理是尽力而为 — 归一化契约 (always returns) 优先
+        payload = {
+            "status": "ERROR",
+            "code": "OFFICECLI_TIMEOUT",
+            "message": f"officecli timed out after {timeout}s",
+            "exe": exe,
+            "args": [str(a) for a in args],
+            "corrective_action": "重试一次 (resident 已清理); 反复超时则核对 "
+                                 "文件锁/数据量或增大 timeout",
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        return subprocess.CompletedProcess(
+            args=("officecli",) + tuple(args), returncode=124,
+            stdout="", stderr=text + "\n")
 
 
 def clean_residents() -> None:
@@ -190,8 +297,6 @@ def resolve_check_path(operations: list, raw_path: str) -> str:
 
 # ── Shared script infrastructure ───────────────────────────────────────
 
-_T0 = time.perf_counter()
-
 
 def fail(code: str, message: str, corrective_action: str,
          defects: list | None = None, exit_code: int = 3) -> None:
@@ -207,23 +312,6 @@ def fail(code: str, message: str, corrective_action: str,
     sys.exit(exit_code)
 
 
-def record_timing(workdir, phase: str) -> None:
-    """Append one machine-phase record to run_timing.json (observability:
-    kind: machine vs note_phase.py's kind: agent entries)."""
-    entry = {
-        "kind": "machine", "phase": phase,
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "duration_ms": round((time.perf_counter() - _T0) * 1000),
-    }
-    path = Path(workdir) / "run_timing.json"
-    try:
-        data = []
-        if path.is_file():
-            data = json.loads(path.read_text(encoding="utf-8"))
-        data.append(entry)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except (OSError, ValueError):
-        pass
 
 
 def sha256_file(path) -> str:
