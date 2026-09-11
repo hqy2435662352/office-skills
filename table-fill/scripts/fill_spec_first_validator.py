@@ -12,23 +12,30 @@ scripts/fill_spec_first_validator.py — FillSpec First Rule 行为契约的可�
   - 未产出初稿禁止深度能力探索; 编译缺陷是下一轮探索的唯一入场券
     (错误驱动, 非探索驱动)。
   - 模式索引路由优先于全文阅读: 已知形态只读对应 pattern。
-  - 决议→初稿之间仅允许四类动作: 读 pattern → 读 digest → 写 spec → compile。
+  - 决议→初稿之间只允许「解除撰写阻塞的最小动作集」: 读 pattern → 读 digest →
+    定向读参考小节 / `--capability <key>` → 写 spec → compile (判据优先于计数)。
 
 动作模型 (阶段 = MOD 决议落盘之后的窗口, 直到首次 fill_spec.yaml 写入):
   每个动作是一个字符串, 由「动作类别」归一化:
     - read_pattern   : 读 assets/fillspec_patterns.yaml (模式索引路由) — 合法
     - read_digest    : 读 {name}_digest.md / premod_evidence / outline / MOD 规则 — 合法
+    - read_reference : 具名参考文件/小节的定向读取, 或 `--capability <key>` 单键
+                       契约查询 (为解除具体阻塞的最小读取) — 合法
     - write_spec     : 写/编辑 fill_spec.yaml — 合法 (首个业务动作的落点)
     - compile        : 运行 compile_fill.py — 合法 (错误驱动的反馈源)
-    - explore        : 深度能力探索 (--capabilities / --capability / --probe /
-                        源码阅读 / FILLSPEC 全文阅读 / 机制求证) — 违规
+    - explore        : 深度探索 (--probe / --capabilities 全量 dump / 源码阅读 /
+                       全文通读 / 机制求证 / 读 case 复盘当证据) — 违规
     - other          : 未识别动作 — 按未知处理 (fail-open 于校验, 但记录)
+
+  判据: 合法与否看「该动作是否解除具体阻塞」, 不看动作数量 (case-009 记录的
+  初稿前定向读 FILLSPEC 小节 + combination_patterns 是正确路径)。
 
 校验规则 (纯函数):
   1. 决议后若先出现 explore 动作、且此时尚未 write_spec → 违规
      (探索出现在初稿写入之前)。
-  2. 首个 write_spec 之前出现的动作集合必须 ⊆ {read_pattern, read_digest,
-     write_spec, compile} (四类动作之外的 → 违规)。
+  2. 首个 write_spec 之前出现的动作集合必须 ⊆ PRE_DRAFT_ACTION_CLASSES
+     (read_pattern / read_digest / read_reference / write_spec / compile)
+     — 集合之外的 → 违规。
   3. 合法循环: write_spec 之后, compile (缺陷) → 定向 explore → 修复 → 重 compile
      是合法且预期的 (错误驱动) — explore 出现在首个 write_spec 之后不再判违规。
 
@@ -56,10 +63,11 @@ import sys
 from pathlib import Path
 
 LEGAL_PRE_DRAFT_ACTIONS = frozenset(
-    {"read_pattern", "read_digest", "write_spec", "compile"}
+    {"read_pattern", "read_digest", "read_reference", "write_spec", "compile"}
 )
-# 四类动作 (决议→初稿窗口内唯一允许的机制动作)。
-FOUR_ACTION_CLASSES = ("read_pattern", "read_digest", "write_spec", "compile")
+# 决议→初稿窗口的合法动作集: 判据是"解除撰写阻塞的最小读取", 不是动作数量。
+PRE_DRAFT_ACTION_CLASSES = ("read_pattern", "read_digest", "read_reference",
+                            "write_spec", "compile")
 
 # 深度能力探索动作 (FillSpec First Rule 禁止在初稿前出现)。
 EXPLORE_ACTIONS = frozenset({"explore"})
@@ -95,18 +103,23 @@ def normalize_action(raw: str) -> str:
                             "source-code", "机制求证", "mechanism", "implement")):
         return "explore"
 
-    # 5. 能力查询 / 探测 (深度能力探索): --capabilities / --capability / --probe
-    if any(k in s for k in ("--capabilit", "--probe", "capability query",
-                            "能力查询", "probe")):
+    # 5. 探测与全量能力 dump = 深度探索; 单键定向查询 = 最小读取.
+    if "probe" in s:
         return "explore"
+    if "--capabilities" in s:
+        return "explore"
+    if any(k in s for k in ("--capability", "capability query", "能力查询")):
+        return "read_reference"
 
     # 6. 读 digest / 证据 (读 digest): digest / premod / outline / mod 规则
     if any(k in s for k in ("digest", "premod", "outline", "mod")):
         return "read_digest"
 
-    # 7. 泛化「读 FILLSPEC 全文」/ 读源码 → explore (读文档/源码本体)
-    if "fillspec" in s and any(k in s for k in ("read", "读", "full", "全文")):
-        return "explore"
+    # 7. 具名参考文件 / 小节的定向读取 → read_reference (最小读取, 合法).
+    #    全文与源码已在规则 4 拦截, 此处只兜定向读取.
+    if any(k in s for k in ("fillspec", "known_traps", "failure_classes",
+                            "officecli help", "参考小节", "reference")):
+        return "read_reference"
 
     return "other"
 
@@ -126,7 +139,7 @@ def validate_actions(actions: list[str]) -> dict:
             first_draft_at = i
 
     for i, act in enumerate(norm):
-        # 初稿写入之前: 只允许四类动作.
+        # 初稿写入之前: 只允许合法动作集 (判据: 是否解除具体阻塞).
         if first_draft_at is None or i < first_draft_at:
             if act == "explore":
                 violations.append(
@@ -135,8 +148,9 @@ def validate_actions(actions: list[str]) -> dict:
                 )
             elif act not in LEGAL_PRE_DRAFT_ACTIONS:
                 violations.append(
-                    f"动作 {i} ({actions[i]!r}) 不属于决议→初稿窗口的四类合法动作 "
-                    f"(读 pattern / 读 digest / 写 spec / compile)。"
+                    f"动作 {i} ({actions[i]!r}) 不属于决议→初稿窗口的合法动作集 "
+                    f"(读 pattern / 读 digest / 定向读参考小节 / 写 spec / "
+                    f"compile)。"
                 )
 
     return {"ok": not violations, "violations": violations,

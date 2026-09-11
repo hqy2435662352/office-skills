@@ -1,18 +1,13 @@
 ---
 name: table-fill
 description: >
-  table-fill is the unified entry for spreadsheet-to-template fill
-  (Excel/PPTX). Use this skill whenever the user asks to fill, populate, map,
-  or transfer data between spreadsheet tables — in any direction (xlsx→pptx,
-  xlsx→xlsx, pptx→pptx, pptx→xlsx). Activate immediately on phrases like
-  "fill", "populate", "map", "展平", "读源数据→填模板", "把数据填到模板里",
-  "从源表出报告", even if the user does not explicitly name the source and
-  target formats. Also activate when the user describes a multi-file data
-  transfer workflow involving Office tables.
-
-  Do NOT activate when the user wants to create a new file from scratch, edit
-  a single cell, or build a general-purpose spreadsheet or slide deck — those
-  are not table-fill tasks.
+  table-fill fills an existing Office template (xlsx or pptx) with data taken
+  from existing Excel/PPTX tables — across files or across sheets. Use it when
+  the user wants existing source data placed into an existing template, report,
+  or quotation shell (e.g. 把数据填到模板里, 从源表出报告), even when they do
+  not name the source and target formats. Do NOT use it to create a file from
+  scratch, edit a single cell, or merely flatten data that has no template
+  target.
 license: MIT
 compatibility: >
   Required: officecli (on PATH), Python 3.10+ (PyYAML). No openpyxl, no pandas,
@@ -71,8 +66,9 @@ S7 Execute + Verify → S8 Deliver
 
 ## S3 — MOD Resolution (任务级一次)
 
-- `mod_nominate.py` → 用户裁决 → `mod_resolution.json` → canonical resolver 加载选中 MOD (sha256 fail-closed) → 解锁 full digest
+- `mod_nominate.py` → 按裁决规则**自动采用或**提请用户裁决 → `mod_resolution.json` → canonical resolver 加载选中 MOD (sha256 fail-closed) → 解锁 full digest
 - 提名只给候选名 + 命中信号 + 业务摘要, 不给完整规则; 未裁决 (status ∉ {resolved, none}) 时禁止业务推导
+- 已满足自动采用条件 (用户明确指定 / 唯一候选信号全过) 时不得再问一轮; 只有多候选不同业务含义、或排除信号冲突才提请裁决
 - 用户确认选择后加载完整 MOD 规则
 - 下一步: S4
 
@@ -176,23 +172,23 @@ No defect, no exploration. No exception signal, no exception route. No unresolve
 
 # Part II — 定位与硬约束（Identity · Hard Constraints · Loading）
 
-table-fill = 带版本记录的 Excel 编译器: FillSpec 是唯一业务 IR; Compiler 静态验证并驱动收敛; Execute 唯一一次填充 + 机器验证; Spec Review 是唯一人工点 (Compile Clean 后、Execute 前); 验证全绿即哈希核对自动交付。多 run 共享一次 Workspace Init (Task 只是优化容器), 单 run 走最快路径, 失败即重跑。文档按五段式组织: I 定位与硬约束 / II 运行时心智模型 / III 强制流程 / IV 治理 / V 参考路由。
+table-fill = 带版本记录的 Excel 编译器: FillSpec 是唯一业务 IR; Compiler 静态验证并驱动收敛; Execute 唯一一次填充 + 机器验证; Spec Review 是唯一人工点 (Compile Clean 后、Execute 前); 验证全绿即哈希核对自动交付。多 run 共享一次 Workspace Init (Task 只是优化容器), 单 run 走最快路径, 失败即重跑。文档按五段式组织: I 运行时控制面 / II 定位与硬约束 / III 强制流程 / IV 治理 / V 参考路由。
 
 ## 硬约束
 
 以下硬约束按**行为**执行, 违反任一即越界 (行为契约, 无物理锁):
 
-1. **FillSpec First Rule**: MOD 决议后, 首个业务动作 = 产出 FillSpec 初稿 (可以不完整); 未产出初稿前**禁止深度能力探索** (--capabilities / --capability 查询 / --probe / 源码阅读 / 机制求证一律后置)。
+1. **FillSpec First Rule**: MOD 决议后, 首个业务动作 = 产出 FillSpec 初稿 (可以不完整); 未产出初稿前**禁止深度能力探索** (--capabilities 全量 dump / --probe / 源码阅读 / 机制求证 / 全文通读 / 读 case 复盘当证据一律后置); 为解除撰写阻塞的**最小定向读取** (`--capability <key>` / pattern index / digest / 指定参考小节) 是合法动作, 如实记入 action log。
 2. **错误驱动, 非探索驱动**: 编译缺陷是下一轮探索的唯一入场券 — 只有 compile 返回的 defect.code / corrective_action (或无法用 FillSpec 表达的 transform) 才触发定向查询; 探索型提前查证 (为了保险/怕错/泛化) 不构成合法理由 (`unjustified capability query = 0`)。
 3. **模式索引路由优先于全文阅读**: 已知 shape 时先查 `assets/fillspec_patterns.yaml` 得到对应 pattern, **只读该 pattern**, 不读 FILLSPEC.md 全文 (定位细节按问题定向读小节)。模式索引优先于任何全文阅读, 是决议→初稿之间的唯一机制信息来源。
 4. **初稿可以不完整**: 首版 FillSpec 允许缺列/缺 selector/缺精确行号等 (非阻塞项); 能由 Compiler 机械检出的问题不是阻塞项 — 「初稿 → 编译缺陷 → 定向修复 → 重编译」是合法且预期的收敛循环, 且**发生在 Spec Review 之前** (Review 只发生在 Compile Clean 上)。
 
-> 决议→初稿之间仅允许**四类动作**: 读 pattern → 读 digest → 写 spec → compile。这四类之外的动作 (能力查询 / 源码阅读 / 全文阅读 / 机制求证) 在初稿落盘前一律禁止 (由 `scripts/fill_spec_first_validator.py` 可执行校验)。
+> 决议→初稿之间只允许**解除撰写阻塞所必需的最小动作集**: 读 pattern → 读 digest → 定向读参考小节 / `--capability <key>` → 写 spec → compile。判据是"该动作是否解除具体阻塞", 不是动作数量; **深度探索一律禁止** (--probe / --capabilities 全量 dump / 源码阅读 / 全文通读 / 机制求证 / 读 case 复盘当证据)。动作集由 `scripts/fill_spec_first_validator.py` 按 action log 可执行校验 (拦深度探索与范围外动作)。
 
 **硬约束 5–8（v3 收敛置顶扩展；与 1–4 同等强制，细则仅留指针）**:
 
 5. **机器证据终止**: `execute_batch.py` 已返回机器证据 (`issues_new` / `validate` / readback 含结构 / render) 后, 禁止再用 `officecli issues`、`officecli get` 逐格复核或读 `execution_plan.json`, 也禁止读 case 复盘/测试病历作证据 — 人工复核是冗余探索; 唯一例外 = 异常驱动的定向检查 (render 失败/readback 意外差异 → `officecli get` ≤2 次)。(细则: Part IV 总原则「机器证据终止条件」; 失败分类见失败处置表)
-6. **禁读源码**: TASK MODE 不读实现源码、不运行 Skill 测试套件、不修改 Skill、不连续设计实验; 机制问题走 Runtime Navigation Table (`compile_fill.py --capability <key>` / `--capabilities` / FILLSPEC 对应章节 / KNOWN_TRAPS / `officecli help`)。(细则: CAPABILITY_EVIDENCE.md)
+6. **禁读源码**: TASK MODE 不读实现源码、不运行 Skill 测试套件、不修改 Skill、不连续设计实验; 机制问题走 Runtime Navigation Table (`compile_fill.py --capability <key>` / `--capabilities` / FILLSPEC 对应章节 / KNOWN_TRAPS / `officecli help`)。**唯一例外 (recorded: case-004)**: 必需机制事实只存在于 tests/源码时, 允许**一次**定向只读定位该事实, 同时记一条 Capability Gap Discovery; 该读取不得当业务答案、不得扩大为读整套测试或改 Skill。(细则: CAPABILITY_EVIDENCE.md)
 7. **MOD 一次加载**: MOD 命中后一次加载 — 提名阶段只给候选名 + 命中/待复验信号 + 业务逻辑摘要 (**不含完整规则集**); 用户裁决后才经 canonical resolver (`references/` + MOD_INDEX 的 Path 列) 从 `canonical_path` 全文加载**选中** MOD 规则 (sha256 校验, 不匹配/缺失/畸形 fail-closed, 绝不回退同名副本)。(细则: II-2)
 8. **输入事实只认工作区清单 (manifest)**: 业务输入事实 (staged/哈希/flattened/digest) 唯一来源 = `workspace_manifest.json` (canonical; 其 run-local 派生视图 `prepare_manifest.json` 由 materialize_run 产出) 的机器记录; 漂移 → 拒绝执行并要求重新初始化, **不重新探测、不把 tests/fixtures、历史输出或 scratch 副本当业务事实来源**。(细则: III-1 / 权威模型 / Runtime Navigation Table)
 
@@ -310,7 +306,7 @@ python scripts/mod_nominate.py --workdir <dir> --task "<任务文本>" --files "
 输出结构化 JSON, status ∈ {none, resolved, ambiguous, conflict}; 裁决规则: 用户明确指定 MOD NONE → 直接记录不中断; 用户指定某 MOD 且排除信号未触发 → 直接采用 (记录 revision, 用户裁决优先); 唯一候选信号全过 → 自动采用; 多候选不同业务含义 → 询问; 单候选含 pending/missed/未知排除 → 询问 (fail-closed); MOD 与表结构冲突 (排除信号命中) → 询问降级/替换/覆盖 — 不再读 MOD 全文核对排除信号是否误报 (领域判断不改变裁决机制), 直接呈现冲突信号+候选+选项 → fail-closed ASK。`selected_mod` 写进 fill_spec.yaml 前, 裁决先落盘 `mod_resolution.json` (`--mod <NAME|NONE>` 重跑写盘; NAME 越界 fail-closed; NONE 写 resolved+selected:NONE) — 无 mod_state, 没有独立 Gate; FillSpec 的 selected_mod 必须与最终裁决一致 (编译器 C2/C3 机械校验; 未裁决 → C4 MOD_UNRESOLVED 拦截)。**MOD 生命周期与 route 解耦**: Prepare → Pre-MOD Evidence → Task Shape → MOD Nomination/Resolution → 加载 selected MOD 规则 → 业务推导 → 选择/执行 executor (fillspec / officecli_native / combined 视 shape 而定; form_content 命中业务 MOD 时 MOD 仍然生效 — **「form_content → 跳过 MOD」不再是合法路径**; FillSpec 语境 NOT_APPLICABLE 只表示引擎层不适用, 不是业务规则不适用)。
 **Canonical MOD Resolver 契约**: `mod_resolution.json` 每条候选/选定记录至少含 {name, canonical_path, revision, sha256} — canonical_path 一律目录表派生 (references/ + MOD_INDEX 的 Path 列), sha256 = 写盘时 canonical 文件哈希; 规则加载经 `load_rules_for_selected_mod()` (脚本与 Agent 只消费 canonical resolver 返回的 canonical 版本) → resolver 读 canonical_path 锁定文件并校验 sha256, 不匹配/缺失/畸形 → fail-closed (exit 3 + corrective_action, 绝不回退同名副本); `--check-canonical` 机械复核; 旧记录缺新字段 → re-resolve from catalog (记录 resolution_action); **禁止 glob 同名文件、禁止 scratch/history/legacy 副本作规则来源**。
 **规则注入时机 (硬性)**: 候选 MOD 规则**必须加载后才可写 spec** — 两段加载 (改变加载时机与粒度, 不因输出形态优化放宽): 提名阶段每个候选只给「候选名 + 命中/待复验信号 + 业务逻辑摘要 + 裁决选项」— **不含完整规则集**; 用户裁决后才经 canonical resolver 从选中 MOD 全文加载完整规则注入 FillSpec 撰写上下文 (spec 的 columns/formulas/lookups/rows/decisions 必须与 MOD 一致, 偏离记 decisions; MOD NONE/status=none 无注入)。MOD 含 Runtime Core → 先建立业务心智模型; 含 Attention Map → 按 resolve→map→transform→validate 认知顺序一次撰写。**MOD 规则变更必须经用户审核** (先呈现拟变更规则+理由+逐条 diff, 明确确认后才写入; 见 MOD_TEMPLATE.md)。
-**MOD ASK 必问清单 (硬性, 一次性枚举)**: 因 MOD 冲突/歧义询问时**一轮问全**, 禁止二轮补问: 成本口径 (原型机成本源列/面价 vs 散件, 含管口径); 缺失稳定属性 (无数值费用列 → 0 还是留空, 记 gaps); 费用组成 (净价公式链引用哪些费用列); 输出文件形态 (单块 vs 多块/目标 sheet/最终路径/是否保留模板既有块)。以上是模板 — 按任务增删, 但已知缺关键映射不得省略。
+**MOD ASK 必问清单 (硬性, 一次性枚举)**: 因 MOD 冲突/歧义询问时**一轮问全**, 禁止二轮补问 — 记录显示第二轮补问的成因是第一轮枚举不全 (case-009 漏问"原型机成本源列"), 所以要问满清单, 而不是留到下一轮。必问: 成本口径 (**原型机成本源列**: 面价 vs 散件, 含管口径); 缺失稳定属性 (无数值费用列 → 0 还是留空, 记 gaps); 费用组成 (净价公式链引用哪些费用列); 输出文件形态 (单块 vs 多块/目标 sheet/最终路径/是否保留模板既有块)。以上是模板 — 按任务增删, 但已知缺关键映射不得省略。**答问后新浮现的歧义不得靠猜, 也不另起一轮**: 记 gaps, 由 Spec Review (唯一人工点) 一次呈现。
 **Business Reasoning Barrier (硬性)**: Prepare 完成后 Barrier 关闭, 直到 `mod_resolution.json` status ∈ {resolved, none} 才解锁 (二元锁, 无例外分级)。**允许读**: `*_premod_evidence.md` / `*_outline.txt`; 裁决期间读 `mod_resolution.json`; `uncertain` 路由的受限补观察 (view html + ≤2 次定向 get/query) 只允许回答 task shape。**禁止读**: `*_flat.csv` / `*_meta.json` / `*_candidates.yaml`。**禁止做**: 生成 `*_digest.md`; column mapping / 公式口径推导 / inheritance / selector / 业务 ASK / FillSpec 推导或撰写。Barrier 未开: 只识别任务与规则, 不解决任务。
 
 ### 5. FillSpec Authoring (S4) — `fill_spec.yaml` (LLM 撰写)
@@ -321,7 +317,7 @@ python scripts/mod_nominate.py --workdir <dir> --task "<任务文本>" --files "
 **撰写规程 (先写后编译循环)**: MOD Resolution 完成后立即写首版 (下一项主要产物就是它); 命中 canonical pattern 直接实例化骨架, 不寻找相似案例; 只有阻塞项才延迟首次 Compile (阻塞项 = 不回答就无法用 FillSpec 表达业务结果的业务未知); 能由 Compiler 机械检出的问题不是阻塞项 (交给 defect 暴露后按 corrective_action 修, 不得手工预证明); 已被用户指令或 Selected MOD 解决的语义不得重开 ASK; 冲突消解裁决序: 本次用户明确指令 > Selected MOD > canonical pattern 默认语义 (结构合法性由 Compiler 裁决)。写 spec → `compile_fill.py` (~0.1s) → stderr 缺陷清单 (code + corrective_action) 即权威反馈 → 定向修 → 重编译; **禁止以源码阅读替代编译验证**。
 **Authoring 允许/禁读清单 (canonical)**: **Allowed（默认允许）**: business data read / MOD rules read / fill_spec template（`assets/fill_spec_template.yaml`）/ write/edit fill_spec / compile。**Forbidden by default**: 完整 FILLSPEC.md 读取（按问题定向读小节除外）/ 完整 TASK_ORCHESTRATION.md 读取 / FAILURE_CLASSES.md 读取 / capabilities matrix dump（`--capabilities`）/ source-code inspection。**Pattern Index（`assets/fillspec_patterns.yaml`）**: 已知 shape 时只读对应 pattern, 不要读 FILLSPEC 全文 — `grid_record: rows→columns / columns→matrix (fields: [field_map, record_map]) / grouped_grid→blocks`; 即 `grid_record + record_axis=columns` → `matrix.field_map + record_map`, 无理由再打开 FILLSPEC 全文。该文件禁止示例/schema 解释/exception/tutorial/capability 矩阵 (contract test 机械固定), 也不得仅为建索引而展平。
 **Capability Query 合法触发 (首次 Compile 前仅三类)**: A. 确实不知道当前 shape 的 canonical pattern; B. 用户要求明显处于能力边界的操作; C. Pattern Index 明确标记 requires_capability_check。不合法: "为了保险确认一下" / "怕出错先查一下" / 无具体问题的泛化探索。全局验收措辞: `unjustified capability query = 0`。
-**能力求证 (按需加载, 正常 Run 不预读)**: happy path 不先 probe、不预读 capability 材料; 只有产生单一可证伪 Capability Question 时才读 CAPABILITY_EVIDENCE.md 并沿其算法: Known Supported → 直接用 (Run Verification 全部执行: formal compile、Validated Draft、readback、结构验证、Render QA); Known Rejected → 找 Known Equivalent Adaptation; Capability Unknown → 非阻塞忽略/等价适配, 昂贵架构分叉才消耗本 Run 唯一 Extra Capability Probe (`--probe`, 骨架用 `make_probe_spec.py`, 输出 ACCEPTED/REJECTED), 四项资格全满足才消耗本 Run 唯一 Bounded Rescue (Rescue 使用前按 CAPABILITY_EVIDENCE.md §4 合同: 预声明 question/plan/verdict → scratch 黑盒实验 → workdir Run-local 记录 → 交付呈报一句; 无 Sufficient Evidence 时仅安全路径间的业务取舍才 ASK, 否则 STOP)。Probe 与 Rescue 预算独立; 普通 compile defect 走 REPAIR 不升级。
+**能力求证 (按需加载, 正常 Run 不预读)**: happy path 不先 probe、不预读 capability 材料; 只有产生单一可证伪 Capability Question 时才读 CAPABILITY_EVIDENCE.md 并沿其算法: Known Supported → 直接用 (Run Verification 全部执行: formal compile、Validated Draft、readback、结构验证、Render QA); Known Rejected → 找 Known Equivalent Adaptation; Capability Unknown → 非阻塞忽略/等价适配, 只有**昂贵架构分叉**才动用 Extra Capability Probe (`--probe`, 骨架用 `make_probe_spec.py`, 输出 ACCEPTED/REJECTED)。预算判据 (recorded: case-005 probe 膨胀): 单一可证伪问题 + 预期新增证据 + 不重复已失败或等价方法 — 满足即用, 不满足即不用; 每 Run 一次是**默认软预算**, 不是"用完必须停"。Bounded Rescue 使用前按 CAPABILITY_EVIDENCE.md §4 合同 (预声明 question/plan/verdict → scratch 黑盒实验 → workdir Run-local 记录 → 交付呈报一句; 无 Sufficient Evidence 时仅安全路径间的业务取舍才 ASK, 否则 STOP)。Probe 与 Rescue 是两种不同的架构分叉, 各需独立判据; 普通 compile defect 走 REPAIR 不升级。
 - **TASK MODE 禁区 (硬性)**: 不读实现源码、不运行测试套件、不修改 Skill、不连续设计实验; 实验 (含 Bounded Rescue) 一律用独立 scratch 文件, staged 文件只读。
 - **YAML 纪律**: 含 `: `/引号/特殊字符的字符串统一加引号 — decisions/gaps 条目含 `: ` 时给**整行** (含冒号) 加双引号 (漏写 → SPEC_NON_STRING_ITEM exit 3)。
 
@@ -416,12 +412,12 @@ python scripts/promote_output.py --workdir <dir> --final <用户要求的最终�
 
 ## 总原则: 思考按需升级
 
-不重新推导确定性状态、不重复评估已解决决策 — 脚本/digest/失败记录已给出的事实不得重新推导; 验证即证据, 手动 `officecli get` 全流程 ≤2 次, 仅用于异常驱动的定向检查; 失败优先读 `_draft_failure.json` 的 defect_class, 禁止自由实验。
-**机器证据终止条件 (硬性)**: `execute_batch.py` 已返回 `issues_new` / `validate` / readback (含结构 readback) / render 后, **禁止**再用 `officecli issues`、读 `execution_plan.json`、`officecli get` 逐格复核, 也**禁止读 case 复盘 / 测试病历作证据** — 坐标、列宽、readback、组边界都已被机器证据证明, 人工复核是冗余探索。唯一例外 = **异常驱动的定向检查** (render 失败 / readback 意外差异): 允许 `officecli get` ≤2 次定位具体格; `get` 与 `issues` 是两回事 — 机器证据已证明时 `officecli issues` 一律禁止。
+不重新推导确定性状态、不重复评估已解决决策 — 脚本/digest/失败记录已给出的事实不得重新推导; 验证即证据; `officecli get` 只在机器证据**覆盖不到**的断言上使用 (不重复已覆盖的断言, 见下), 并优先自动化; 失败优先读 `_draft_failure.json` 的 defect_class, 禁止自由实验。
+**机器证据终止条件 (硬性)**: `execute_batch.py` 已返回 `issues_new` / `validate` / readback (含结构 readback) / render 后, **禁止**再用 `officecli issues`、读 `execution_plan.json`、`officecli get` 逐格复核**它已经覆盖的断言** (坐标、组边界、readback 值、`precision: keep` 列的列宽均有编译期或结构机检背书), 也**禁止读 case 复盘 / 测试病历作证据** — 重复已覆盖的复核是冗余探索。但**机器证据不是充分条件**: render 只产出产物 (`status: "produced"`), 视觉与结构结论属于 Agent (`execute_batch.py`: the verdict is the agent's); 已记录的反例是交付件净价列显示全 0$ 而 readback/issue/validate 全绿 (KNOWN_TRAPS), 以及 readback 假失败必须人工复核。因此: 机器证据**覆盖不到**的目标 (交付件里的公式结果、版式与视觉、与观测矛盾之处) **必须**做异常驱动的定向检查; 覆盖到的不得重复。`get` 与 `issues` 是两回事 — 机器证据已覆盖时 `officecli issues` 一律禁止。
 ## Help-first
 当 officecli 属性名、参数语义、元素能力或 merge/remove 行为不确定时, 先跑 `officecli help <format> <element>` 再生成相关 ops (Standard Evidence Path); **绝不猜测未经确认的命令语义**。已实测机械事实 (spike 四坑: 行删除残留 vMerge、unmerge 多步、`merge.down=N` 总跨度 N+1、validate 对合并残留视而不见) 见 references/KNOWN_TRAPS.md — 运行时不再重新发现。
 ## Exit Code Protocol
-exit 0 = Pass, proceed; exit 1 = Fatal (file missing, env error), STOP + report to user; exit 3 = Retryable: 读 stderr 的 defect/corrective_action 定向修复后重跑 — 修复是预期步骤, 不询问用户; 第 2 次连续失败才分类为 ASK/STOP。
+exit 0 = Pass, proceed; exit 1 = Fatal (**非瞬时**环境错误: file missing / 依赖不可用 / 权限), STOP + report to user; exit 3 = Retryable: 读 stderr 的 defect/corrective_action 定向修复后重跑 — 修复是预期步骤, 不询问用户。**瞬时环境故障** (officecli timeout / 文件锁占用 / resident 窗口冲突 / render 服务不可用) 不按 exit 1 终止, 按失败处置表判 RECOVER: 清理运行条件后直接重 execute; 第 2 次连续失败才分类为 ASK/STOP。
 ## 失败处置表 (每次失败先分类, 再行动)
 
 | 失败类型 | 处置 |
@@ -458,11 +454,11 @@ tests/fixtures/benchmark expected/historical snapshots 的合法性由**当前 M
 | **tests/fixtures** | **Task Mode 禁止**（仅 Skill Development Mode 可读） |
 
 #### Source Scope Guard（用户声明来源边界）
-用户声明边界时, search 限制在 declared scope + table-fill runtime code/docs + selected MOD。**禁止无授权递归全盘搜索** legacy skill / 历史输出作业务答案 — 越界搜索被记录/阻止 (严重度足以污染证据边界时 fail-closed)。
+用户声明边界时, search 的**上界**是 declared scope + selected MOD; 业务答案只能来自合法来源枚举, 不得来自 legacy skill / 历史输出 / scratch 副本 — **禁止无授权递归全盘搜索**。`runtime code/docs` 只界定"搜索能到哪里", **不构成**读实现源码的许可 (源码读取仍受硬约束 6 与 case-004 单次例外约束)。越界搜索被记录/阻止 (严重度足以污染证据边界时 fail-closed)。
 #### Runtime Tool Contract（禁止无授权 openpyxl 直写业务）
 table-fill 开始后禁止无授权 openpyxl 直写业务执行 — 业务填充唯一执行器是 `execute_batch.py`; Python 仅限 Skill Development/diagnostics/tests。officecli 子进程调用必须经 `_officecli.officecli()` 适配器。
 #### Exploration Stop Rule（探索预算与停止条件）
-obvious_grid → routing probes = 0 (Fast Path stop-rule 保留); 非 obvious 仅限既有 uncertain 受限补观察 + **结构补充 probe ≤ 1 次**; 预算耗尽仍不确定 → ask/ambiguous。**禁止无限 view/render/script/glob/legacy search 直到"感觉理解"**。
+obvious_grid → routing probes = 0 (Fast Path stop-rule 保留); 非 obvious 仅限既有 uncertain 受限补观察, 且每次补观察必须针对一个具体未决问题 (默认 1 次为**软预算**, 不因次数本身中止有效调查); 仍不确定 → ask/ambiguous。**禁止无限 view/render/script/glob/legacy search 直到"感觉理解"**。
 #### Barrier Enforcement（Task Shape / MOD Resolution 完成前的闸门）
 Task Shape / MOD Resolution 完成前不允许 field mapping / business selector / output generation — 业务推导必须以 task_shape 判定 + `mod_resolution.json` (status ∈ {resolved, none}) 为前提。
 ## 不信任事件与契约漂移 (记录在案, 制度化交给 Skill Development)
@@ -474,7 +470,7 @@ Task Shape / MOD Resolution 完成前不允许 field mapping / business selector
 
 # Part V — 参考路由（Reference Router）
 
-**先决纪律 (渐进式披露)**: 机制问题按 Runtime Navigation Table 与下表**定向查阅**, 不全文通读; references 是细节唯一权威源, SKILL 正文不重复细节。**正常 happy path 默认读取 references = 0** — 只有下表列出的具体触发条件发生时, 才读取对应**单一** reference; 禁止把 references 当启动加载项, 禁止"常态运行实际使用七件套"式预读。
+**先决纪律 (渐进式披露)**: 机制问题按 Runtime Navigation Table 与下表**定向查阅**, 不全文通读; references 是细节唯一权威源, SKILL 正文不重复细节。**判据是"读最小文献面"**: 无具体问题不预读、不全文通读、只读触发条件点名的那几个小节 — 一个真实问题可以跨多份文件的小节 (recorded: 报价场景同时读 FILLSPEC 指定小节 + `assets/combination_patterns.yaml` 是必要且不可删的), 因此不设"零文件/单文件"上限; 但禁止把 references 当启动加载项, 禁止"常态运行实际使用七件套"式预读。
 
 ## Troubleshooting
 

@@ -5,20 +5,22 @@
   [ ] SKILL 顶部硬约束写明: MOD 决议后首个业务动作 = 产出 FillSpec 初稿 (可以不完整)
   [ ] 未产出初稿禁止深度能力探索; 编译缺陷是下一轮探索的唯一入场券 (错误驱动)
   [ ] 模式索引路由优先于全文阅读: 已知形态只读对应 pattern
-  [ ] 埃及类 case 重跑验证: 决议→初稿之间仅允许 读 pattern → 读 digest → 写 spec
-      → compile 四类动作
+  [ ] 埃及类 case 重跑验证: 决议→初稿之间仅允许「解除撰写阻塞的最小动作集」
+      (读 pattern → 读 digest → 定向读参考小节 / --capability <key> → 写 spec →
+      compile 五类动作; 判据优先于计数, ADR 0022)
   [ ] 行为契约文字在 SKILL 中的位置不随后续瘦身丢失 (07 号票迁移时保留置顶位)
 
 测试面 (spec Testing Decisions「好测试 = 只测外部行为」, 本票是行为契约):
 
-  A. SKILL 硬约束文字 pin — SKILL.md「## 硬约束」节含四类动作 + FillSpec First
-     Rule + 错误驱动 + 模式索引路由 + 初稿可以不完整。
-  B. fill_spec_first_validator 纯函数校验 — 合法序列 (四类动作) 通过; 非法序列
-     (探索在前) 失败; 错误驱动循环 (初稿后 compile→explore→修复) 合法。
+  A. SKILL 硬约束文字 pin — SKILL.md「## 硬约束」节含最小动作集 (五类) + FillSpec
+     First Rule + 错误驱动 + 模式索引路由 + 初稿可以不完整。
+  B. fill_spec_first_validator 纯函数校验 — 合法最小序列 (五类动作集内) 通过;
+     非法序列 (探索在前) 失败; 定向读参考小节 / 单键 `--capability <key>` 合法;
+     错误驱动循环 (初稿后 compile→explore→修复) 合法。
   C. 埃及类 case 证据 (e2e): 复用 task_orchestration e2e fixture (parameter_book
      / filling_template), 在临时 workdir 走 workspace_init → 写初稿 spec → compile
      最短流程, 断言「决议→初稿」动作序列 (读 pattern / 读 digest / 写 spec /
-     compile 四类) 不含探索动作, 且四类动作可完整跑通。
+     compile — 五类动作集的子集) 不含探索动作, 且该序列可完整跑通。
 
 无 Office 时: A 与 B 全绿 (纯文字 + 纯函数); C 依赖 officecli, 整体 skipIf 优雅
 跳过 (与 test_workspace_init / test_task_e2e 同风格)。
@@ -44,8 +46,8 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from fill_spec_first_validator import (  # noqa: E402
-    FOUR_ACTION_CLASSES,
     LEGAL_PRE_DRAFT_ACTIONS,
+    PRE_DRAFT_ACTION_CLASSES,
     normalize_action,
     validate_actions,
 )
@@ -76,7 +78,7 @@ def _hard_constraint_section() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# A. SKILL 硬约束文字 pin (置顶位 + 四类动作 + FillSpec First + 错误驱动 + 模式索引)
+# A. SKILL 硬约束文字 pin (置顶位 + 最小动作集五类 + FillSpec First + 错误驱动 + 模式索引)
 # ─────────────────────────────────────────────────────────────────────
 
 class TestHardConstraintTextPinning(unittest.TestCase):
@@ -131,13 +133,15 @@ class TestHardConstraintTextPinning(unittest.TestCase):
                         or "不读FILLSPEC全文" in stripped)
         self.assertTrue(no_full_read, "硬约束节缺 '不读 FILLSPEC 全文' 规则")
 
-    def test_four_action_classes(self):
-        """决议→初稿之间仅允许 读 pattern → 读 digest → 写 spec → compile 四类。"""
+    def test_pre_draft_action_set(self):
+        """决议→初稿之间仅允许 读 pattern → 读 digest → 定向读参考小节 /
+        `--capability <key>` → 写 spec → compile (解除撰写阻塞的最小动作集, 五类)。"""
         section = _hard_constraint_section()
         stripped = _strip(section)
-        self.assertIn("四类动作", stripped)
-        for clazz in ("读pattern", "读digest", "写spec", "compile"):
-            self.assertIn(clazz, stripped, f"四类动作缺 {clazz!r}")
+        self.assertIn("解除撰写阻塞所必需的最小动作集", stripped)
+        for clazz in ("读pattern", "读digest", "定向读参考小节",
+                      "写spec", "compile"):
+            self.assertIn(clazz, stripped, f"最小动作集缺 {clazz!r}")
 
     def test_validator_reference_in_skill(self):
         """硬约束节引用可执行校验器 (可执行化的落点)。"""
@@ -154,17 +158,19 @@ class TestFillSpecFirstValidator(unittest.TestCase):
     """行为契约的可执行化: 合法序列通过 / 探索在前失败 / 错误驱动循环合法。"""
 
     def test_legal_minimal_sequence_passes(self):
-        """四类动作最小序列 (读 pattern → 读 digest → 写 spec → compile) 合法。"""
+        """合法最小序列 (五类动作集内的 读 pattern → 读 digest → 写 spec →
+        compile) 通过。"""
         result = validate_actions(
             ["read_pattern", "read_digest", "write_spec", "compile"])
         self.assertTrue(result["ok"], result["violations"])
         self.assertEqual(result["first_draft_at"], 2)
 
-    def test_legal_sequence_has_only_four_classes(self):
-        """四类动作契约常量与校验器一致。"""
-        self.assertEqual(set(FOUR_ACTION_CLASSES), set(LEGAL_PRE_DRAFT_ACTIONS))
-        self.assertEqual(FOUR_ACTION_CLASSES,
-                         ("read_pattern", "read_digest", "write_spec", "compile"))
+    def test_legal_sequence_has_only_pre_draft_classes(self):
+        """五类动作集常量与校验器一致 (判据式契约: 判据优先于计数, ADR 0022)。"""
+        self.assertEqual(set(PRE_DRAFT_ACTION_CLASSES), set(LEGAL_PRE_DRAFT_ACTIONS))
+        self.assertEqual(PRE_DRAFT_ACTION_CLASSES,
+                         ("read_pattern", "read_digest", "read_reference",
+                          "write_spec", "compile"))
 
     def test_explore_before_draft_violates(self):
         """探索出现在初稿写入之前 → 违规 (FillSpec First Rule 核心)。"""
@@ -179,6 +185,17 @@ class TestFillSpecFirstValidator(unittest.TestCase):
             ["read_digest", "full read fillspec", "write_spec"])
         self.assertFalse(result["ok"])
         self.assertTrue(any("深度能力探索" in v for v in result["violations"]))
+
+    def test_targeted_reference_read_before_draft_is_legal(self):
+        """定向读具名参考小节 / 单键 `--capability <key>` 是初稿前的合法最小读取
+        (case-009 记录的正确路径); 全文阅读 (explore) 仍违规。"""
+        self.assertTrue(validate_actions(
+            ["read_pattern", "读 FILLSPEC.md 布局决策树",
+             "write_spec", "compile"])["ok"])
+        self.assertTrue(validate_actions(
+            ["--capability matrix.field_locator", "write_spec"])["ok"])
+        self.assertFalse(validate_actions(
+            ["read_digest", "full read fillspec", "write_spec"])["ok"])
 
     def test_error_driven_loop_after_draft_is_legal(self):
         """初稿后 compile 缺陷 → 定向 explore → 修复 → 重 compile 是合法循环。"""
@@ -200,10 +217,14 @@ class TestFillSpecFirstValidator(unittest.TestCase):
         self.assertEqual(normalize_action("read fillspec_patterns.yaml"), "read_pattern")
         self.assertEqual(normalize_action("--capabilities"), "explore")
         self.assertEqual(normalize_action("read source digest.md"), "read_digest")
+        self.assertEqual(normalize_action("--capability matrix.field_locator"),
+                         "read_reference")
+        self.assertEqual(normalize_action("读 references/KNOWN_TRAPS.md 条目"),
+                         "read_reference")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# C. 埃及类 case 证据 (e2e): 最短流程跑通四类动作, 无探索动作
+# C. 埃及类 case 证据 (e2e): 最短流程跑通最小动作集, 无探索动作
 # ─────────────────────────────────────────────────────────────────────
 
 def run_py(workdir: Path, script: str, *args) -> subprocess.CompletedProcess:
@@ -216,7 +237,8 @@ def run_py(workdir: Path, script: str, *args) -> subprocess.CompletedProcess:
 @unittest.skipIf(shutil.which("officecli") is None, "officecli not on PATH")
 class TestEgyptianCaseFourActionFlow(unittest.TestCase):
     """埃及类 case 证据: 复用 task_orchestration e2e fixture, 走 workspace_init
-    → 写初稿 spec → compile 最短流程; 断言「决议→初稿」动作序列仅四类、无探索。"""
+    → 写初稿 spec → compile 最短流程; 断言「决议→初稿」动作序列仅属五类最小
+    动作集、无探索。"""
 
     def setUp(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -243,8 +265,9 @@ class TestEgyptianCaseFourActionFlow(unittest.TestCase):
             pass
 
     def _build_action_log(self) -> list[str]:
-        """决议→初稿窗口的动作日志: 读 pattern → 读 digest → 写 spec → compile
-        (与 SKILL「四类动作」逐字对应; 无 --capabilities/--probe/源码/全文阅读)。"""
+        """决议→初稿窗口的最短动作日志: 读 pattern → 读 digest → 写 spec → compile
+        (五类最小动作集的子集; 与 SKILL「解除撰写阻塞所必需的最小动作集」逐字对应,
+        无 --capabilities/--probe/源码/全文阅读)。"""
         return ["read_pattern", "read_digest", "write_spec", "compile"]
 
     def test_four_action_flow_runs_green_no_exploration(self):
@@ -271,7 +294,7 @@ class TestEgyptianCaseFourActionFlow(unittest.TestCase):
             sheets="parameter_book.xlsx:R32参数;filling_template.xlsx:Sheet1",
             sources=target_entry_name("parameter_book", "R32参数"),
             target=target_entry_name("filling_template", "Sheet1"),
-            task="FillSpec First 四类动作验收")
+            task="FillSpec First 最小动作集验收")
         self.assertIn("flattened", manifest)
 
         # 3. 决议落盘 (MOD NONE → resolved), 解锁业务推理
@@ -291,7 +314,7 @@ class TestEgyptianCaseFourActionFlow(unittest.TestCase):
         # 5. 写初稿 fill_spec.yaml (可以不完整 — 最小可编译形状)
         fp = manifest["fingerprints"]
         spec = {
-            "task": {"intent": "埃及类四类动作验收 (FillSpec First)",
+            "task": {"intent": "埃及类最小动作集验收 (FillSpec First)",
                      "selected_mod": "NONE", "selected_mod_revision": None},
             "inputs": {"sources": ["parameter_book.xlsx"],
                        "target": "filling_template.xlsx",
@@ -331,8 +354,11 @@ class TestEgyptianCaseFourActionFlow(unittest.TestCase):
         self.assertGreater(plan["operation_count"], 0)
 
         # 7. 全程断言: 决议→初稿窗口无探索动作 (契约的流程合法性验证)。
-        self.assertEqual(set(result["normalized"]), set(FOUR_ACTION_CLASSES),
-                         "决议→初稿窗口动作必须是四类动作的子集")
+        #    本最短流程 4 个动作即可跑通; 契约另允许第五类 (定向读参考小节 /
+        #    单键 --capability), 故断言实际动作集 ⊆ 五类合法动作集。
+        self.assertLessEqual(set(result["normalized"]),
+                             set(PRE_DRAFT_ACTION_CLASSES),
+                             "决议→初稿窗口动作必须属于最小动作集 (五类)")
 
 
 if __name__ == "__main__":

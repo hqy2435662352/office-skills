@@ -5522,7 +5522,8 @@ class DocCoverageGuardTests(unittest.TestCase):
         与 Run-local 证据 (防详细政策被拆散或章节被误删)."""
         text = self._capability_evidence_text()
         for word in ("Known Supported", "Known Rejected", "Capability Unknown",
-                     "Evidence Fit", "Standard Evidence Path", "scope"):
+                     "Evidence Fit", "Standard Evidence Path", "scope",
+                     "判据优先于计数", "软预算"):
             self.assertIn(word, text, f"CAPABILITY_EVIDENCE.md 缺词 {word!r}")
         for path_word in ("--capabilities", "formal compile", "officecli help",
                           "KNOWN_TRAPS", "readback", "结构验证", "Render QA"):
@@ -5850,11 +5851,14 @@ class DocCoverageGuardTests(unittest.TestCase):
     def test_skill_md_failure_cost_quantified(self):
         """SKILL.md 失败处置量化: 第 1 轮失败是预期路径 (REPAIR), 预算约束
         连续失败而非单次失败 (第 2 次连续失败才 ASK/STOP — 消除'怕失败读源码'
-        的动机; 时间预算已退役, Observability 无时间限制)."""
+        的动机; 时间预算已退役, Observability 无时间限制). ADR 0022: exit 1
+        只对**非瞬时**环境错误判 STOP; 瞬时故障 (timeout/锁/resident) 走 RECOVER."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("预期路径", text)
         self.assertIn("连续失败", text)
         self.assertIn("第 2 次连续失败", text)
+        self.assertIn("瞬时环境故障", text)
+        self.assertIn("非瞬时", text)
 
     def test_fillspec_q11_q12_sections(self):
         """契约章节含 Q11 (克隆携带合并) 与 Q12 (merges×aggregates/多组聚合)."""
@@ -6221,11 +6225,13 @@ class DocCoverageGuardTests(unittest.TestCase):
                       "FAILURE_CLASSES 缺 render 默认 html 措辞")
 
     def test_skill_md_machine_evidence_termination_extended(self):
-        """机器证据终止条件扩展: execute 已返回机器证据后禁止 officecli get 逐格
-        复核 + 禁止读 case 复盘/测试病历作证据; 唯一例外 = 异常驱动定向 get ≤2."""
+        """机器证据终止条件 (ADR 0022 改写): 禁止重复已覆盖的断言, 但机器证据不是
+        充分条件 — render 只产出产物 (status produced), 视觉/结构结论属于 Agent;
+        覆盖不到的目标必须异常驱动定向检查 (recorded: KNOWN_TRAPS 净价列全 0$)."""
         text = self._skill_md_text()
         for word in ("机器证据终止条件", "逐格复核", "officecli get", "case 复盘",
-                     "测试病历", "异常驱动的定向检查", "禁止"):
+                     "测试病历", "异常驱动的定向检查", "禁止",
+                     "the verdict is the agent's", "覆盖不到", "produced"):
             self.assertIn(word, text, f"SKILL.md 机器证据终止条件缺词 {word!r}")
 
     def test_skill_md_canonical_pattern_instantiate_stop(self):

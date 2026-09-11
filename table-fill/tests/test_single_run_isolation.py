@@ -614,13 +614,18 @@ class SingleRunIsolationContractTextTests(unittest.TestCase):
     def test_task_orchestration_reference_annotation_triple(self):
         """TASK_ORCHESTRATION 参考资料标注在多处：
         S4 authoring 禁读清单 / Task Orchestration 末尾 / Troubleshooting。
-        happy path 默认读取 references = 0 (Part V)。"""
+        ADR 0022: Part V 的判据是"读最小文献面" (无具体问题不预读、不全文通读),
+        不再写"零文件 / 单文件"上限。"""
         skill = self._skill()
         # "正常 happy path 禁止全文读取" 至少出现 2 次 (authoring + 参考路由)
         count = skill.count("正常 happy path 禁止全文读取")
         self.assertGreaterEqual(
             count, 2,
             f"TASK_ORCHESTRATION 参考资料标注应至少出现 2 次，实际 {count} 次")
+        self.assertIn("读最小文献面", skill,
+                      "Part V 缺 ADR 0022 '读最小文献面' 判据")
+        self.assertNotIn("默认读取 references = 0", skill,
+                         "ADR 0022 已移除 'references = 0' 硬上限")
 
     def test_topology_check_uses_only_existing_facts(self):
         """Topology 只消费任务文本 + workspace_manifest 事实，零新增探测。"""

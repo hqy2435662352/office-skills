@@ -238,10 +238,10 @@ non-dispositive) ≠ 能力状态 (三态) ≠ 工作流动作 (使用/适配/AS
   同时记录 **Contract Drift**; 无法判定哪个更直接 → **ASK/STOP**, 不以自造
   实验仲裁 (见第 5 节)。
 
-## 3. Extra Capability Probe (每 Run ≤ 1)
+## 3. Extra Capability Probe (默认每 Run 1 次软预算, 判据优先)
 
-**用途唯一**: 只在下列**全部**成立时, 允许在撰写正式 FillSpec 之前消耗本 Run
-唯一一次 Extra Capability Probe (`compile_fill.py --probe` 或
+**用途唯一**: 只在下列**全部**成立时, 允许在撰写正式 FillSpec 之前动用
+Extra Capability Probe (`compile_fill.py --probe` 或
 `make_probe_spec.py` 生成骨架):
 
 1. 问题属于 Compiler acceptance 且能力权威 (contract / `--capabilities`) 未回答;
@@ -254,7 +254,10 @@ defect、复杂组合、首次出现、特性数量多、缺少同形 Canonical 
 
 **结果与预算**:
 
-- 预算属于 Run 而非问题: 每 Run 至多一次; 不被问题的数量重置。
+- **判据优先于计数**: 一次 probe 只有在「单一可证伪问题 + 预期新增证据 + 不重复
+  已失败或等价方法」全部成立时才算正当。每 Run 1 次是**默认软预算**, 用来提醒
+  "这是架构分叉, 不是探索手段"; 判据不成立时第 1 次也不该做, 判据成立时不为
+  次数本身中止 (recorded: case-005 有 3 次 compile, 其中 2 次属能力探测)。
 - 输出只有 **ACCEPTED / REJECTED**; 对问题具有 Evidence Fit 的结果
   **立即终结该 Capability Question** — 不能把 dispositive 结果包装成
   "不够放心" 后再进入 Rescue。
@@ -263,7 +266,7 @@ defect、复杂组合、首次出现、特性数量多、缺少同形 Canonical 
 - 结果只解决当前具体 spec 的接受性 (formal compile 同管线); 不升级跨 Run
   knowledge, 不写入 KNOWN_TRAPS (制度化见第 5 节模式切换)。
 
-## 4. Bounded Rescue (每 Run ≤ 1)
+## 4. Bounded Rescue (默认每 Run 1 次软预算)
 
 **四项资格 (同时成立才可进入)**:
 
