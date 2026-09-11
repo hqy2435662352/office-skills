@@ -37,71 +37,19 @@ S7 Execute + Verify → S8 Deliver
 
 除明确 Exception Route 外, 不跳阶段、不倒序、不插入机制探索。
 
-## S0 — Workspace Init
+| 阶段 | 细则所有者 | 不可省契约 |
+|---|---|---|
+| **S0 Workspace Init** | §1 | `workspace_init.py --init` Job 级一次原子完成 staging → 事实空间; workdir 必须 ASCII; 输入漂移 → 重新 `--init` |
+| **S1 Topology** | §2 | Topology: 用任务文本 + workspace_manifest 事实判定 single_run / multi_run, **零新增探测**; lowering 只由 `materialize_run.py` 做 |
+| **S2 Task Shape** | §3 | 判定输入 = 任务指令 × 源 evidence × 目标 evidence; 零新脚本 / 零额外 LLM / 零额外探测 |
+| **S3 MOD Resolution** | §4 | 按裁决规则**自动采用或**提请用户裁决 → `mod_resolution.json`; 未裁决 (status ∈/ {resolved, none}) 禁止业务推导 |
+| **S4 FillSpec First Draft** | §5 | 初稿可以不完整; 只有阻塞项才做最小定向读取; `fill_spec.yaml` 是唯一业务 IR |
+| **S5 Compile / Repair** | §6 | Compile Clean 才进 Review; 机械缺陷自动 REPAIR, 业务歧义 ASK / 记 gaps |
+| **S6 Spec Review** | §7 | 唯一人工点; `--confirm` 绑定该份 FillSpec 的 sha256, 字节变化即旧确认失效 |
+| **S7 Execute + Verify** | §8 | 先复制 staged target 再填充 (模板永不改); 前置门禁 fail-closed; 机器验证全绿才出 draft |
+| **S8 Deliver** | §9 | `promote_output.py` 哈希核对复制; 验证后绝不再次填充 |
 
-- 唯一命令: `workspace_init.py --init --files ... --sheets ... --task ...` (每 Job 一次, 单 run 与 multi-run 相同)
-- 产出: `workspace_manifest.json` — physical facts only: inputs / outlines / flattened (每 entry: file/sheet/csv/meta/evidence/candidates + entry-level structure_sha256)
-- 角色中立: 无 target 参数, 无 kind 标签, 无 source/target 二元 fingerprints; 不写 prepare_manifest
-- **Selective Flatten Invariant**: 只展平本 Job 明确纳入的业务 sheet 并集。角色中立 ≠ 全簿展平 — 后者会让历史 sheet 混入事实空间、污染 MOD 提名与路由判定
-- Sheet Scope (本 Job 需要哪些 sheet 进事实空间) ≠ Run Role (某 run 中谁是 source/target) — 前者在 init 内回答, 后者在 topology 后回答
-- 下一步: S1
-
-## S1 — Topology + Run Materialization
-
-- Topology: 用任务文本 + workspace_manifest 事实判定 single_run (默认, 1 个 run) 或 multi_run (N 个 run, task.yaml 清单); 零新增探测; 判定只回答"几个 run", 不回答业务映射
-- Run Materialization = Topology 的机械 lowering, 不是独立决策阶段: `materialize_run.py`
-  - Resolve: sources/target entry 名与 workspace_manifest 比对
-  - Validate: 引用 entry 必须在已初始化 scope 内, 否则 `RUN_ENTRY_NOT_IN_WORKSPACE` (exit 3) — 绝不偷偷增量 flatten 缺失 sheet, 修正 = 以完整业务 sheet 并集重新 --init
-  - Project: 生成 run-local `prepare_manifest.json` (派生 source_structure/target_structure 指纹 — 聚合是 run 层视图, workspace 只存 entry-level 事实)
-  - Render: 对 target entry 从已有 meta/csv/candidates 渲染 target routing view (style 段; 0 probing · 0 flatten · 0 extraction, 纯 presentation projection)
-- 单 run 用 CLI 参数定义 run (不创建 task.yaml); 多 run 用 task.yaml (持久清单, 一次 materialize 全部, 纯 for 循环)
-- 禁止: 增量 flatten / workspace 修改 / cache 发现 / run-definition 落盘文件 / 业务映射
-- 下一步 S2 multi-run 自此按阶段推进：S2/S4/S5/S7/S8 为 per-run；S3 为 Job-level once；S6 为所有 Compile Clean runs 的一次联合 Review。
-
-## S2 — Task Shape (每 run)
-
-- 输入: 任务文本 × 源 evidence × 目标 evidence; 输出: `task_shape.json` (grid_record → fillspec 快路径 / form_content / mixed / uncertain → Exception Routing)
-- 零新脚本、零额外探测 — 读毕 evidence 即答 (Routing V2 见 III-3)
-- 下一步: S3
-
-## S3 — MOD Resolution (任务级一次)
-
-- `mod_nominate.py` → 按裁决规则**自动采用或**提请用户裁决 → `mod_resolution.json` → canonical resolver 加载选中 MOD (sha256 fail-closed) → 解锁 full digest
-- 提名只给候选名 + 命中信号 + 业务摘要, 不给完整规则; 未裁决 (status ∉ {resolved, none}) 时禁止业务推导
-- 已满足自动采用条件 (用户明确指定 / 唯一候选信号全过) 时不得再问一轮; 只有多候选不同业务含义、或排除信号冲突才提请裁决
-- 用户确认选择后加载完整 MOD 规则
-- 下一步: S4
-
-## S4 — FillSpec First Draft
-
-- MOD 决议后下一产物 = `fill_spec.yaml` 初稿 (允许不完整); 初稿前禁止深度能力探索
-- 允许: business data / MOD rules / fill_spec 模板 / pattern index / write spec / compile; 禁读全文型 references
-- 下一步: S5
-
-## S5 — Compile / Repair Loop
-
-- `compile_fill.py`: PASS → **COMPILE CLEAN** → S6; FAIL → defect.code / corrective_action
-- 机械类缺陷 (YAML/schema · locator · fingerprint · 重复写 owner · 公式/merge/nulls 结构冲突 · deterministic corrective_action): 修复 → 重编译, 不打扰用户
-- **业务歧义不得"修到能编译"** (两映射都合理 / 填 0 还是空 / 字段归属 / 输出语义): 走 ASK 或记 gaps 由 Review 呈现。Compile before Review ≠ 业务决策 before Review — Compiler 只证明"合法", 不证明"是用户要的"
-- 下一步: S6
-
-## S6 — Spec Review (唯一人工点)
-
-- 对 COMPILE CLEAN 的 fill_spec 生成摘要 (映射/转换/排除, 业务语言, 非 YAML); `--confirm` 绑定 fill_spec sha256 → `review_confirm.json`
-- 用户确认的是"即将执行的这一份 IR bytes", 不是"这个任务我看过" — 所以任何 FillSpec 字节变化后旧确认失效
-- TASK MODE 禁止 `--skip-review` (CLI 仅兼容保留) — Execute 门禁不区分"跳过"与"漏做"
-- 下一步: S7
-
-## S7 — Execute + Verify
-
-- 前置门禁 (复制模板之前 fail-closed): `review_confirm.json` 存在 (否则 SPEC_REVIEW_MISSING) 且 `review_confirm.fill_spec_sha256 == execution_plan.fill_spec_sha256` (否则 SPEC_REVIEW_STALE); 输入哈希漂移 → INPUT_HASH_DRIFT
-- 机器验证: validate / issue delta / readback (含结构) / Render QA → `draft_receipt.json`
-- 失败二分: 执行/环境缺陷 (FillSpec bytes 不变) → 修复运行条件 → 直接重试, 不重新 Review; FillSpec-affecting 缺陷 → 修 spec → 重新 S5 → S6 → S7
-- 下一步: S8
-
-## S8 — Deliver
-
-- `promote_output.py`: 哈希核对复制 → `final_receipt.json`; 验证后绝不再次填充
+以上只固定**顺序** (契约 = 阶段名与顺序关系); 各阶段的进入/退出条件、异常分支与机制细节由 Part III 对应 § 拥有, 本节不重复。
 
 ## Runtime Stop Rule
 

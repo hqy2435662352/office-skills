@@ -38,7 +38,8 @@ Triage verdicts for the six relax candidates:
 
 - Surviving constraints now carry recorded evidence; changed ones keep their mechanism and lose only their unevidenced absolute form.
 - **Three-piece sync is mandatory** for this class of change (wording + validator/script + contract test). This decision touches `SKILL.md`, `CAPABILITY_EVIDENCE.md`, `fill_spec_first_validator.py` and 4 test files (`test_fillspec_first_contract.py`, `test_runtime_governance.py`, `test_optimization.py`, `test_single_run_isolation.py`) in one change set.
-- Two follow-ups are deliberately out of scope: refresh `references/TASK_ORCHESTRATION.md`, then finish item 2 by collapsing SKILL.md's duplicated Task Public Contract into a pointer.
+- **Item 2 executed partially (follow-up commit)**: Part I's `## S0`–`## S8` per-stage blocks (~66 lines) restated Part III §1–§9 — and §1–§9 is the expansion the contract tests actually pin (`^### N\.` scope regexes in `test_optimization.py`, `test_axis_neutral_grid_routing.py`, `test_mod_canonical_resolver.py`, `test_single_run_isolation.py`). The blocks were collapsed to a 12-line stage table (stage → owning § → non-omittable contract); stage **order** remains in Part I as the single authority. SKILL.md 496 → 440 lines (44,321 → 42,678 chars).
+- Remaining item-2 work is out of scope: refresh `references/TASK_ORCHESTRATION.md`, then collapse the duplicated Task Public Contract (23 lines); move Part IV's Runtime Governance (29 lines) and §3's routing detail (59 lines) into references — each requires repointing the test scopes that currently pin them inside SKILL.md.
 - **New finding beyond the review's 20 items**: `TASK_ORCHESTRATION.md` documents deleted scripts/artifacts in the present tense — a Contract Drift instance, the repo's highest-priority defect class.
 
 ## Corrections to the review
