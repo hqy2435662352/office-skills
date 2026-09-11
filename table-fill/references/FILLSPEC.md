@@ -325,8 +325,8 @@ executor / readback / validate 机制零改动), `plan.writes` 数 ==
 **source lineage 一等输出 (硬性)**: 每条 matrix 写入携带
 `{target, source, transform_chain}` (如 `SPEC!D15 ← SourceSheet!G42
 [trim, fin_ct]`), 聚合到 `plan.source_trace` 并镜像到 workdir
-`source_trace.json` (compile 同时写两份, 同源; Gate / 语义验证 ticket 07
-消费文件)。物化即 lineage — 不存在无 lineage 的 matrix 写入。`transform_chain`
+`source_trace.json` (compile 同时写两份, 同源; Verify/readback 机器证据消费
+文件)。物化即 lineage — 不存在无 lineage 的 matrix 写入。`transform_chain`
 是**可执行**的: `trim` (内置, 首尾空白剥离 — Z 码清理)、
 `controlled_translation` (`mapping.transforms` 函数,
 `translations: {源值: 目标值}` 整值精确匹配, 未命中原样通过 —
@@ -371,7 +371,7 @@ matrix-correct 用法的物化写入不是 sets → 零 literal 告警; 合法�
 
 **MOD Attention Map 对齐 (D6)**: resolve → `record_map` (哪些 record 被解析
 进目标产品列); map → `field_map`; transform → `transform_chain` (可执行受控
-转换); validate → Gate assertions (`validation` 三件套, ticket 07 消费)。
+转换); validate → `validation` 断言 (required_coverage / key_outputs / required_empty，compiler 机械 readback 校验)。
 该对齐即契约本身 — 权威 = `compile_fill.py --capability matrix.*` 探针矩阵
 (与本节同源, 不指向具体测试类)。
 
@@ -390,9 +390,8 @@ python scripts/compile_fill.py --capability matrix.field_locator
 `SUPPORTED | REJECTED | NOT_ROLLED_OUT`; 未知 key → exit 3 `CAPABILITY_KEY_UNKNOWN`
 + 可用 key 列表。namespace: `matrix` / `matrix.field_locator` / `matrix.record_map`
 / `matrix.transforms` / `matrix.literal_fallback` / `inplace` /
-`inplace.placeholder_ownership` / `task.assembly` / `semantic_gate` — 每条应答的
-`reference` 指向本文件对应小节 (组装见 SKILL「Task Orchestration」, 语义门见
-SKILL §6 Execution Gate)。
+`inplace.placeholder_ownership` / `task.assembly` — 每条应答的
+`reference` 指向本文件对应小节 (组装见 SKILL「Task Orchestration」)。
 
 ### rows: 单源与多源合并
 
@@ -454,6 +453,18 @@ mapping:
 ```
 
 列映射可设 `precision: keep` 显式接受长精度值 (需列宽实测背书, 见 Q7)。
+
+**函数能力边界契约 (T02, 宽片案例教训)**: 三个自定义函数语义必须区分 —
+`controlled_translation` = **整值精确匹配** (键==值 全等才翻译, 未命中原样
+通过; 词表键无空白时翻译前须先 `trim`, 顺序敏感), `regex_replace` =
+**子串替换** (pattern 命中任意位置即替换), `strip` = 首尾空白剥离。需要"把源
+值里的一段字符换成另一段" (源值含多余字符/前后缀) 时选 regex_replace, 需要
+"整值按词表翻译" 时选 controlled_translation — 选错会在 execute 后才暴露
+(session 证据: 宽片→wide fin 首轮误用 controlled_translation 整值匹配不生效)。
+转换函数**定义**的静态形状检查现已并入编译器 (ticket 06)：未知 `function` /
+`regex_replace` 的 `pattern` 缺失或不可编译 / 缺 `replacement` /
+`controlled_translation` 词表形状坏 → 编译期结构化缺陷
+`STATIC_VALIDATION_FAILED` (不再有独立的预检步骤)。
 
 ### lookups
 
@@ -761,7 +772,7 @@ formulas:
 | 情形 | 行为 |
 |---|---|
 | 索引文件归一化后为空 (0 entries — 清洗脚本重写 inheritance.json 丢了 `field_consensus`, 或文件本身为空) | ❌ 编译拒绝 `LOOKUP_TABLE_EMPTY` (exit 3) — **不再静默全空** (埃及 FRESH 坑 1: 曾全部静默留空, 计划照常产出, 唯一暴露点是 Agent 审 mapping.md 发现 Written values 全空) |
-| 索引非空, 但某声明 lookup 列**所有行**都未命中 | ⚠️ 编译警告 `LOOKUP_COLUMN_ALL_MISSING` (不阻断, 记 warnings, Gate 呈现) — 拦截整列静默空, 同时允许合法缺失 (如某 SKU 确实不在索引里, 记 gaps) |
+| 索引非空, 但某声明 lookup 列**所有行**都未命中 | ⚠️ 编译警告 `LOOKUP_COLUMN_ALL_MISSING` (不阻断, 记 warnings, 审查呈现) — 拦截整列静默空, 同时允许合法缺失 (如某 SKU 确实不在索引里, 记 gaps) |
 
 - 修复 `LOOKUP_TABLE_EMPTY`: 检查索引结构 (`field_consensus` 是否存在 / 是否被
   手工改写), 用 `build_inheritance_index.py` **重建索引** — 禁止手改 JSON。
@@ -936,12 +947,13 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 > | **compile** | `compile_fill.py` 重算 staged 输入 (sources + target) 的内容 sha256, 写入 `plan.input_hashes` (按 staged 文件名) — **不是** 抄 prepare_manifest.json 的 `files[].sha256` (那是 outline 期快照, repair_row_gaps 修改 staged 文件后**过期** — repair 只重算指纹, 不刷新 files[].sha256; 重编译即重绑定, repair 流程天然兼容) |
 > | **execute** | `execute_batch.py` 在 `copy_template` **之前**重算 staged 输入哈希, 与 `plan.input_hashes` 比对; 漂移/缺失绑定 → `INPUT_HASH_DRIFT` / `INPUT_HASH_BINDING_MISSING` (exit 3, corrective_action: 恢复未漂移输入或重 prepare+重编译) — 绝不带着漂移输入开始填充 |
 > | **receipt** | `draft_receipt.json` 的 `source_hashes` / `template_sha256` 是**执行时重算值** (不再无条件抄 manifest); 另记 `input_hash_check` = {bound, actual, drifted}, 一致/漂移可查 |
-> | **promote** | `promote_output.py` 的 HASH_DRIFT 核对范围含 source/template: plan 绑定 / receipt / 当前 staged 文件三方一致, 任一漂移 → exit 3 (fail-closed: 缺绑定或缺 receipt 证据也拒绝) |
+> | **deliver** | `promote_output.py` 的 HASH_DRIFT 核对范围含 source/template: plan 绑定 / receipt / 当前 staged 文件三方一致, 任一漂移 → exit 3 (fail-closed: 缺绑定或缺 receipt 证据也拒绝) |
 
 - staged 输入 = 本次填充的输入快照; compile 后手工改动 staged 文件 (非
   repair 流程) 会先被 execute 拒绝, 不会再出现"读旧 manifest 哈希"的盲区。
-- `.gate3_confirmed` 绑定三元组结构不变 (spec/plan/draft) — 输入哈希由
-  plan 背书 (plan 本身在门禁三元组内)。
+- 交付是哈希核对复制: 唯一人工点 = Spec Review（`review_confirm.json` 绑定
+  fill_spec 哈希，改动后旧确认失效）；verify 全绿后 deliver 三方哈希核对
+  （spec/plan/draft 由 receipt 背书，输入哈希由 plan 三方核对）。
 
 ## 能力映射表: MOD 规则类型 → FillSpec 表达模式
 
@@ -1097,7 +1109,7 @@ digest, 不要 unzip sheet XML 考古。
 | 错误码 | 含义 | 修复 |
 |---|---|---|
 | FILLSPEC_FINGERPRINT_MISMATCH | 结构变了, spec 过期 | 重跑 prepare_run, 读新 digest, 更新 spec |
-| INPUT_HASH_DRIFT | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 copy_template 前拒绝 (exit 3), 或 promote 的 HASH_DRIFT 三方核对拒绝 | 恢复未漂移的 staged 输入, 或重跑 prepare_run + compile_fill.py 重绑定 (见 E5) |
+| INPUT_HASH_DRIFT | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 copy_template 前拒绝 (exit 3), 或 deliver 的 HASH_DRIFT 三方核对拒绝 | 恢复未漂移的 staged 输入, 或重跑 prepare_run + compile_fill.py 重绑定 (见 E5) |
 | INPUT_HASH_BINDING_MISSING | plan 无 input_hashes 绑定 (旧版 compile 产物), execute 无法核对输入 | 重跑 compile_fill.py 重绑定后重执行 (见 E5) |
 | CLONE_SOURCE_IS_ANCHOR | 数据克隆源是合并锚点 | 换非锚点数据行 |
 | CLONE_RESIDUE_UNHANDLED | template_row 携带某列值但未覆盖 | 加 columns mapping 或 nulls |
@@ -1155,3 +1167,30 @@ digest, 不要 unzip sheet XML 考古。
 | MATRIX_MIXED_WITH_BLOCK_SEMANTICS | matrix 目标同时声明块语义（clone_roles/rows/columns/formulas/merges/group_merges/nulls/remove_rows/blocks/base_last_row） | 矩阵是格转移填充; 移除块声明, 固定值用 sets |
 | MATRIX_REQUIRED_COVERAGE_UNSUPPORTED | matrix 目标声明 required_coverage（矩阵不消费整源行） | matrix 目标不声明 required_coverage; 用 key_outputs 采样 |
 | BULK_SOURCE_DERIVED_LITERAL_FALLBACK | 值型 sets ≥ 4 条且 ≥ 50% 的字面值出现在展平源 CSV 值池（metadata 烘焙绕过 grid; 默认 compile-audit 警告, Matrix rollout 开关下 exit 3） | 把 source-derived 内容写进 matrix 或 columns/rows 映射; sets 只保留客户名/日期/固定 title/footer 类固定值 — 审计不是路由依据 |
+| TRANSFORM_NAME_MISSING | transform 定义缺非空字符串 name | 补 name 字段 (mapping.transforms 条目) |
+| TRANSFORM_FUNCTION_UNKNOWN | transform 定义的 function 非法 (允许 strip/regex_replace/controlled_translation) | 改用合法 function, 或删除定义改内置 trim/round2/round4 直接引用 |
+| TRANSFORM_PATTERN_MISSING / TRANSFORM_PATTERN_INVALID | regex_replace 缺 pattern / pattern 不可编译 | 补/修正 pattern (re.compile 通过后再编译) |
+| TRANSFORM_REPLACEMENT_MISSING | regex_replace 缺 replacement (或非字符串) | 补 replacement (空串 "" 可合法表示删除匹配) |
+| TRANSFORM_TRANSLATIONS_INVALID | controlled_translation 词表形状坏 (非 dict / 键空 / 值非标量) | 写 键: 标量值 词表 |
+
+## 转换函数定义的静态检查 (并入编译器, ticket 06)
+
+转换函数定义的静态检查已并入 `compile_fill.py`（取代已退役的独立预检步骤）。
+编译期对 `mapping.transforms` 与
+`targets[].transforms` 的**定义**做结构化校验，缺陷经
+`STATIC_VALIDATION_FAILED` 报出（含 code/at/message/corrective_action +
+fix_options），
+不生成 plan：
+
+- **name 缺失** → `TRANSFORM_NAME_MISSING`；
+- **function 未知** → `TRANSFORM_FUNCTION_UNKNOWN`（合法: strip /
+  regex_replace / controlled_translation；内置 trim/round2/round4 按名直接
+  引用，无需定义）；
+- **regex_replace**：`pattern` 缺失 → `TRANSFORM_PATTERN_MISSING`；不可编译 →
+  `TRANSFORM_PATTERN_INVALID`；`replacement` 缺失/非字符串 →
+  `TRANSFORM_REPLACEMENT_MISSING`；
+- **controlled_translation**：`translations` 非 dict、键空、值非标量 →
+  `TRANSFORM_TRANSLATIONS_INVALID`。
+
+引用未定义的 transform 名仍是 `TRANSFORM_UNKNOWN`（与 columns 同路径，见
+matrix 验证规则表）。

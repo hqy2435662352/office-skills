@@ -3,7 +3,7 @@
 Replays the REAL hierarchical parameter-sheet shape through the whole Runtime
 seam — Prepare (real officecli flatten with merged-parent propagation) → Matrix
 FillSpec (all three locator forms mixed) → Compile → Execute → Structural Gate
-(draft_receipt) → Semantic Gate (final workbook scan) — plus the negative
+(draft_receipt: validate + readback + issue delta) — plus the negative
 regression that locks "first match wins" can never come back.
 
 Fixture: tests/_fixtures/hierarchical_matrix/ (data-neutral canonical asset,
@@ -36,7 +36,8 @@ Hard acceptance (all must hold simultaneously):
     paths, every entry exactly {target, source, transform_chain};
   - zero BULK_SOURCE_DERIVED_LITERAL_FALLBACK warning; zero
     MATRIX_FIELD_LOCATOR_AMBIGUOUS;
-  - Structural Gate PASS (draft_receipt.json) AND Semantic Gate PASS (exit 0);
+  - Structural Gate PASS (draft_receipt.json: validate + readback + issue
+    delta, 语义验证层已退役);
   - internal-only values absent from the final workbook (zip/XML scan);
   - data-neutrality self-check (forbidden tokens absent from fixtures, flat
     CSVs, produced JSON and the final workbook).
@@ -61,7 +62,6 @@ Run:
 from __future__ import annotations
 
 import csv
-import hashlib
 import html as _html
 import json
 import shutil
@@ -80,9 +80,6 @@ SCRIPTS = SKILL_ROOT / "scripts"
 FIX = Path(__file__).resolve().parent / "_fixtures" / "hierarchical_matrix"
 SRC_XLSX = FIX / "source_parameter_book.xlsx"
 TGT_XLSX = FIX / "target_template.xlsx"
-SEM_FIX = Path(__file__).resolve().parent / "_fixtures" / "semantic_gate"
-MODS_FIX = SEM_FIX / "MODS_param"
-MOD_MD = MODS_FIX / "MOD_param.md"
 
 SRC_FILE = "source_parameter_book.xlsx"
 TGT_FILE = "target_template.xlsx"
@@ -151,23 +148,18 @@ def zip_text(path: Path) -> str:
             for n in z.namelist()))
 
 
-def file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def mod_record(mods_copy: Path) -> dict:
-    """MOD Adjudication Record locked to the param_sheet MOD (canonical
-    path/revision/sha256) — consumed by BOTH compile (C1–C3) and the semantic
-    gate (canonical resolver)."""
-    sha = file_sha256(mods_copy / "MOD_param.md")
+    """MOD Adjudication Record for the param_sheet MOD. Compiler C1–C4 only
+    check mod_resolution.json vs spec.task.selected_mod consistency — they
+    never read the MOD .md content — so no .md shim is needed (the semantic
+    gate's canonical resolver, which consumed the .md, was retired in 06)."""
     return {
         "status": "resolved", "selected": "param_sheet",
         "selected_revision": 1,
         "selected_canonical_path": "MOD_param.md",
-        "selected_sha256": sha,
         "candidates": [{"name": "param_sheet",
                         "canonical_path": "MOD_param.md",
-                        "revision": 1, "sha256": sha}],
+                        "revision": 1}],
     }
 
 
@@ -259,33 +251,6 @@ def build_negative_spec(manifest: dict) -> dict:
     return spec
 
 
-def semantic_policy() -> dict:
-    """Executable translation of the param_sheet MOD's validation rules
-    (SEC-003 / SEC-001 / ID-001 / TRN-001 / FLD-004 / VAL-002) over the filled
-    record region Template!D4:F11 (the 24 matrix cells)."""
-    return {"checks": [
-        {"check": "cjk_leakage", "rule_id": "SEC-003",
-         "range": f"{TGT_SHEET}!D4:F11"},
-        {"check": "internal_only", "rule_id": "SEC-001",
-         "range": f"{TGT_SHEET}!D4:F11",
-         "terms": ["Internal", "Cost Code", "内部成本", "研发", "原型"]},
-        {"check": "whitespace", "rule_id": "ID-001",
-         "range": f"{TGT_SHEET}!D4:F11"},
-        {"check": "controlled_translation", "rule_id": "TRN-001",
-         "range": f"{TGT_SHEET}!D4:F11",
-         "allowed": ["Cooling and Heating", "wide fin"],
-         "forbidden": ["宽片", "Heating pump", "Heat Pump"],
-         "translations": [{"from": "Heating pump", "to": "Cooling and Heating"}],
-         "controlled_translation_transforms": ["op_translate"]},
-        {"check": "template_stale", "rule_id": "FLD-004",
-         "range": f"{TGT_SHEET}!D4:F11", "stale_values": ["placeholder", "TBD"]},
-        {"check": "unresolved_placeholder", "rule_id": "FLD-004",
-         "range": f"{TGT_SHEET}!D4:F11"},
-        {"check": "source_lineage", "rule_id": "VAL-002",
-         "range": f"{TGT_SHEET}!D4:F11"},
-    ]}
-
-
 @unittest.skipIf(shutil.which("officecli") is None, "officecli not on PATH")
 class HierarchicalMatrixRegressionTests(unittest.TestCase):
     """The ticket's hard acceptance, driven entirely through the public CLIs."""
@@ -294,7 +259,6 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="hmx_reg_")
         self.workdir = Path(self._tmp.name)
         self.mods = self.workdir / "MODS_param"
-        shutil.copytree(MODS_FIX, self.mods)
         shutil.copy2(SRC_XLSX, self.workdir / SRC_FILE)
         shutil.copy2(TGT_XLSX, self.workdir / TGT_FILE)
 
@@ -314,18 +278,15 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _prepare(self):
-        """Stage + outline + flatten (real officecli flatten)."""
-        proc = run_py(self.workdir, "prepare_run.py", "--workdir", ".",
-                      "--files",
-                      f"{SRC_FILE}|{SRC_FILE},{TGT_FILE}|{TGT_FILE}", "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(self.workdir, "prepare_run.py", "--workdir", ".",
-                      "--flatten",
-                      "--sheets", f"{SRC_FILE}:{SRC_SHEET};{TGT_FILE}:{TGT_SHEET}",
-                      "--target", TGT_FILE)
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        return json.loads(
-            (self.workdir / "prepare_manifest.json").read_text(encoding="utf-8"))
+        """Stage + outline + flatten (real officecli flatten), canonical path."""
+        from _fixtures.run_driver import prepare_single, target_entry_name
+        return prepare_single(
+            self.workdir,
+            files=f"{SRC_FILE}|{SRC_FILE},{TGT_FILE}|{TGT_FILE}",
+            sheets=f"{SRC_FILE}:{SRC_SHEET};{TGT_FILE}:{TGT_SHEET}",
+            sources=target_entry_name(SRC_FILE, SRC_SHEET),
+            target=target_entry_name(TGT_FILE, TGT_SHEET),
+            task="matrix hierarchical regression e2e")
 
     def _verify_flat_contract(self, manifest) -> tuple[int, int]:
         """Assert the flatten contract (merged-parent propagation into A for
@@ -383,7 +344,7 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
         manifest = self._prepare()
         src_guard, tgt_guard = self._verify_flat_contract(manifest)
 
-        # MOD lock (compile C1–C3 + semantic gate share this record)
+        # MOD lock (compile C1–C4 consistency) — no MOD .md content is read
         (wd / "mod_resolution.json").write_text(
             json.dumps(mod_record(self.mods), ensure_ascii=False),
             encoding="utf-8")
@@ -445,7 +406,10 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
 
         # ── 4. Execute (structural gate) — retry ONCE on the documented
         #    transient officecli batch flake (KNOWN_TRAPS ~1/4
-        #    BATCH_CHUNK_FAILED under resident concurrency) ──
+        #    BATCH_CHUNK_FAILED under resident concurrency). Spec Review
+        #    first — the Execute gate rejects missing confirmation (ADR 0019).
+        from _fixtures.run_driver import review_and_confirm
+        review_and_confirm(wd)
         proc = run_py(wd, "execute_batch.py", "--plan", "execution_plan.json",
                       "--template", TGT_FILE, "--workdir", ".",
                       "--round", "1", "--render", "html")
@@ -471,34 +435,7 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
         self.assertTrue((wd / "validated_draft.xlsx").is_file())
         draft = wd / "validated_draft.xlsx"
 
-        # ── 5. Semantic Gate (final workbook scan, MOD rule_ids) ──
-        (wd / "semantic_policy.json").write_text(
-            json.dumps(semantic_policy(), ensure_ascii=False), encoding="utf-8")
-        proc = run_py(wd, "semantic_gate.py", "--workdir", ".",
-                      "--mods-dir", str(self.mods))
-        self.assertEqual(proc.returncode, 0,
-                         f"semantic gate: {proc.stdout[-800:]} {proc.stderr[-800:]}")
-        srec = json.loads((wd / "semantic_receipt.json").read_text(encoding="utf-8"))
-        self.assertEqual(srec["status"], "PASS")
-        self.assertEqual(srec["violations_total"], 0)
-        self.assertEqual(srec["mod"]["name"], "param_sheet")
-        self.assertTrue(srec["scanned_file_sha256"])
-        by_check = {c["check"]: c for c in srec["checks"]}
-        for c in srec["checks"]:
-            self.assertEqual(c["cell_count"], N_WRITES, c["check"])
-            self.assertEqual(c["violations"], 0, c["check"])
-            self.assertIn(c["rule_id"],
-                          {"SEC-001", "SEC-003", "ID-001", "TRN-001",
-                           "FLD-004", "VAL-002"})
-        ctrl = by_check["controlled_translation"]
-        comp = {e["cell"]: e for e in ctrl["compliant_cells"]}
-        for ref in ("D7", "E7", "F7"):
-            self.assertEqual(comp[f"{TGT_SHEET}!{ref}"]["value"],
-                             "Cooling and Heating")
-            self.assertIn("controlled_translation_lineage",
-                          comp[f"{TGT_SHEET}!{ref}"]["basis"])
-
-        # ── 6. Hard acceptance: internal-only values ABSENT from the final
+        # ── 5. Hard acceptance: internal-only values ABSENT from the final
         #    workbook (zip/XML scan — the check object is the file on disk) ──
         draft_text = zip_text(draft)
         for token in ("Internal", "Cost Code", "USD", "内部成本"):
@@ -510,7 +447,7 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
             self.assertIn(token, draft_text,
                           f"filled content {token!r} missing from the draft")
 
-        # ── 7. Data-neutrality self-check ──
+        # ── 6. Data-neutrality self-check ──
         self._data_neutrality(draft, manifest)
 
     def _data_neutrality(self, draft: Path, manifest: dict) -> None:
@@ -524,8 +461,7 @@ class HierarchicalMatrixRegressionTests(unittest.TestCase):
             texts.append((p.name, p.read_text(encoding="utf-8-sig")))
         for name in ("fill_spec.yaml", "prepare_manifest.json",
                      "execution_plan.json", "mapping.md", "source_trace.json",
-                     "draft_receipt.json", "semantic_policy.json",
-                     "semantic_receipt.json", "mod_resolution.json"):
+                     "draft_receipt.json", "mod_resolution.json"):
             p = self.workdir / name
             if p.is_file():
                 texts.append((name, p.read_text(encoding="utf-8")))

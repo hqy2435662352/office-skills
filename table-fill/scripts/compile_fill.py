@@ -21,10 +21,10 @@ batch JSON. It:
      hand-written --checks).
   8. Writes execution_plan.json (machine) + mapping.md (human view).
 
-MOD consistency gates (C1–C4, per ADR-0011 "Compiler checks"): before any
+MOD consistency checks (C1–C4, per ADR-0011 "Compiler checks"): before any
 schema/fingerprint work, `compile_spec` reads `workdir/mod_resolution.json`
 (the MOD Adjudication Record — final decision, not a recommendation) and
-fails closed on the FIRST violated gate, in order:
+fails closed on the FIRST violated check, in order:
   C1 MOD_RESOLUTION_MISSING — file absent / unreadable / invalid JSON.
   C4 MOD_UNRESOLVED          — record.status ∉ {resolved, none}.
   C2 MOD_SELECTION_MISMATCH  — spec.task.selected_mod must EQUAL the recorded
@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -63,7 +64,11 @@ except ImportError:
 MANIFEST_NAME = "prepare_manifest.json"
 MOD_RESOLUTION_NAME = "mod_resolution.json"
 
-from _officecli import ensure_utf8_stdio, fail, record_timing, sha256_file  # noqa: E402
+from _officecli import (  # noqa: E402
+    ensure_utf8_stdio,
+    fail as _fail,
+    sha256_file,
+)
 PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
 SOURCE_TRACE_NAME = "source_trace.json"
@@ -150,7 +155,212 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def bind_input_hashes(workdir: Path, inputs: dict) -> dict:
+# ── Compiler 反馈硬化 (ticket 03): 缺陷附修复路径选项 ────────────────────
+# 编译缺陷从「错误定位」升级为「错误分类 + 修复路径」: 校验断言类缺陷附
+# `fix_options[]` (≥2 个候选修复路径, 一个 option + 说明/涉及片段, 不替 Agent
+# 决定); 矩阵场景 (locator 歧义/未命中) 额外附 `candidate_cells[]` 候选格清单
+# (sheet/cell/value/meaning), 同样不替 Agent 决定选哪个。本票只新增字段,
+# 不删任何既有字段 (code/message/corrective_action 全保留, 清理由 06 号票负责)。
+
+def _fix_options_for(code: str) -> list:
+    """按缺陷码返回 ≥2 个候选修复路径 (每项 {option, note}); 未登记的码给
+    通用默认两条。只提供选项, 不替 Agent 决定 (Compiler 反馈契约)。"""
+    table = {
+        "MATRIX_FIELD_LOCATOR_AMBIGUOUS": [
+            {"option": "composite match 加列消歧",
+             "note": "把重复标签拆到 match: {A: ..., B: ...} 加一列唯一字段, "
+                     "直到命中恰 1 行"},
+            {"option": "换 row + expect 守卫",
+             "note": "直接用展平 CSV 的 orig 行号 + expect 结构守卫锁死唯一行"},
+        ],
+        "MATRIX_FIELD_LOCATOR_NOT_FOUND": [
+            {"option": "改成该侧真实存在标签/列文本组合",
+             "note": "对照展平 CSV 的真实标签列逐字对齐 (trim 后 exact identity)"},
+            {"option": "用 row + expect 守卫定位",
+             "note": "标签不存在就改用 orig 行号 + expect 结构守卫"},
+        ],
+        "MATRIX_RECORD_MAP_INVALID": [
+            {"option": "补全 record/source_column/target_column 必要字段",
+             "note": "record 为非空字符串, source_column/target_column 为 Excel 列字母"},
+            {"option": "改用该侧真实存在的记录列字母",
+             "note": "对照源/目标展平宽度修正越界列字母"},
+        ],
+        "MATRIX_COLUMN_INVALID": [
+            {"option": "改用该侧真实存在的列字母",
+             "note": "对照源/目标展平宽度 (digest cols) 修正列字母"},
+            {"option": "重跑 workspace_init --init（更新列宽事实）",
+             "note": "宽度变化 (源表增删列) 时先重新展平再修正列引用"},
+        ],
+        "MATRIX_FIELD_LOCATOR_INVALID": [
+            {"option": "写非空 string locator (legacy 单标签)",
+             "note": "单标签唯一时最简单"},
+            {"option": "写结构化 locator 三形式之一",
+             "note": "string | {match: {列: 文本}} | {row: N, expect: {列: 文本}}"},
+        ],
+        "MATRIX_FIELD_ROW_GUARD_REQUIRED": [
+            {"option": "为 guard row 补 expect: {列: 文本}",
+             "note": "裸 row 禁止 — 必须带结构守卫"},
+            {"option": "改用 string/composite match 定位",
+             "note": "不要裸 row 号定位"},
+        ],
+        "MATRIX_FIELD_ROW_GUARD_MISMATCH": [
+            {"option": "把 row/expect 对准真实展平行",
+             "note": "逐列核对 expected vs actual (message 已列出)"},
+            {"option": "改用 composite match 定位",
+             "note": "guard 行号易漂移时用标签组合更稳"},
+        ],
+        "MATRIX_FIELD_ROW_OUT_OF_RANGE": [
+            {"option": "核对展平 CSV 的 orig 列行号",
+             "note": "row 必须是展平 CSV 真实存在的 orig 行号"},
+            {"option": "改用 label / composite match 定位",
+             "note": "行号超界改用文本标签定位"},
+        ],
+        "TRANSFORM_UNKNOWN": [
+            {"option": "在 mapping.transforms 定义该命名 transform",
+             "note": "function ∈ strip / regex_replace / controlled_translation"},
+            {"option": "改用内置 round2/round4/trim",
+             "note": "内置变换无需定义, 直接按名引用"},
+        ],
+        "TRANSFORM_FUNCTION_UNKNOWN": [
+            {"option": "改用合法 function",
+             "note": "function ∈ strip / regex_replace / controlled_translation"},
+            {"option": "删除该 transform 定义为内置引用",
+             "note": "内置 trim/round2/round4 按名直接用, 无需在 transforms 定义"},
+        ],
+        "TRANSFORM_NAME_MISSING": [
+            {"option": "补非空字符串 name",
+             "note": "列映射/矩阵按名引用该 transform"},
+            {"option": "删除该无名字段条目",
+             "note": "若本意是内置变换, 按名直接引用即可"},
+        ],
+        "TRANSFORM_PATTERN_MISSING": [
+            {"option": "补非空 pattern",
+             "note": "regex_replace 缺 pattern 会全串替换 (静默数据丢失)"},
+            {"option": "改用 strip 或 controlled_translation",
+             "note": "若非子串替换语义, 换整值/空白处理函数"},
+        ],
+        "TRANSFORM_PATTERN_INVALID": [
+            {"option": "修正 pattern 为可编译正则",
+             "note": "re.compile 通过后再编译; 曾静默原样通过"},
+            {"option": "改用字面字符串替换",
+             "note": "简单子串可考虑用更简单可编译的 pattern"},
+        ],
+        "TRANSFORM_REPLACEMENT_MISSING": [
+            {"option": "补 replacement 字段",
+             "note": "空串 \"\" 可合法表示删除匹配"},
+            {"option": "明确写出 replacement 值",
+             "note": "把目标替换字段显式写出, 消除缺省歧义"},
+        ],
+        "TRANSFORM_TRANSLATIONS_INVALID": [
+            {"option": "修正 translations 为 键→标量值 映射",
+             "note": "controlled_translation 词表须是 dict, 键非空字符串, 值为字符串/数值"},
+            {"option": "删除该词表条目改内置处理",
+             "note": "若无需词表翻译, 删定义并按名引用内置函数"},
+        ],
+        "DUPLICATE_TARGET_WRITE": [
+            {"option": "为每格只保留一个 owner",
+             "note": "columns/nulls/formulas/merges/sets/group_merges 重叠处删去多余写"},
+            {"option": "核对 matrix field_map × record_map 与 sets 是否撞格",
+             "note": "matrix 目标格与 sets 固定值不能重叠"},
+        ],
+        "SPEC_NON_STRING_ITEM": [
+            {"option": "用双引号包裹整行 (冒号在内)",
+             "note": "含 ': ' 的裸标量被解析成 mapping — 整行加双引号"},
+            {"option": "拆成多个独立字符串条目",
+             "note": "避免行内冒号触发 YAML mapping 解析"},
+        ],
+        "INPLACE_REGION_OVERLAP": [
+            {"option": "前置块结构行/remove_rows 移出占位区",
+             "note": "区行归终末 inplace 块所有"},
+            {"option": "换 append-only 合法终态",
+             "note": "占位行自然下沉保留, 无需前置块打占位区"},
+        ],
+    }
+    return table.get(code) or [
+        {"option": f"按 {code} 的 corrective_action 定向修",
+         "note": "读缺陷 message/corrective_action, 修 fill_spec.yaml 后重编译"},
+        {"option": "查 references/FILLSPEC.md 对应约束",
+         "note": "按缺陷码定位 FILLSPEC 能力/语法小节, 对齐声明"},
+    ]
+
+
+def decorate_defects(defects: list | None) -> list | None:
+    """为每个校验断言类缺陷附 fix_options[] (≥2); 矩阵场景已有 candidate_cells
+    的原样保留 (此处不重复生成). 幂等 (已附 fix_options 的不再覆盖), 纯地址内
+    增字段, 不删任何既有字段。"""
+    if not defects:
+        return defects
+    for d in defects:
+        if not isinstance(d, dict):
+            continue
+        if d.get("fix_options"):
+            continue
+        d["fix_options"] = _fix_options_for(d.get("code", ""))
+    return defects
+
+
+def fail(code: str, message: str, corrective_action: str,
+         defects: list | None = None, exit_code: int = 3) -> None:
+    """compile_fill 本地 fail 包装: 缺陷 emit 前先 decorate (附 fix_options 等),
+    其余语义与 _officecli.fail 完全一致 (code/message/corrective_action/defects
+    透传)。"""
+    _fail(code, message, corrective_action,
+          decorate_defects(defects), exit_code)
+
+
+# 展平产物 run-local 文件名后缀 → cache 白名单 canonical 名（ticket 08：共享
+# 展平产物只存 cache/<key>/ 一份，run 目录不再逐字节复制；compile 按 cache_key
+# 从 cache 解析。candidates 不参与 compile/execute，不列入 cache 解析）。
+_CACHE_BY_SUFFIX = {
+    "_flat.csv": "flat.csv",
+    "_meta.json": "meta.json",
+    "_digest.md": "digest.md",
+}
+
+
+def _staged_input_path(name: str, workdir: Path,
+                       shared_root: Path | None) -> Path:
+    """Raw staged 输入 (.xlsx 等) 路径解析（ticket 08 + ADR 0018）：workdir-local
+    优先（single-run），否则 shared_root/staged/<name>（legacy task 布局），
+    再否则 shared_root/<name>（workspace 平铺布局 — role-neutral init 把
+    staged 与 flatten 产物放 task root 根）。"""
+    w = workdir / name
+    if w.is_file():
+        return w
+    if shared_root is not None:
+        if (shared_root / "staged" / name).is_file():
+            return shared_root / "staged" / name
+        if (shared_root / name).is_file():
+            return shared_root / name
+    return w
+
+
+def _flat_entry_path(entry: dict, filename: str, workdir: Path,
+                     shared_root: Path | None) -> Path:
+    """展平条目文件（csv/meta/digest）路径解析（ticket 08 + ADR 0018）：
+    workdir-local 优先（single-run），否则按 entry.cache_key 从
+    shared_root/cache/<key>/ 取 canonical 产物（legacy task 共享缓存），
+    再否则 shared_root/<filename>（workspace 平铺布局 — materialize_run
+    投影的 run-local manifest 条目文件在 task root 根）。"""
+    w = workdir / filename
+    if w.is_file():
+        return w
+    key = (entry or {}).get("cache_key") if isinstance(entry, dict) else None
+    if shared_root is not None:
+        if key:
+            for suffix, canonical in _CACHE_BY_SUFFIX.items():
+                if filename.endswith(suffix):
+                    p = shared_root / "cache" / key / canonical
+                    if p.is_file():
+                        return p
+                    break
+        if (shared_root / filename).is_file():
+            return shared_root / filename
+    return w
+
+
+def bind_input_hashes(workdir: Path, inputs: dict,
+                      shared_root: Path | None = None) -> dict:
     """Compile-time binding of the STAGED input files' content hashes.
 
     plan.input_hashes = {staged_name: sha256} for every source + the target —
@@ -159,13 +369,16 @@ def bind_input_hashes(workdir: Path, inputs: dict) -> dict:
     files[].sha256, which is an outline-stage snapshot that goes stale after
     repair_row_gaps modifies the staged target — repair resyncs fingerprints
     but not files[].sha256; recompile rebinds). A staged file missing at
-    compile time binds None (unverifiable — execute fails closed on it)."""
+    compile time binds None (unverifiable — execute fails closed on it).
+
+    ticket 08: shared_root 给定时，raw 输入从 shared_root/staged/<name> 按名
+    引用（task 级共享，不复制进 run 目录）。"""
     names = list(inputs.get("sources") or []) + [inputs.get("target")]
     out = {}
     for name in names:
         if not name:
             continue
-        p = workdir / name
+        p = _staged_input_path(name, workdir, shared_root)
         out[name] = sha256_file(p) if p.is_file() else None
     return out
 
@@ -221,12 +434,12 @@ def load_manifest(workdir: Path) -> dict:
     p = workdir / MANIFEST_NAME
     if not p.is_file():
         fail("MANIFEST_NOT_FOUND", f"{MANIFEST_NAME} missing in {workdir}",
-             "Run prepare_run.py first (outline + flatten stages)")
+             "Run workspace_init.py --init first (fact space)")
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except ValueError as e:
         fail("MANIFEST_INVALID", f"corrupt manifest: {e}",
-             "Re-run prepare_run.py")
+             "Re-run workspace_init.py --init")
 
 
 def load_csv_rows(csv_path: Path) -> list[tuple[list[str], int]]:
@@ -362,12 +575,14 @@ def validate_schema(spec: dict, manifest: dict) -> list[dict]:
 
 # ── MOD consistency gates (C1–C4) ──────────────────────────────────────
 
-def check_mod_consistency(spec: dict, workdir: Path) -> None:
-    """Static MOD-reference-vs-decision consistency gates (C1–C4).
+def check_mod_consistency(spec: dict, workdir: Path,
+                          mod_resolution_path: Path | None = None) -> None:
+    """Static MOD-reference-vs-decision consistency checks (C1–C4).
 
-    Reads `workdir/mod_resolution.json` — the MOD Adjudication Record (final
-    decision, not a recommendation). Fails closed on the FIRST violated gate,
-    in strict order C1 → C4 → C2 → C3:
+    Reads the MOD Adjudication Record (final decision, not a recommendation)
+    from `mod_resolution_path` when given (task-level once, ticket 08), else
+    falls back to `workdir/mod_resolution.json` (single-run). Fails closed on
+    the FIRST violated check, in strict order C1 → C4 → C2 → C3:
 
       C1 MOD_RESOLUTION_MISSING — the record is absent, unreadable, or not a
           JSON object. There is NO legal compile path without the record
@@ -389,7 +604,8 @@ def check_mod_consistency(spec: dict, workdir: Path) -> None:
     the adjudication process: no resolution-hash binding, no `why` validation,
     no `adjudicated_from` validation.
     """
-    rec_path = workdir / MOD_RESOLUTION_NAME
+    rec_path = mod_resolution_path if mod_resolution_path is not None \
+        else (workdir / MOD_RESOLUTION_NAME)
     try:
         if not rec_path.is_file():
             raise ValueError("missing")
@@ -398,7 +614,7 @@ def check_mod_consistency(spec: dict, workdir: Path) -> None:
             raise ValueError("not a mapping")
     except (OSError, ValueError):
         fail("MOD_RESOLUTION_MISSING",
-             f"{MOD_RESOLUTION_NAME} absent / unreadable / invalid in {workdir}",
+             f"{MOD_RESOLUTION_NAME} absent / unreadable / invalid: {rec_path}",
              "先运行 mod_nominate.py 提名；用户裁决后带 --mod 重跑把选择写盘")
 
     status = record.get("status")
@@ -1121,7 +1337,7 @@ def apply_precision_policy(target: dict, data_rows: list,
                                f"value (sample {sample!r}) cannot be verified to "
                                f"fit; re-run prepare (flatten) to collect "
                                f"meta.column_width",
-                    "corrective_action": "Re-run prepare_run.py --flatten to "
+                    "corrective_action": "Re-run workspace_init.py --init --flatten to "
                                          "measure column widths, or prefer "
                                          "`transform: round4`",
                 })
@@ -1157,7 +1373,7 @@ def apply_precision_policy(target: dict, data_rows: list,
                            "15-digit cost values overflow the template's narrow "
                            "columns; the mapping was NOT modified, values were "
                            "rounded in place",
-                "corrective_action": "Review the Gate; add `transform: round4` "
+                "corrective_action": "Review the mapping summary; add `transform: round4` "
                                      "to the column mapping to make it explicit",
             })
         else:
@@ -1202,7 +1418,8 @@ def _lookup_key_column_corrective(kcol, reason: str,
 
 def validate_lookup_key_columns(blocks_cfg: list, spec_mapping: dict,
                                 target_cfg: dict, manifest_flat: dict,
-                                workdir: Path, num_cols: int) -> list:
+                                workdir: Path, num_cols: int,
+                                shared_root: Path | None = None) -> list:
     """Static guard for lookup key_column declarations (issue 04).
 
     Binding semantics (verified against resolve_lookup's only callers, both
@@ -1238,7 +1455,8 @@ def validate_lookup_key_columns(blocks_cfg: list, spec_mapping: dict,
             csv_name = entry.get("csv") if isinstance(entry, dict) else None
             if csv_name:
                 try:
-                    rows = load_csv_rows(workdir / csv_name)
+                    rows = load_csv_rows(
+                        _flat_entry_path(entry, csv_name, workdir, shared_root))
                 except (OSError, ValueError, csv.Error):
                     rows = None
             widths[src_name] = None if rows is None else max(
@@ -1319,7 +1537,7 @@ def resolve_lookup(lookup: dict, values: list, lookups: dict, defects: list,
         # issue 04 backstop: validate_lookup_key_columns intercepts invalid
         # key_columns before any plan work; nothing may reach the old bare
         # values[col_letter_to_idx(kcol)] IndexError even if a path slips
-        # past the static gate — same defect code + reason, row skipped.
+        # past the static validation — same defect code + reason, row skipped.
         idx = col_letter_to_idx(kcol) if isinstance(kcol, str) else -1
         if not (0 <= idx < len(values)):
             reason = _lookup_key_column_reason(kcol)
@@ -1465,20 +1683,123 @@ def build_lookup_tables(spec_mapping: dict, target_cfg: dict, workdir: Path) -> 
     return tables
 
 
-def build_transforms(spec_mapping: dict, target_cfg: dict) -> dict:
+def build_transforms(spec_mapping: dict, target_cfg: dict,
+                     defects: list | None = None) -> dict:
+    """Build the name→callable transform map from mapping.transforms +
+    target.transforms, collecting STRUCTURED static defects for invalid
+    transform DEFINITIONS (ticket 06: 转换函数定义的静态检查并入编译器 — 取代
+    已退役的独立预检步骤, 不再有业务规则的二次解释层).
+
+    Definition-side checks (referencing-side is TRANSFORM_UNKNOWN, emitted in
+    materialize_values / _resolve_matrix_row):
+      - name 缺失 → TRANSFORM_NAME_MISSING
+      - function 未知 → TRANSFORM_FUNCTION_UNKNOWN
+      - regex_replace: pattern 缺失/不可编译 → TRANSFORM_PATTERN_MISSING /
+        TRANSFORM_PATTERN_INVALID; replacement 缺失/非字符串 →
+        TRANSFORM_REPLACEMENT_MISSING
+      - controlled_translation: translations 非 dict 或键/值形状坏 →
+        TRANSFORM_TRANSLATIONS_INVALID
+
+    Defects are appended to `defects` (caller fails after); a malformed entry
+    contributes no callable so a later TRANSFORM_UNKNOWN also fires if it is
+    referenced. When `defects` is None (legacy direct callers) a defected
+    definition still yields no callable but does not raise — callers that care
+    pass a list and fail on it."""
     fns = {}
-    entries = list(spec_mapping.get("transforms", [])) + list(target_cfg.get("transforms", []))
-    for tr in entries:
-        name = tr.get("name")
+    raw_entries = list(spec_mapping.get("transforms", [])) + \
+        list(target_cfg.get("transforms", []))
+    entries: list[tuple[dict, str]] = []
+    if raw_entries and not isinstance(raw_entries, list):
+        if defects is not None:
+            defects.append({
+                "code": "TRANSFORM_DEF_INVALID",
+                "at": "mapping.transforms",
+                "message": "mapping.transforms 必须是条目列表 (每个条目含 "
+                           "name + function)",
+                "corrective_action": "按 FILLSPEC transforms 契约写条目列表",
+            })
+        return fns
+    for i, tr in enumerate(raw_entries):
+        entries.append((tr, f"mapping.transforms[{i}]"))
+    for ti, tgt in enumerate(spec_mapping.get("targets", [])):
+        if not isinstance(tgt, dict):
+            continue
+        ttransforms = tgt.get("transforms")
+        if not isinstance(ttransforms, list):
+            continue
+        for i, tr in enumerate(ttransforms):
+            entries.append((tr, f"mapping.targets[{ti}].transforms[{i}]"))
+
+    for tr, at in entries:
+        if not isinstance(tr, dict) or not isinstance(tr.get("name"), str) \
+                or not tr.get("name"):
+            if defects is not None:
+                defects.append({
+                    "code": "TRANSFORM_NAME_MISSING", "at": at,
+                    "message": "transform 条目缺非空字符串 name (列映射/矩阵"
+                               "按名引用)",
+                    "corrective_action": "补 name 字段 (mapping.transforms 条目)",
+                })
+            continue
+        name = tr["name"]
         fn = tr.get("function")
         if fn == "regex_replace":
-            pattern = tr.get("pattern", "")
-            repl = tr.get("replacement", "")
-            def _rr(v, _p=pattern, _r=repl):
+            pattern = tr.get("pattern")
+            if not isinstance(pattern, str) or not pattern:
+                if defects is not None:
+                    defects.append({
+                        "code": "TRANSFORM_PATTERN_MISSING",
+                        "at": f"{at}.pattern",
+                        "message": f"regex_replace transform {name!r} 缺非空"
+                                   f"字符串 pattern",
+                        "corrective_action": "补 pattern (合法正则)",
+                    })
+            else:
                 try:
-                    return re.sub(_p, _r, v)
+                    re.compile(pattern)
+                except re.error as e:
+                    if defects is not None:
+                        defects.append({
+                            "code": "TRANSFORM_PATTERN_INVALID",
+                            "at": f"{at}.pattern",
+                            "message": f"regex_replace transform {name!r} 的 "
+                                       f"pattern 不可编译: {e}",
+                            "corrective_action": "修正正则 (re.compile 通过后再"
+                                                 "编译)",
+                        })
+            repl = tr.get("replacement")
+            if repl is None:
+                if defects is not None:
+                    defects.append({
+                        "code": "TRANSFORM_REPLACEMENT_MISSING",
+                        "at": f"{at}.replacement",
+                        "message": f"regex_replace transform {name!r} 缺 "
+                                   f"replacement",
+                        "corrective_action": "补 replacement (空串可合法表示"
+                                             "删除匹配)",
+                    })
+                repl = ""
+            if not isinstance(repl, str):
+                if defects is not None:
+                    defects.append({
+                        "code": "TRANSFORM_REPLACEMENT_MISSING",
+                        "at": f"{at}.replacement",
+                        "message": f"regex_replace transform {name!r} 的 "
+                                   f"replacement 必须是字符串",
+                        "corrective_action": "把 replacement 写成字符串",
+                    })
+                repl = str(repl)
+            # 只有 pattern 可编译才产出可执行 callable；否则定义坏, 引用处
+            # 触发 TRANSFORM_UNKNOWN (fail-closed)。
+            if isinstance(pattern, str) and pattern:
+                try:
+                    re.compile(pattern)
                 except re.error:
-                    return v
+                    continue
+            else:
+                continue
+            def _rr(v, _p=pattern, _r=repl):
+                return re.sub(_p, _r, v)
             fns[name] = _rr
         elif fn == "strip":
             def _st(v):
@@ -1489,14 +1810,53 @@ def build_transforms(spec_mapping: dict, target_cfg: dict) -> dict:
             # Heating pump→Cooling and Heating). Deterministic: unmatched
             # values pass through unchanged — agents must trim BEFORE
             # translation when the vocabulary keys carry no whitespace.
-            translations = tr.get("translations") or {}
+            translations = tr.get("translations")
+            if not isinstance(translations, dict):
+                if defects is not None:
+                    defects.append({
+                        "code": "TRANSFORM_TRANSLATIONS_INVALID",
+                        "at": f"{at}.translations",
+                        "message": f"controlled_translation transform {name!r} "
+                                   f"的 translations 必须是 键→值 映射 (dict)",
+                        "corrective_action": "写 键: 值 词表 (键=源值、值=目标值)",
+                    })
+                translations = {}
+            else:
+                for key, value in translations.items():
+                    if not isinstance(key, str) or not key:
+                        if defects is not None:
+                            defects.append({
+                                "code": "TRANSFORM_TRANSLATIONS_INVALID",
+                                "at": f"{at}.translations",
+                                "message": f"controlled_translation {name!r} 词表"
+                                           f"键必须是非空字符串 (got {key!r})",
+                                "corrective_action": "删除空键或补键",
+                            })
+                    if not isinstance(value, (str, int, float)) \
+                            or isinstance(value, bool):
+                        if defects is not None:
+                            defects.append({
+                                "code": "TRANSFORM_TRANSLATIONS_INVALID",
+                                "at": f"{at}.translations",
+                                "message": f"controlled_translation {name!r} 词表"
+                                           f"键 {key!r} 的值必须是字符串/数值标量",
+                                "corrective_action": "把值写成字符串或数值标量",
+                            })
             def _ct(v, _t=translations):
                 s = str(v)
                 return _t.get(s, s)
             fns[name] = _ct
         else:
-            fail("TRANSFORM_FUNCTION_UNKNOWN", f"transform function {fn!r} unknown",
-                 "Use regex_replace, strip or controlled_translation")
+            if defects is not None:
+                defects.append({
+                    "code": "TRANSFORM_FUNCTION_UNKNOWN", "at": at,
+                    "message": f"transform {name!r} 的 function {fn!r} 非法 "
+                               f"— 允许 strip / regex_replace / "
+                               f"controlled_translation",
+                    "corrective_action": "改用 controlled_translation / "
+                                         "regex_replace / strip (内置 trim/"
+                                         "round2/round4 按名直接用)",
+                })
     return fns
 
 
@@ -1542,9 +1902,9 @@ def split_group_aggregates(ga_spec: object, defects: list | None = None,
     Shapes accepted:
       list — canonical per-group entries `[{group_by, col, formula, style}]`;
              an entry carrying the key `whole_run` marks the cross-block total
-             declaration (gated pre-spike in the static validation phase).
+             declaration (validated in the static validation phase).
       dict — `{per_group: [...], whole_run: {...}}` (spec draft shape);
-             per_group entries are lowered, whole_run is gated.
+             per_group entries are lowered, whole_run is validated.
 
     Malformed shapes (per_group not a list / entry not a mapping) are skipped
     so lowering never crashes; when `defects` is given (static phase), each is
@@ -2003,43 +2363,71 @@ CAPABILITY_CONTRACT: dict[str, dict] = {
         ],
         "reference": "FILLSPEC#v25-row-layout-mode--inplace-占位区",
     },
-    "task.assembly": {
-        "state": "SUPPORTED",
-        # 派生: Task Orchestration — assemble_task.py packaging-only (SKILL
-        # §Task Orchestration / references/TASK_ORCHESTRATION.md); final gate
-        # fail-closed (--set/--confirm/--promote); 无 FILLSPEC 常量 → terse 串。
-        "constraints": [
-            "assemble_task.py 只做 packaging: clone/copy sheet、rename、保留格式",
-            "禁止字段映射 / 业务 transform / lookup / 纠错 / 任何数据语义操作",
-            "多 run 各自通过 Run Gate 后才可组装; final gate fail-closed "
-            "(--set 呈现 / --confirm 正向确认 / --promote 交付)",
-            "每 run 一个命名 sheet; per-run 独立输出始终是合法形态 "
-            "(N 文件, 或 1 workbook / N sheets)",
-        ],
-        "conflicts": [
-            "多 run 绝不并发写同一 final workbook",
-        ],
-        "reference": "FILLSPEC#能力查询-capability-query",
+}
+
+
+# ── 转换函数命名空间 (ticket 03: 双命名空间反馈) ─────────────────────────
+# `--capability <key>` 的第二命名空间 — 转换函数不是能力。查错命名空间时给出
+# 「这是转换函数不是能力」的机器提示 + 最近可用能力键 (一次查询即终结, US 15)。
+# 权威来源 = build_transforms (function ∈ strip/regex_replace/controlled_translation)
+# + 内置 round2/round4/trim (_resolve_transform) — 与 FILLSPEC「columns → transforms」
+# 同一份真相, 不新增第二份。
+TRANSFORM_NAMESPACE: dict[str, dict] = {
+    "round2": {
+        "kind": "builtin",
+        "what": "内置数值变换: 四舍五入到 2 位小数 (消除长精度成本值溢出)",
     },
-    "semantic_gate": {
-        "state": "SUPPORTED",
-        # 派生: SKILL §6 Semantic Gate (双 Gate 分离, 独立 PASS/FAIL) /
-        # semantic_gate.py — 扫最终 XLSX; 声明的 rule_id 必须在 selected MOD
-        # 规则表 (sha256 校验); 任一 violation → exit 3。
-        "constraints": [
-            "semantic_gate.py 扫最终生成的 XLSX (gate 锁定的 validated_draft), "
-            "不是 fill_spec / mapping / plan",
-            "semantic_policy.json 声明的 rule_id 必须在 selected MOD 规则表 "
-            "(sha256 校验), 否则 fail-closed exit 3",
-            "任一 violation → exit 3 (fail-closed); 全绿 → exit 0; "
-            "独立 PASS/FAIL 于 Structural Gate (禁止合并)",
-        ],
-        "conflicts": [
-            "无证据不得宣称 semantic green (receipt 缺失/STALE → UNVERIFIED)",
-        ],
-        "reference": "FILLSPEC#能力查询-capability-query",
+    "round4": {
+        "kind": "builtin",
+        "what": "内置数值变换: 四舍五入到 4 位小数 (消除长精度成本值溢出)",
+    },
+    "trim": {
+        "kind": "builtin",
+        "what": "内置变换: 首尾空白剥离 (Z 码清理 / 词表键规整)",
+    },
+    "strip": {
+        "kind": "custom_function",
+        "what": "自定义函数 (mapping.transforms function: strip) — 首尾空白剥离",
+    },
+    "regex_replace": {
+        "kind": "custom_function",
+        "what": "自定义函数 (mapping.transforms function: regex_replace) — 子串替换",
+    },
+    "controlled_translation": {
+        "kind": "custom_function",
+        "what": "自定义函数 (mapping.transforms function: controlled_translation) — "
+                "整值精确匹配翻译 (未命中原样通过)",
     },
 }
+
+
+def _nearest_keys(key: str, candidates: list, limit: int = 5) -> list:
+    """difflib 最近可用键 (标准库, 无新依赖): 按近似度排序返回前 `limit` 个,
+    精确命中排最前 (无精确命中时按相似度)。"""
+    if key in candidates:
+        return [key]
+    scored = [(difflib.SequenceMatcher(None, key, c).ratio(), c) for c in candidates]
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [c for _, c in scored[:limit]]
+
+
+def capability_namespaces() -> dict:
+    """双命名空间清单 (ticket 03): 转换函数 vs 能力 — 一个显式分组结构,
+    `--capabilities` 报告嵌入此结构。旧语义验证能力键已于 06 号票移除
+    （业务规则的二次解释层退役）；task.assembly 键已于 07 号票移除
+    （打包机制退役，多 run 交付 = 每 run 一个独立文件）。"""
+    ckeys = sorted(CAPABILITY_CONTRACT)
+    return {
+        "transforms": [
+            {"name": name, **TRANSFORM_NAMESPACE[name]}
+            for name in sorted(TRANSFORM_NAMESPACE)
+        ],
+        "capabilities": [
+            {"name": key, "state": CAPABILITY_CONTRACT[key]["state"],
+             "reference": CAPABILITY_CONTRACT[key]["reference"]}
+            for key in ckeys
+        ],
+    }
 
 
 def _matrix_axes_ok(block: dict, side: str, defects: list) -> bool:
@@ -2074,6 +2462,37 @@ def _locator_desc(loc) -> str:
     if isinstance(loc, dict) and "row" in loc:
         return f"guard row {loc.get('row')!r}"
     return f"locator {loc!r}"
+
+
+def _locator_candidate_cells(loc, rows: list, label_col: int, side: str,
+                             topn: int = 5) -> list:
+    """ticket 03: locator 未命中时的候选格清单 — difflib 在该侧标签列里找与
+    查询标签最接近的已有标签 (纠拼写/措辞), 返回 {side, orig, label, meaning},
+    不替 Agent 决定选哪个。查询目标是 label 文本时用其字面量; 否则用 locator 描述。"""
+    want = ""
+    if isinstance(loc, str):
+        want = loc.strip()
+    elif isinstance(loc, dict) and isinstance(loc.get("match"), dict):
+        first = next(iter(loc["match"].values()), "")
+        want = str(first).strip()
+    if not want:
+        return []
+    labels = []
+    for values, orig in rows:
+        if label_col < len(values):
+            text = str(values[label_col]).strip()
+            if text:
+                labels.append((text, orig))
+    unique = {}
+    for text, orig in labels:
+        unique.setdefault(text, orig)
+    ranked = sorted(
+        ((difflib.SequenceMatcher(None, want, t).ratio(), t, o)
+         for t, o in unique.items()),
+        key=lambda t: (-t[0], t[1]))
+    return [{"side": side, "orig": orig, "label": text,
+             "meaning": "最近标签候选 (核对拼写/措辞后改 locator)"}
+            for _, text, orig in ranked[:topn]]
 
 
 def _locator_structure_ok(loc, side: str, fi: int, defects: list) -> bool:
@@ -2228,8 +2647,12 @@ def _resolve_matrix_row(loc, rows: list, label_col: int, side: str, fi: int,
                 return None
         return matched[0]
     if not hits:
+        # ticket 03: 候选格清单 — difflib 找该侧标签列里与查询标签最接近的已有
+        # 标签, 供 Agent 纠拼写/措辞 (不替 Agent 决定选哪个)。
+        cands = _locator_candidate_cells(loc, rows, label_col, side)
         defects.append({"code": "MATRIX_FIELD_LOCATOR_NOT_FOUND", "side": side,
                         "index": fi, "locator": _locator_desc(loc),
+                        "candidate_cells": cands,
                         "message": f"matrix.field_map[{fi}].{side} "
                                    f"{_locator_desc(loc)} 未在 {side} 展平 CSV 命中",
                         "corrective_action": "用该侧真实存在的标签/列文本组合"})
@@ -2238,6 +2661,13 @@ def _resolve_matrix_row(loc, rows: list, label_col: int, side: str, fi: int,
         defects.append({"code": "MATRIX_FIELD_LOCATOR_AMBIGUOUS", "side": side,
                         "index": fi, "locator": _locator_desc(loc),
                         "matches": len(hits),
+                        "candidate_cells": [
+                            {"side": side, "orig": orig,
+                             "label": str(values[label_col]).strip()
+                                      if label_col < len(values) else "",
+                             "meaning": "命中候选行 (需加列消歧或换 row+expect 守卫)"}
+                            for values, orig in hits
+                        ],
                         "message": f"matrix.field_map[{fi}].{side} "
                                    f"{_locator_desc(loc)} 命中 {len(hits)} 行 — "
                                    "fail-closed, 首命中已废止",
@@ -2249,7 +2679,7 @@ def _resolve_matrix_row(loc, rows: list, label_col: int, side: str, fi: int,
 
 def validate_matrix(matrix_cfg: dict, target_cfg: dict, num_cols: int,
                     manifest_flat: dict, manifest_target: dict, workdir: Path,
-                    defects: list) -> dict | None:
+                    defects: list, shared_root: Path | None = None) -> dict | None:
     """Static validation of a target-level `matrix` declaration (ticket 06,
     locator grammar ticket 01 V2).
 
@@ -2355,12 +2785,15 @@ def validate_matrix(matrix_cfg: dict, target_cfg: dict, num_cols: int,
                                              "rows.source 同一个名字)"})
         return None
     try:
-        src_rows = load_csv_rows(workdir / src_entry["csv"])
-        tgt_rows = load_csv_rows(workdir / manifest_target["csv"])
+        src_rows = load_csv_rows(
+            _flat_entry_path(src_entry, src_entry["csv"], workdir, shared_root))
+        tgt_rows = load_csv_rows(
+            _flat_entry_path(manifest_target, manifest_target["csv"],
+                             workdir, shared_root))
     except OSError as e:
         defects.append({"code": "MATRIX_INVALID",
                         "message": f"matrix CSV unreadable: {e}",
-                        "corrective_action": "Re-run prepare_run.py --flatten"})
+                        "corrective_action": "Re-run workspace_init.py --init --flatten"})
         return None
     src_width = max((len(r[0]) for r in src_rows), default=0)
     src_label_col = col_letter_to_idx(src_block.get("field_label_column") or "A")
@@ -2476,7 +2909,8 @@ def materialize_matrix(ctx: dict, transforms: dict, defects: list,
     return cells, trace
 
 
-def _source_value_pool(manifest: dict, workdir: Path) -> set:
+def _source_value_pool(manifest: dict, workdir: Path,
+                       shared_root: Path | None = None) -> set:
     """All non-empty cell values of every flattened CSV except the target's
     own CSV — the mechanical pool the bulk-literal audit compares set values
     against (target template text is NOT source-derived)."""
@@ -2486,7 +2920,7 @@ def _source_value_pool(manifest: dict, workdir: Path) -> set:
         if e.get("csv") == target_csv:
             continue
         try:
-            rows = load_csv_rows(workdir / e["csv"])
+            rows = load_csv_rows(_flat_entry_path(e, e["csv"], workdir, shared_root))
         except (OSError, ValueError):
             continue
         for values, _orig in rows:
@@ -2499,7 +2933,8 @@ def _source_value_pool(manifest: dict, workdir: Path) -> set:
 
 def audit_bulk_literal_fallback(target_cfg: dict, manifest: dict,
                                 workdir: Path, warnings: list,
-                                defects: list) -> None:
+                                defects: list,
+                                shared_root: Path | None = None) -> None:
     """Compile-audit: bulk source-derived literal `sets` (ticket 06 / D6).
 
     Mechanical heuristic (compile-audit ONLY — the spec's record-count-threshold
@@ -2518,7 +2953,7 @@ def audit_bulk_literal_fallback(target_cfg: dict, manifest: dict,
                if isinstance(s, dict) and "value" in s and s.get("value") is not None]
     if len(entries) < BULK_LITERAL_MIN_TOTAL:
         return
-    pool = _source_value_pool(manifest, workdir)
+    pool = _source_value_pool(manifest, workdir, shared_root)
     derived = [s for s in entries if str(s.get("value")).strip() in pool]
     if not derived:
         return
@@ -2764,7 +3199,7 @@ def _emit_block_ops(b: dict, data_rows: list, data_cursor: int, num_cols: int,
     #    Groups come from the materialized group_by values (compute_groups);
     #    {r1}:{r2} expands per group start/end and must stay inside the block
     #    (AGG_RANGE_INVALID). Anchor cells register nonempty readback. The
-    #    whole_run gate fires in the static validation phase, before ops.
+    #    whole_run check fires in the static validation phase, before ops.
     for ga in ga_entries:
         col = ga.get("col")
         gcol = ga.get("group_by")
@@ -3148,7 +3583,7 @@ def render_mapping(spec: dict, plan: dict, manifest: dict) -> str:
         "| Artifact | Basis |",
         "|---|---|",
         "| fill_spec.yaml | this report + execution_plan.json |",
-        "| source data | flattened CSVs from prepare_run.py (staged inputs) |",
+        "| source data | flattened CSVs from workspace_init.py (staged inputs) |",
         "",
     ]
     if spec.get("decisions"):
@@ -3313,7 +3748,9 @@ def render_mapping(spec: dict, plan: dict, manifest: dict) -> str:
 
 
 def compile_spec(spec: dict, manifest: dict, workdir: Path,
-                  spec_path: Path | None = None) -> dict:
+                  spec_path: Path | None = None,
+                  mod_resolution_path: Path | None = None,
+                  shared_root: Path | None = None) -> dict:
     defects: list = []
     defects += validate_schema(spec, manifest)
     if defects:
@@ -3321,7 +3758,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
 
     # MOD-consistency gates (C1–C4) — fail-closed BEFORE any fingerprint/structure
     # work. No legal compile path without a resolved decision record.
-    check_mod_consistency(spec, workdir)
+    # mod_resolution_path 可指向 task-level 一次裁决（ticket 08），缺省回退
+    # workdir/mod_resolution.json（single-run）。
+    check_mod_consistency(spec, workdir, mod_resolution_path)
 
     inputs = spec["inputs"]
     manifest_target = manifest["target"]
@@ -3337,7 +3776,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         fail("FILLSPEC_FINGERPRINT_MISMATCH",
              "fill_spec fingerprints do not match prepare_manifest — the spec "
              "was written against a different structure",
-             "Structure changed: re-run prepare_run.py, read the fresh digests, "
+             "Structure changed: re-run workspace_init.py --init + materialize_run.py, read the fresh digests, "
              "and update the spec. Fingerprints not yet filled: copy them from "
              "prepare_manifest.json (fingerprints.source_structure / "
              "target_structure), or generate a probe scaffold with "
@@ -3350,7 +3789,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
              "Fix the target entry")
 
     manifest_flat = {e["name"]: e for e in manifest["flattened"]}
-    target_meta = json.loads((workdir / manifest_target["meta"]).read_text(encoding="utf-8"))
+    target_meta = json.loads(
+        _flat_entry_path(manifest_target, manifest_target["meta"],
+                         workdir, shared_root).read_text(encoding="utf-8"))
     dims = target_meta.get("dimensions", {})
     num_cols = dims.get("cols", 0)
 
@@ -3383,11 +3824,14 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                  "Fix the spec and re-run compile_fill.py", defects)
         matrix_ctx = validate_matrix(matrix_cfg, target_cfg, num_cols,
                                      manifest_flat, manifest_target, workdir,
-                                     defects)
+                                     defects, shared_root)
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
-        transforms = build_transforms(spec["mapping"], target_cfg)
+        transforms = build_transforms(spec["mapping"], target_cfg, defects)
+        if defects:
+            fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                 "Fix the spec and re-run compile_fill.py", defects)
         matrix_cells, source_trace = materialize_matrix(
             matrix_ctx, transforms, defects, matrix_ctx["src_entry"]["name"])
         if defects:
@@ -3458,7 +3902,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         # reason invalid_format / out_of_range (no new taxonomy).
         defects += validate_lookup_key_columns(
             blocks_cfg, spec["mapping"], target_cfg, manifest_flat, workdir,
-            num_cols)
+            num_cols, shared_root)
         if defects:
             fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
                  "Fix the spec and re-run compile_fill.py", defects)
@@ -3485,7 +3929,8 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                     fail("SPEC_SOURCE_CSV", f"{label}: rows source {src_name!r} not among flattened sources",
                          "Reference the flattened entry name from the manifest (e.g. the "
                          "name field of a flattened sheet, not the csv filename)")
-                src_rows = load_csv_rows(workdir / src_entry["csv"])
+                src_rows = load_csv_rows(
+                    _flat_entry_path(src_entry, src_entry["csv"], workdir, shared_root))
                 # Selectors match SOURCE rows — validate their column letters
                 # against the SOURCE's own width, not the target's (the MXP case:
                 # 27-col source into a 6-col target made L selectors fail).
@@ -3522,7 +3967,10 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             return out
 
         lookups = build_lookup_tables(spec["mapping"], target_cfg, workdir)
-        transforms = build_transforms(spec["mapping"], target_cfg)
+        transforms = build_transforms(spec["mapping"], target_cfg, defects)
+        if defects:
+            fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
+                 "Fix the spec and re-run compile_fill.py", defects)
         lookup_stats: dict = {}
 
         # Materialize per block and attach block data (rows, source, block index).
@@ -3699,7 +4147,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                 per_row = cfg.get("formulas", {}).get("per_row", {})
                 gm_cols = {g.get("col") for g in cfg.get("group_merges", [])}
                 validate_clone_residue(cfg, template_row,
-                                       workdir / manifest_target["csv"], num_cols,
+                                       _flat_entry_path(
+                                           manifest_target, manifest_target["csv"],
+                                           workdir, shared_root), num_cols,
                                        cfg.get("columns", []), null_specs, per_row,
                                        b["count"], defects, gm_cols)
                 if b.get("inplace"):
@@ -3708,7 +4158,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                     # (covered by validate_clone_residue above).
                     validate_placeholder_residue(
                         cfg, b["inplace"]["start_row"], b["inplace"]["capacity"],
-                        b["count"], workdir / manifest_target["csv"], num_cols,
+                        b["count"],
+                        _flat_entry_path(manifest_target, manifest_target["csv"],
+                                         workdir, shared_root), num_cols,
                         b["rows"], defects)
                 validate_formula_references(cfg.get("formulas", {}), b["count"], defects)
                 ga_entries, ga_whole_run = split_group_aggregates(
@@ -3778,7 +4230,8 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     # Bulk source-derived literal-sets audit (ticket 06 / D6) — compile-audit
     # ONLY, never a routing basis (spec 的记录数量阈值禁令只约束 routing)。对
     # 两条路径都生效 — blocks:[] + 大量 literal sets 正是被审计的病理形态。
-    audit_bulk_literal_fallback(target_cfg, manifest, workdir, warnings, defects)
+    audit_bulk_literal_fallback(target_cfg, manifest, workdir, warnings,
+                                defects, shared_root)
 
     if not ops:
         fail("PLAN_EMPTY", "compilation produced zero operations",
@@ -3949,7 +4402,7 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         "platform": platform,
         "target": inputs["target"],
         "target_sheet": inputs["target_sheet"],
-        "input_hashes": bind_input_hashes(workdir, inputs),
+        "input_hashes": bind_input_hashes(workdir, inputs, shared_root),
         "fingerprints": {"source_structure": mfp.get("source_structure"),
                          "target_structure": mfp.get("target_structure")},
         "blocks": blocks,
@@ -3993,8 +4446,7 @@ def probe_spec(spec: dict, manifest: dict, workdir: Path) -> dict:
     """Compile-only probe: does the compiler ACCEPT this spec?
 
     Runs the exact same pipeline as a real compile (so the answer is always
-    the same), but writes nothing: no execution_plan.json, no mapping.md,
-    no run_timing entry. Result:
+    the same), but writes nothing: no execution_plan.json, no mapping.md. Result:
       accepted=True  → {"accepted", "operations", "warnings"}
       accepted=False → {"accepted", "exit_code", "code", "defects", "message"}
     """
@@ -4041,15 +4493,34 @@ def query_capability(key: str) -> dict | None:
 
 
 def capability_key_unknown(key: str) -> None:
-    """Unknown capability key → exit 3 + 短 JSON defect (stderr, 同错误契约),
-    答带可用 key 列表 (短输出, 不 dump FILLSPEC 全文)。"""
+    """Unknown key → exit 3 + 命名空间不匹配 + 最近可用键 (ticket 03 收敛提示).
+
+    保留旧 CAPABILITY_KEY_UNKNOWN code + available_keys (既有 contract test 兼容),
+    新增 namespace_mismatch 提示 + nearest_keys (difflib 最近键) + transform_functions
+    (转换函数命名空间 — 查错命名空间时给出「这是转换函数不是能力」, US 15 一次
+    查询即终结)。"""
     keys = sorted(CAPABILITY_CONTRACT)
+    transforms = sorted(TRANSFORM_NAMESPACE)
+    is_transform = key in TRANSFORM_NAMESPACE
+    all_keys = keys + transforms
+    nearest = _nearest_keys(key, all_keys)
+    if is_transform:
+        message = (f"{key!r} 是转换函数不是能力 (namespace mismatch) — "
+                   f"转换函数用于 columns.transforms / matrix.field_map[].transforms, "
+                   f"能力键用 --capability; {TRANSFORM_NAMESPACE[key]['what']}")
+    else:
+        message = (f"unknown key {key!r} (namespace mismatch) — 不是能力键也不是 "
+                   f"转换函数; 最近可用键: {', '.join(nearest)}")
     sys.stderr.write(json.dumps({
         "status": "ERROR",
         "code": "CAPABILITY_KEY_UNKNOWN",
-        "message": f"unknown capability key {key!r}",
+        "namespace_mismatch": True,
+        "message": message,
         "available_keys": keys,
-        "corrective_action": "Use one of the listed capability keys",
+        "transform_functions": transforms,
+        "nearest_keys": nearest,
+        "corrective_action": "Use one of the listed capability keys (or a transform "
+                             "function name when you meant a value transform)",
     }, ensure_ascii=False, indent=2))
     sys.exit(3)
 
@@ -4100,6 +4571,17 @@ def main() -> None:
                         help="pure contract query: answer one fine-grained capability "
                              "key from CAPABILITY_CONTRACT (e.g. matrix.field_locator) "
                              "as short JSON — no workdir/workbook/spec needed")
+    parser.add_argument("--mod-resolution", type=Path, default=None, metavar="PATH",
+                        help="optional task-level MOD Adjudication Record path "
+                             "(ticket 08: task 级一次裁决，多 run 共享；缺省回退 "
+                             "workdir/mod_resolution.json 的 single-run 语义)")
+    parser.add_argument("--shared-root", type=Path, default=None, metavar="DIR",
+                        help="optional task root providing shared staged/raw inputs "
+                             "(staged/) and the flatten cache (cache/<key>/); when set, "
+                             "compile resolves raw inputs and flattened csv/meta by "
+                             "hash/cache_key reference instead of reading them from "
+                             "workdir (ticket 08: shared inputs are not byte-copied "
+                             "into run dirs)")
     args = parser.parse_args()
 
     if args.capability:
@@ -4117,6 +4599,7 @@ def main() -> None:
         import tempfile as _tmp
         with _tmp.TemporaryDirectory() as td:
             results = run_probe_cases(Path(td))
+        namespaces = capability_namespaces()
         print(json.dumps({
             "status": "SUCCESS", "code": "CAPABILITIES_REPORTED",
             "schema_version": "2.5",
@@ -4124,6 +4607,9 @@ def main() -> None:
                     "contract tests assert this matrix matches FILLSPEC.md",
             "patterns": "assets/combination_patterns.yaml (copyable fragments "
                         "for the recommended combinations)",
+            # ticket 03: 双命名空间显式分组 (转换函数 vs 能力), 能力键一个不删
+            "transforms": namespaces["transforms"],
+            "capabilities": namespaces["capabilities"],
             "cases": results,
         }, ensure_ascii=False, indent=2))
         sys.exit(0)
@@ -4139,7 +4625,9 @@ def main() -> None:
         print(json.dumps({"status": "PROBED", **result}, ensure_ascii=False, indent=2))
         sys.exit(0 if result["accepted"] else 3)
 
-    plan = compile_spec(spec, manifest, args.workdir)
+    plan = compile_spec(spec, manifest, args.workdir,
+                        mod_resolution_path=args.mod_resolution,
+                        shared_root=args.shared_root)
     plan["fill_spec"] = str(args.spec)
     plan["fill_spec_sha256"] = sha256_text(args.spec.read_bytes().decode("utf-8"))
 
@@ -4148,14 +4636,13 @@ def main() -> None:
     mapping_path = args.workdir / MAPPING_NAME
     mapping_path.write_text(render_mapping(spec, plan, manifest), encoding="utf-8")
     # Source lineage (ticket 06): 每条 matrix 写入的 {target, source,
-    # transform_chain} 聚合到独立文件 — Gate/语义验证 (ticket 07) 消费;
+    # transform_chain} 聚合到独立文件 — Verify/readback 的机器证据消费;
     # execution_plan.json 内同源镜像 (plan.source_trace)。
     if plan.get("source_trace"):
         (args.workdir / SOURCE_TRACE_NAME).write_text(
             json.dumps(plan["source_trace"], ensure_ascii=False, indent=2),
             encoding="utf-8")
 
-    record_timing(args.workdir, "compile")
     print(json.dumps({
         "status": "SUCCESS", "code": "PLAN_GENERATED",
         "operations": len(plan["operations"]),

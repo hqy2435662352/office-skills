@@ -884,7 +884,7 @@ class AttentionMapContractTextTests(unittest.TestCase):
         self.assertIn("BULK_SOURCE_DERIVED_LITERAL_FALLBACK", text)
         self.assertIn("resolve→`record_map`", text)
         self.assertIn("transform→`transform_chain`", text)
-        self.assertIn("validate→Gate assertions", text)
+        self.assertIn("validate→`validation` 断言", text)
 
     def test_fillspec_matrix_section_and_alignment(self):
         text = (SKILL_ROOT / "references" / "FILLSPEC.md").read_text(encoding="utf-8")
@@ -895,7 +895,7 @@ class AttentionMapContractTextTests(unittest.TestCase):
         self.assertIn("resolve → `record_map`", text)
         self.assertIn("map → `field_map`", text)
         self.assertIn("transform → `transform_chain`", text)
-        self.assertIn("validate → Gate assertions", text)
+        self.assertIn("validate → `validation` 断言", text)
         self.assertIn("compile-audit", text)
         self.assertIn("不是路由依据", text)
 

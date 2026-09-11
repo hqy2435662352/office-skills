@@ -34,7 +34,7 @@ repair 预算内的验证次数)。
 | `FINAL_ROW_COUNT_MISMATCH` | structural_failures 报 expected != actual 行数 | ①trim/overflow 方向与数据量不符 → 核对源匹配行数与 capacity ②selectors 误配/漏配行 ③重编译重执行 (budget 1 轮, 再失败 ASK/STOP) | MXP 占位区 capacity 18 vs 13 产品 → trim 5, 期望 35 行 |
 | `GROUP_BOUNDARY_MISMATCH` | 列上实际合并区集合 != 推导集合 (validate 对合并残留视而不见) | ①group_by 物化值出现意外同值段/杂散值 → 修数据或 selectors ②merges 与 group_merges 同列混用 ③残留合并未拆 → 确认 lowering 逐行 unmerge (含单格残留 A19:A19) | 删行后单格残留卡住重合并 |
 | `RENDER_QA_FAILED` | `--render` 产物生成失败 (exit 3) | ①png 失败 → 降级 `--render html` (纯文本模型只做结构渲染检查, 不得声称视觉验证 — 属 budget 内一次 ADAPT) ②html 也失败 → 核对 region (plan.render_qa.region) 与文件路径 ③修复后重跑 | 无渲染后端 / 路径含中文 |
-| `INPUT_HASH_DRIFT` | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 `copy_template` 前以 `_draft_failure.json` 拒绝 (exit 3, code=INPUT_HASH_DRIFT, 含 bound/actual/drifted_inputs) | ①恢复未漂移的 staged 输入 (从源文件重新 stage) ②或重跑 prepare_run + compile_fill.py 重绑定 → 重执行 — 输入哈希在 compile/execute/promote 三个边界重算 (FILLSPEC E5) | 2026-08-13 审计 issue 03: compile 后改 staged template 曾静默产出错误 Draft |
+| `INPUT_HASH_DRIFT` | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 `copy_template` 前以 `_draft_failure.json` 拒绝 (exit 3, code=INPUT_HASH_DRIFT, 含 bound/actual/drifted_inputs) | ①恢复未漂移的 staged 输入 (从源文件重新 stage) ②或重跑 prepare_run + compile_fill.py 重绑定 → 重执行 — 输入哈希在 compile/execute/deliver 三个边界重算 (FILLSPEC E5) | 2026-08-13 审计 issue 03: compile 后改 staged template 曾静默产出错误 Draft |
 | `INPUT_HASH_BINDING_MISSING` | plan 无 input_hashes (旧版 compile 产物), execute 无法核对输入 (fail-closed) | 重跑 compile_fill.py 重绑定 → 重执行 (FILLSPEC E5) | — |
 
 ## 修复后验证循环
