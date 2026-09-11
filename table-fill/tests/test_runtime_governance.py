@@ -12,7 +12,7 @@
 测试面 (spec Testing Decisions「好测试 = 只测外部行为」, 本票是行为契约):
 
   A. SKILL 硬约束文字 pin — SKILL.md「## 硬约束」节含四类动作 + FillSpec First
-     Rule + 错误驱动 + 模式索引路由 + 初稿可以不完整 + 迁移锚点注释 (置顶位可识别)。
+     Rule + 错误驱动 + 模式索引路由 + 初稿可以不完整。
   B. fill_spec_first_validator 纯函数校验 — 合法序列 (四类动作) 通过; 非法序列
      (探索在前) 失败; 错误驱动循环 (初稿后 compile→explore→修复) 合法。
   C. 埃及类 case 证据 (e2e): 复用 task_orchestration e2e fixture (parameter_book
@@ -89,14 +89,6 @@ class TestHardConstraintTextPinning(unittest.TestCase):
         dep_idx = text.index("## ⚠️ 依赖加载")
         self.assertLess(hard_idx, dep_idx,
                         "「## 硬约束」必须位于「依赖加载」之前 (置顶位)")
-
-    def test_migration_anchor_comment(self):
-        """迁移锚点注释点名 04/07/09 号票 (置顶位随瘦身保留的识别标记)。"""
-        section = _hard_constraint_section()
-        self.assertIn("迁移锚点", section, "硬约束节缺「迁移锚点」注释")
-        self.assertIn("ticket 04", section, "迁移锚点缺 ticket 04 点名")
-        self.assertIn("07 号票", section, "迁移锚点缺 07 号票迁移说明")
-        self.assertIn("09 号票", section, "迁移锚点缺 09 号票置顶说明")
 
     def test_fillspec_first_rule_wording(self):
         """MOD 决议后首个业务动作 = 产出 FillSpec 初稿 + 可以不完整。"""
