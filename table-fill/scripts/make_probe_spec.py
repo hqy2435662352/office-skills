@@ -45,7 +45,7 @@ def main() -> None:
         print(json.dumps({
             "status": "ERROR", "code": "MANIFEST_NOT_FOUND",
             "message": f"prepare_manifest.json missing in {args.workdir}",
-            "corrective_action": "Run prepare_run.py first (outline + flatten stages)",
+            "corrective_action": "Run workspace_init.py --init first (fact space)",
         }, ensure_ascii=False, indent=2))
         sys.exit(3)
 

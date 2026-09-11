@@ -1,8 +1,9 @@
-# LAYER4_EXECUTE_LOOP.md — Draft 执行、验证与修复循环 (v2.5)
+# LAYER4_EXECUTE_LOOP.md — Draft 执行、验证与修复循环 (v3)
 
-v2.5 只有**一次填充执行**。冒烟测试已删除: `execute_batch.py` 在模板副本上执行
-plan 并**保留**结果为 `validated_draft.<ext>`; Execution Gate 批准后
-`promote_output.py` 做哈希验证复制。Gate 后绝不再次执行填充。
+v3 只有**一次填充执行**。冒烟测试已删除: `execute_batch.py` 在模板副本上执行
+plan 并**保留**结果为 `validated_draft.<ext>`; Spec Review 确认（唯一人工点）
+后、verify 全绿即 `promote_output.py` 做哈希验证复制自动交付。deliver 后绝不
+再次执行填充。
 
 本文件承载执行期的**过程性知识** (SKILL.md 只留一行指针 — 渐进式披露原则):
 刷盘顺序、结构 readback、Render QA 分支、失败码与修复预算。
@@ -56,6 +57,34 @@ plan 并**保留**结果为 `validated_draft.<ext>`; Execution Gate 批准后
 
 失败 → exit 3 + `_draft_failure.json` (defect_class/standard_fix)。
 
+## execute 失败自动复核 (T03 Execute Stability)
+
+Task 编排 (`task_prepare.execute_worker`) 里 execute 子进程失败（非零退出或
+超时/被杀窗口）**不直接进入失败恢复流程**，先走执行器边界的自动复核（复用
+`_officecli` 适配器与 execute_batch 读回逻辑；`execute_batch.py` 本体与产物
+契约零改动）：
+
+1. **force flush / close**：`officecli close <draft>` 刷盘 resident 延迟写，
+   再 `clean_residents()` 释放文件锁（顺序不能反——taskkill 会丢未刷盘的
+   尾部 chunk，KNOWN_TRAPS「resident 延迟写被 taskkill 丢尾部 chunk」）。
+2. **读回复核**：目标格 = 本次 plan 的**写入目标**（`plan.operations` 中可
+   定位、可文本验证的 value/text op，非全文件扫描；复用
+   `execute_batch.batch_read_cells` 批量范围 get，非 A1 坐标逐格 fallback）。
+3. **决策**（纯函数 `task_prepare.review_execute_failure`，可 import 单测）：
+   - `recovered` —— ≥1 目标格已含计划写值（readback 假失败场景：文件实际
+     有值、读回为空）→ 恢复路径；
+   - `retry` —— 无目标格含写值且未重试 → 一次自动重跑；
+   - `confirmed` —— 无写值且已重试 → 确认失败（保留既有失败收敛路径：exit 3
+     + failure record → 修 spec 重跑 / 失败二分重新初始化；不伪造 receipt、
+     不跳过验证、不与输入事实变化的重新初始化混淆）。
+4. **自动重跑一次**：recovered/retry 均自动重跑 execute_batch（单跑 19s，
+   复核 ~1s → 失败重跑 <30s 目标）；重跑成功 → run 正常推进到 deliver，
+   artifacts 带 `recovery` 注记（verdict/recovered_cells/retried）进阶段报告，
+   重跑仍失败 → confirmed。
+
+写阶段未到达（无 `validated_draft.*`：plan 缺失/输入漂移/复制失败）→ 无值
+可复核，直接按既有失败收敛路径。
+
 ## 修复循环 (首次修复是预期路径)
 
 ```
@@ -73,21 +102,16 @@ _draft_failure.json → 修 fill_spec.yaml → compile_fill.py → execute_batch
   不是错误; INPLACE_REGION_OUT_OF_BOUNDS 只表达模型事实矛盾)。
 - 失败码 → 标准修复见 `references/FAILURE_CLASSES.md` (含 v2.5 三码)。
 
-## 提升 (promote_output.py)
+## 交付 (promote_output.py)
 
 | 检查 | 行为 |
 |---|---|
-| `.gate3_confirmed` 缺失 | GATE_NOT_CONFIRMED 拒绝 — marker 缺失不是确认 (fail-closed) |
-| `.gate3_pending` 仍存在 | GATE_PENDING 拒绝 |
-| 确认记录 / receipt / 当前 spec+plan+draft 三方哈希任一漂移 | HASH_DRIFT 拒绝 → 重新生成 draft + 重新 Gate |
-| **输入哈希三方核对 (2026-08-13)** | plan.input_hashes (编译期绑定, plan 在门禁三元组内背书) / receipt 执行时值 (source_hashes + template_sha256) / 当前 staged 文件 — 任一漂移或证据缺失 → HASH_DRIFT 拒绝 (fail-closed) |
+| `draft_receipt.json` 缺失 | RECEIPT_NOT_FOUND 拒绝 — 无已验证 draft 存在的证据 (fail-closed) |
+| receipt 损坏 | RECEIPT_INVALID 拒绝 |
+| receipt / 当前 spec+plan+draft 三方哈希任一漂移 | HASH_DRIFT 拒绝 → 重新生成 draft + 重新验证 |
+| **输入哈希三方核对 (2026-08-13)** | plan.input_hashes (编译期绑定) / receipt 执行时值 (source_hashes + template_sha256) / 当前 staged 文件 — 任一漂移或证据缺失 → HASH_DRIFT 拒绝 (fail-closed) |
 | 原子复制 (同目录 tmp + 校验哈希 + os.replace) | 先删旧 final 是禁止的 — 复制或 replace 失败时旧交付文件必须保留 |
 | final 哈希 == draft 哈希 | 不匹配 → FINAL_HASH_MISMATCH 拒绝 |
 | ZIP 结构 (pptx 查 presentation.xml) | 损坏 → ZIP_STRUCTURE_INVALID 拒绝 |
 | 通过 | 写 final_receipt.json |
 
-## Timing
-
-每个脚本自动追加 `{phase, started_at, duration_ms}` 到 `run_timing.json`:
-prepare_outline / prepare_flatten / compile / draft_execute / promote。
-Gate 展示和最终报告引用该文件, 不依赖聊天时间戳。

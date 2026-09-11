@@ -1,237 +1,213 @@
 #!/usr/bin/env python3
 """
-scripts/repair_row_gaps.py — 物化目标 sheet 的行号空洞 (row elements).
+scripts/repair_row_gaps.py — input-repair utility (ADR 0021).
 
-行号空洞 = sheet XML 中 row 元素 r 值不连续 (如 1..21, 23..52 → 缺 22)。
-officecli 的 `add ... after: /row[N]` 锚点要求 N 元素真实存在; 空洞存在时
-插入行会落在空洞之后的 r 值、锚点链永久断裂 (2026-08-12 埃及复盘)。
+Row-number gaps (`row` element r-values discontinuous in sheet XML) break
+officecli `add ... after: /row[N]` anchor chains permanently. This utility
+repairs a COPY of the affected workbook and produces a NEW repaired input
+snapshot. It is input-version repair, NOT workspace mutation:
 
-修复方式 (已实证): 对缺失行执行 `set <sheet>/A<r> numberformat=0.00` —
-officecli 会物化空行元素且不留单元格内容。注意 `value:null` 只在 officecli
-已规范化 (保存过) 的文件上物化, WPS/Excel 原始 XML 上无效 — 一律用
-style-only (numberformat) 写入。写完必须 `officecli close <file>` 强制刷盘
-(否则 resident 延迟写未落盘, 紧跟的重 flatten 仍读到旧 XML, 2026-08-13 实测)。
+  input workbook → copy to <out> → materialize missing row elements on the
+  copy → close/flush → verify gaps repaired → output repaired snapshot
 
-用法:
-  python scripts/repair_row_gaps.py --workdir <dir> [--target <staged 文件>]
-                                     [--patch-spec <fill_spec.yaml>]
+The current workspace stays immutable; once the repaired snapshot is adopted
+it re-enters through the canonical `workspace_init --init` path (re-init with
+the repaired file among --files), then materialize_run re-projects run views,
+FillSpec fingerprints are rebound, and Compile → Spec Review → Execute follow.
 
-读 prepare_manifest.json 的 row_gaps (prepare_run.py 阶段 B 输出),
-在 staged 副本上物化缺失行元素。
+This script performs NO: manifest refresh, incremental flatten, fingerprint
+patching, spec patching, recompile, or any next-state derivation. It answers
+one question only: "produce a repaired copy of this workbook".
 
-修复成功后脚本自动重跑 prepare_run.py --flatten (仅目标 sheet),
-同步 prepare_manifest.json 的结构指纹 — 行洞修复 = staged 文件修改 =
-指纹必然变化 (机械事实), 手工同步已取消。
+Gap detection reads the workbook XML directly (allowed structural parsing —
+invariant 6); materialization uses the officecli adapter (`set ... numberformat
+=0.00` materializes an empty row element without cell content; `value:null`
+fails on un-normalized WPS/Excel XML). `officecli close` forces the flush that
+a resident-deferred write would otherwise lose.
 
-修复后唯一动作 (flatten 已自动):
-  1. 更新 fill_spec.yaml 的 target_structure 指纹 — 抄输出 JSON 里的
-     fingerprints.target_structure, 或 --patch-spec 一步改写;
-  2. 重编译 (compile_fill.py) → 重执行 (execute_batch.py)。
+Usage:
+  python scripts/repair_row_gaps.py --input <staged.xlsx> --sheet <SheetName>
+                                     [--out <repaired.xlsx>]
 
-Exit codes: 0=pass, 1=fatal, 3=retryable.
+Exit codes: 0=pass (repaired or no gaps), 1=fatal (env/file), 3=retryable.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import re
+import shutil
 import sys
+import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _officecli import (  # noqa: E402
     ensure_utf8_stdio as _utf8_stdio, fail, officecli,
 )
 
-MANIFEST_NAME = "prepare_manifest.json"
+ROW_RE = re.compile(r"<row\b[^>]*\br=\"(\d+)\"", re.IGNORECASE)
 
-try:
-    import yaml  # 仅 --patch-spec 的改写后回读校验
-except ImportError:  # pragma: no cover
-    yaml = None
+# 与 prepare_run 的 files 参数同构: officecli 对中文路径失败, staged 名必须 ASCII
+# (不改文件名 — repair 只修内容, 命名由 workspace_init --files 映射消化)。
 
 
-def load_manifest(workdir: Path) -> dict:
-    p = workdir / MANIFEST_NAME
-    if not p.is_file():
-        fail("MANIFEST_NOT_FOUND",
-             f"prepare_manifest.json not found in {workdir} — run the flatten stage first",
-             "Run: python scripts/prepare_run.py --workdir <dir> --flatten ...")
+def sheet_target_path(book: Path, sheet_name: str) -> str:
+    """sheet 名 → xl/<sheet file> 路径 (经 workbook.xml + rels 解析).
+
+    Rel 元素属性顺序不定 (Target 可能在 Id 前), 分别捕获后组合, 不依赖顺序。"""
+    with zipfile.ZipFile(book) as z:
+        try:
+            wb = z.read("xl/workbook.xml").decode("utf-8")
+            rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        except KeyError:
+            fail("NOT_XLSX", f"{book} 不是标准 xlsx (缺 workbook.xml)",
+                 "用 officecli 或 Excel 保存后重试", exit_code=1)
+    rid_m = re.search(
+        r'<(?:\w+:)?sheet\b[^>]*name="([^"]*)"[^>]*r:id="(rId\d+)"', wb)
+    if not rid_m:
+        fail("SHEET_NOT_FOUND", f"sheet {sheet_name!r} 未在 workbook.xml 找到",
+             "用 outline 文件确认 sheet 名", exit_code=1)
+    r_id = rid_m.group(2)
+    rel_m = re.search(
+        rf'<Relationship\b[^>]*Id="{re.escape(r_id)}"[^>]*/?>', rels)
+    if not rel_m:
+        fail("SHEET_REL_MISSING",
+             f"sheet {r_id} 的 Relationship 未在 rels 找到",
+             "检查 xl/_rels/workbook.xml.rels", exit_code=1)
+    target_m = re.search(r'Target="([^"]+)"', rel_m.group(0))
+    if not target_m:
+        fail("SHEET_REL_MISSING",
+             f"sheet {r_id} 的 Relationship 缺 Target",
+             "检查 xl/_rels/workbook.xml.rels", exit_code=1)
+    target = target_m.group(1)
+    if not target.startswith("/"):
+        target = "xl/" + target.lstrip("/")
+    # 规范化相对路径 (../) 与重复前缀 (/xl/xl/...)
+    parts = []
+    for seg in target.split("/"):
+        if seg == "..":
+            if parts:
+                parts.pop()
+        elif seg and seg != ".":
+            parts.append(seg)
+    norm = "/".join(parts)
+    if not norm.startswith("xl/"):
+        norm = "xl/" + norm.lstrip("xl/")
+    return norm
+
+
+def row_gaps_in(book: Path, sheet_path: str) -> list[int]:
+    """读取 sheet XML 的 row r 值, 返回不连续处缺失的行号 (升序)."""
+    with zipfile.ZipFile(book) as z:
+        try:
+            xml = z.read(sheet_path).decode("utf-8")
+        except KeyError:
+            fail("SHEET_XML_MISSING", f"{sheet_path} 不存在于 {book}",
+                 "检查 sheet 路径解析", exit_code=1)
+    r_vals = sorted({int(m) for m in ROW_RE.findall(xml)})
+    if not r_vals:
+        return []
+    gaps = [expected for expected in range(min(r_vals) + 1, max(r_vals))
+            if expected not in set(r_vals)]
+    return gaps
+
+
+def verify_no_gaps(book: Path, sheet_path: str) -> bool:
+    return not row_gaps_in(book, sheet_path)
+
+
+def repair_copy(input_path: Path, out_path: Path, sheet_name: str) -> dict:
+    """在副本上物化缺失行元素 → close 刷盘 → 验证无洞 → 输出 repaired snapshot.
+
+    只做 Office 手术。fails closed: 任何一步失败都不产生"半修复被当作快照"的
+    状态 — 调用方应删除 out 并重试 (脚本幂等: 已修复的副本再跑 → NO_ROW_GAPS)。"""
+    sheet_path = sheet_target_path(input_path, sheet_name)
+    # 只修 xlsx (pptx 无 row 元素概念); slide[...] 目标由调用方自行跳过 —
+    # 这里按 sheet XML 存在性判, 不存在即 NO_ROW_GAPS (pptx 没有行空洞域)。
+    if not sheet_path.endswith(".xml") or not sheet_path.startswith("xl/"):
+        return {"status": "PASS", "code": "NO_ROW_GAPS",
+                "repaired": [], "reason": "pptx/no-row sheet: 无行元素空洞域"}
+    gaps = row_gaps_in(input_path, sheet_path)
+    if not gaps:
+        return {"status": "PASS", "code": "NO_ROW_GAPS",
+                "repaired": [], "reason": "row r 值连续"}
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_path, out_path)
+    # 副本可写 (stage_files 会设只读, 复制后 officecli 需要写)
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except ValueError as e:
-        fail("MANIFEST_INVALID", f"corrupt manifest: {e}",
-             "Delete the manifest and re-run prepare_run.py")
+        out_path.chmod(0o644)
+    except OSError:
+        pass
 
-
-def resync_flatten(workdir: Path) -> dict:
-    """重跑 prepare_run.py --flatten (仅目标 sheet), 返回新指纹 dict.
-
-    行洞修复 = staged 文件修改 = 指纹必然变化 (机械事实)。repair 后由脚本
-    自动同步 manifest 指纹, Agent 不再手工重 flatten。指纹以
-    prepare_run.py 的 FLATTEN_STAGE_DONE 输出为准 (同一管线, 必然一致)。
-    """
-    manifest = load_manifest(workdir)
-    target_entry = manifest.get("target")
-    if not target_entry:
-        fail("NO_TARGET", "manifest has no target entry",
-             "Run prepare_run.py --flatten with --target <staged file>")
-    proc = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "prepare_run.py"),
-         "--workdir", str(workdir), "--flatten",
-         "--sheets", f"{target_entry['file']}:{target_entry['sheet']}",
-         "--target", target_entry["file"]],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=900)
-    if proc.returncode != 0:
-        fail("RESYNC_FLATTEN_FAILED",
-             f"auto re-flatten after repair failed: {proc.stderr[-400:]}",
-             "The staged file was repaired but the manifest is stale — re-run "
-             "repair_row_gaps.py (idempotent) or run prepare_run.py --flatten "
-             "manually, then update the spec fingerprint", exit_code=3)
-    try:
-        out = json.loads(proc.stdout)
-    except ValueError:
-        fail("RESYNC_FLATTEN_INVALID", "auto re-flatten produced unparsable output",
-             "Re-run repair_row_gaps.py or prepare_run.py --flatten manually")
-    fps = out.get("fingerprints")
-    if not isinstance(fps, dict) or "target_structure" not in fps:
-        fail("RESYNC_FLATTEN_NO_FINGERPRINTS",
-             "auto re-flatten reported no fingerprints",
-             "Re-run repair_row_gaps.py or prepare_run.py --flatten manually")
-    return fps
-
-
-def patch_spec_fingerprint(spec_path: Path, target_fp: str) -> None:
-    """把新 target_structure 指纹写进 fill_spec.yaml (外科手术式行替换,
-    保留注释与其余内容; 改写后 yaml 回读校验)。"""
-    if not spec_path.is_file():
-        fail("SPEC_NOT_FOUND", f"fill_spec.yaml not found: {spec_path}",
-             "Provide the --patch-spec path")
-    if yaml is None:
-        fail("DEP_MISSING", "PyYAML is required for --patch-spec",
-             "pip install pyyaml")
-    text = spec_path.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    out: list[str] = []
-    fp_indent: int | None = None
-    patched = False
-    for line in lines:
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if fp_indent is None:
-            if stripped == "fingerprints:":
-                fp_indent = indent
-            out.append(line)
-            continue
-        if not stripped or indent <= fp_indent:
-            # 块结束 (空行 / 同级或更外缩进) — 后续行原样保留
-            fp_indent = None
-            out.append(line)
-            continue
-        if stripped.startswith("target_structure:"):
-            head = line[:line.index("target_structure:") + len("target_structure:")]
-            comment = ""
-            rest = line[line.index("target_structure:") + len("target_structure:"):]
-            if "#" in rest:
-                comment = rest[rest.index("#"):].rstrip()
-            out.append(f"{head} {target_fp}" + (f" {comment}" if comment else ""))
-            patched = True
-        else:
-            out.append(line)
-    if not patched:
-        fail("SPEC_FINGERPRINT_NOT_FOUND",
-             "no `fingerprints.target_structure` key found in the spec",
-             "Add the fingerprints block (see assets/fill_spec_template.yaml) "
-             "or use make_probe_spec.py --workdir <dir>")
-    new_text = "\n".join(out)
-    try:
-        spec = yaml.safe_load(new_text)
-    except yaml.YAMLError as e:
-        fail("SPEC_PATCH_INVALID", f"patched spec does not parse: {e}",
-             "Restore the spec and fix the fingerprints block manually")
-    if spec.get("fingerprints", {}).get("target_structure") != target_fp:
-        fail("SPEC_PATCH_VERIFY_FAILED",
-             "patched spec fingerprint mismatch after write",
-             "Restore the spec and update the fingerprint manually")
-    spec_path.write_text(new_text + "\n", encoding="utf-8")
-
-
-def repair(workdir: Path, target: str | None, patch_spec: Path | None) -> list[dict]:
-    manifest = load_manifest(workdir)
-    target_entry = manifest.get("target")
-    if not target_entry:
-        fail("NO_TARGET", "manifest has no target entry",
-             "Run prepare_run.py --flatten with --target <staged file>")
-    staged = workdir / (target or target_entry["file"])
-    if not staged.is_file():
-        fail("STAGED_NOT_FOUND", f"staged target not found: {staged}",
-             "Stage the target file first (prepare_run.py --outline)")
-    sheet = target_entry["sheet"]
-    if not sheet.startswith("slide["):  # pptx 无行元素概念, 无空洞可修
-        gaps = sorted(set((manifest.get("row_gaps") or {}).get(
-            target_entry["name"], [])))
-        if not gaps:
-            print(json.dumps({"status": "PASS", "code": "NO_ROW_GAPS",
-                              "repaired": [], "fingerprints_synced": False},
-                             ensure_ascii=False, indent=2))
-            return []
-        fixed = []
-        for r in gaps:
-            path = f"/{sheet}/A{r}"
-            proc = officecli("set", str(staged), path,
-                             "--prop", "numberformat=0.00")
-            if proc.returncode != 0:
-                fail("REPAIR_OP_FAILED",
-                     f"officecli set {path} failed: {proc.stderr[-400:]}",
-                     "Check the sheet name / staged file", exit_code=3)
-            fixed.append(r)
-        # 强制刷盘: resident 延迟写未落盘时, 紧跟的重 flatten 仍读到旧 XML
-        # (2026-08-13 实测: set 返回后立即重 flatten 会复见空洞)。
-        proc = officecli("close", str(staged))
+    fixed = []
+    for r in gaps:
+        path = f"/{sheet_name}/A{r}"
+        proc = officecli("set", str(out_path), path,
+                         "--prop", "numberformat=0.00")
         if proc.returncode != 0:
-            fail("REPAIR_FLUSH_FAILED",
-                 f"officecli close failed: {proc.stderr[-400:]}",
-                 "The row elements were materialized but may not be flushed — "
-                 "re-run repair_row_gaps.py (idempotent)", exit_code=3)
-        fps = resync_flatten(workdir)
-        result = {"status": "PASS", "code": "ROW_GAPS_REPAIRED",
-                  "sheet": sheet, "repaired": fixed,
-                  "fingerprints_synced": True,
-                  "fingerprints": fps,
-                  "next": "flatten 已自动同步; 唯一动作 = 更新 spec 指纹 "
-                          "(抄本输出 fingerprints.target_structure 或 "
-                          "--patch-spec 一步完成) + 重编译 (compile_fill.py)"}
-        # 先输出指纹: --patch-spec 失败 (exit 3) 时, 新指纹也已可见可抄
-        # (重跑 repair 只会得到 NO_ROW_GAPS, 不再带指纹 — 2026-08-13 复盘)。
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        if patch_spec is not None:
-            patch_spec_fingerprint(patch_spec, fps["target_structure"])
-            print(json.dumps({"status": "PASS", "code": "SPEC_PATCHED",
-                              "spec_patched": str(patch_spec)},
-                             ensure_ascii=False, indent=2))
-        return fixed
-    print(json.dumps({"status": "PASS", "code": "NO_ROW_GAPS", "repaired": [],
-                      "fingerprints_synced": False},
-                     ensure_ascii=False, indent=2))
-    return []
+            fail("REPAIR_OP_FAILED",
+                 f"officecli set {path} failed: {proc.stderr[-400:]}",
+                 "检查 sheet 名 / 副本文件", exit_code=3)
+        fixed.append(r)
+    # 强制刷盘: resident 延迟写未落盘时, 紧跟的验证会复见空洞
+    # (2026-08-13 实测: set 返回后立即重读会复见空洞)。
+    proc = officecli("close", str(out_path))
+    if proc.returncode != 0:
+        fail("REPAIR_FLUSH_FAILED",
+             f"officecli close failed: {proc.stderr[-400:]}",
+             "行元素已物化但可能未刷盘 — 删除 out 后重跑 (幂等)",
+             exit_code=3)
+
+    if not verify_no_gaps(out_path, sheet_path):
+        fail("REPAIR_VERIFY_FAILED",
+             f"副本 {out_path} 仍含行号空洞 (sheet {sheet_name})",
+             "删除 out 并重跑 (幂等); 若持续, 检查是否 officecli close 未刷盘",
+             exit_code=3)
+
+    return {"status": "PASS", "code": "ROW_GAPS_REPAIRED",
+            "sheet": sheet_name, "repaired": fixed,
+            "input": str(input_path),
+            "output_snapshot": str(out_path),
+            "next": "以该 repaired snapshot 为输入重新 workspace_init --init "
+                    "(canonical re-entry, ADR 0021) → materialize_run → 刷新 "
+                    "FillSpec 指纹 → Compile Clean → Spec Review → Execute"}
 
 
 def main() -> None:
     _utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="Materialize missing row elements in the staged target "
-                    "(row-number gaps that break add-after anchors); auto "
-                    "re-syncs prepare_manifest fingerprints")
-    parser.add_argument("--workdir", type=Path, required=True, help="ASCII workdir")
-    parser.add_argument("--target", type=str, default=None,
-                        help="Staged target file name (default: manifest target)")
-    parser.add_argument("--patch-spec", type=Path, default=None,
-                        help="fill_spec.yaml to rewrite its "
-                             "fingerprints.target_structure with the new hash "
-                             "(one-step spec sync)")
+        description="input-repair utility: 在副本上物化行号空洞, 产出 repaired "
+                    "input snapshot (ADR 0021)")
+    parser.add_argument("--input", type=Path, required=True,
+                        help="待修复的 Office 输入 (staged 名, ASCII)")
+    parser.add_argument("--sheet", type=str, required=True,
+                        help="sheet 名 (如 11_FRESH本土)")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="repaired snapshot 路径 (默认: <input>.repaired<ext> "
+                             "同目录)")
+    parser.add_argument("--workdir", type=Path, default=None,
+                        help="(兼容) 旧 CLI 占位 — 新语义不需要; 保留以拒绝误用")
     args = parser.parse_args()
-    repair(args.workdir, args.target, args.patch_spec)
+
+    if args.workdir is not None:
+        fail("LEGACY_CLI_REJECTED",
+             "repair_row_gaps 已收缩为 input-repair utility (ADR 0021): "
+             "--workdir/--target/--patch-spec 不再存在",
+             "用法: repair_row_gaps.py --input <staged.xlsx> --sheet <Name> "
+             "[--out <repaired.xlsx>] — 不触碰 manifest/spec/编译", exit_code=3)
+
+    if not args.input.is_file():
+        fail("INPUT_NOT_FOUND", f"input not found: {args.input}",
+             "确认 staged 输入路径", exit_code=1)
+    out = args.out or args.input.with_name(
+        f"{args.input.stem}.repaired{args.input.suffix}")
+    result = repair_copy(args.input, out, args.sheet)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

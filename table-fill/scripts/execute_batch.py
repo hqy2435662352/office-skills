@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _officecli import (  # noqa: E402
     clean_residents, copy_template, ensure_utf8_stdio, fail, issues_delta,
-    officecli, officecli_validate, read_cell, record_timing as _record_timing,
+    officecli, officecli_validate, read_cell,
     resolve_check_path, sha256_file,
 )
 
@@ -59,7 +59,8 @@ FAILURE_NAME = "_draft_failure.json"
 
 
 def input_hash_drift(workdir: Path, plan: dict,
-                     template_path: Path) -> tuple[dict, list]:
+                     template_path: Path,
+                     staged_root: Path | None = None) -> tuple[dict, list]:
     """Recompute the staged input files' content hashes at EXECUTION time and
     compare them against the plan's compile-time binding (plan.input_hashes).
 
@@ -67,7 +68,11 @@ def input_hash_drift(workdir: Path, plan: dict,
     recomputed NOW; drifted = staged names whose recomputed hash differs from
     the bound hash (bound None = unverifiable → drift; missing file → actual
     None → drift). The template's staged name is plan["target"]; the staged
-    file passed as --template is the one hashed for it."""
+    file passed as --template is the one hashed for it.
+
+    ticket 08: staged_root 给定时，非 target 输入（源 .xlsx）从
+    staged_root/staged/<name> 按名引用（task 级共享，不复制进 run 目录）；
+    target 仍是传入的绝对 --template 路径。"""
     bound = plan.get("input_hashes") or {}
     target = plan.get("target")
     tp = Path(template_path)
@@ -75,7 +80,18 @@ def input_hash_drift(workdir: Path, plan: dict,
         tp = workdir / tp
     actual = {}
     for name, bound_hash in bound.items():
-        p = tp if name == target else workdir / name
+        if name == target:
+            p = tp
+        else:
+            w = workdir / name
+            if not w.is_file() and staged_root is not None:
+                # legacy: staged_root/staged/<name>; workspace 平铺 (ADR 0018):
+                # staged_root/<name> (materialize 投影的 run 引用 task root 文件)
+                if (staged_root / "staged" / name).is_file():
+                    w = staged_root / "staged" / name
+                elif (staged_root / name).is_file():
+                    w = staged_root / name
+            p = w
         actual[name] = sha256_file(p) if p.is_file() else None
     drifted = [name for name, b in bound.items() if actual.get(name) != b]
     return actual, drifted
@@ -83,7 +99,6 @@ def input_hash_drift(workdir: Path, plan: dict,
 
 def fail_record(workdir: Path, record: dict, exit_code: int) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
-    _record_timing(workdir, f"draft_execute_round{record.get('round', '?')}_failed")
     (workdir / FAILURE_NAME).write_text(
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     sys.stderr.write(json.dumps(record, ensure_ascii=False, indent=2))
@@ -425,13 +440,89 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--template", type=Path, required=True,
                         help="staged target template (copied, never modified)")
     parser.add_argument("--workdir", type=Path, required=True)
+    parser.add_argument("--staged-root", type=Path, default=None, metavar="DIR",
+                        help="optional task root providing shared staged inputs "
+                             "(staged/); when set, non-target input hashes are read "
+                             "from staged-root/staged/<name> (ticket 08: shared inputs "
+                             "referenced by name, not byte-copied into run dirs)")
     parser.add_argument("--round", type=int, default=1, help="repair round (tracking)")
+    parser.add_argument("--review-confirm", type=Path, default=None, metavar="FILE",
+                        help="optional review_confirm.json path (multi-run: task-root "
+                             "confirm covering all runs; single-run default: "
+                             "<workdir>/review_confirm.json)")
     parser.add_argument("--render", choices=("png", "html", "none"),
                         default=RENDER_MODE_DEFAULT,
                         help="Render QA: png (multimodal models inspect visually) / "
                              "html (text-only models: structural render check only — "
                              "never claim visual verification; default) / none (skip)")
     return parser
+
+
+def review_gate(workdir: Path, plan: dict, round_no: int,
+                confirm_path: Path | None = None) -> None:
+    """Execute Input Gate (ADR 0019): the executed IR must be exactly the
+    reviewed one.
+
+    fail-closed BEFORE any fill: `review_confirm.json` must exist
+    (SPEC_REVIEW_MISSING) and its fill_spec_sha256 must equal
+    execution_plan.fill_spec_sha256 (SPEC_REVIEW_STALE). Both hashes are
+    computed over the same fill_spec bytes by spec_review --confirm and
+    compile_fill respectively — no schema migration needed.
+
+    confirm_path: multi-run passes the task-root review_confirm.json; default
+    <workdir>/review_confirm.json (single-run)."""
+    cp = confirm_path or (workdir / "review_confirm.json")
+    plan_spec_hash = plan.get("fill_spec_sha256")
+    if not plan_spec_hash:
+        fail_record(workdir, {
+            "code": "PLAN_SPEC_HASH_MISSING",
+            "round": round_no,
+            "message": "execution_plan carries no fill_spec_sha256 — cannot "
+                       "verify the reviewed IR identity",
+            "corrective_action": "Recompile with compile_fill.py (plan records "
+                                 "fill_spec_sha256), then re-run",
+        }, 3)
+    if not cp.is_file():
+        fail_record(workdir, {
+            "code": "SPEC_REVIEW_MISSING",
+            "round": round_no,
+            "message": f"review_confirm.json not found: {cp} — Spec Review "
+                       "(S6) is mandatory after COMPILE CLEAN and before "
+                       "Execute (S7); TASK MODE forbids --skip-review",
+            "corrective_action": "Run spec_review.py --confirm on the "
+                                 "compile-clean fill_spec, then re-run",
+        }, 3)
+    try:
+        confirm = json.loads(cp.read_text(encoding="utf-8"))
+    except ValueError as e:
+        fail_record(workdir, {
+            "code": "REVIEW_CONFIRM_INVALID",
+            "round": round_no,
+            "message": f"review_confirm.json corrupt: {e}",
+            "corrective_action": "Re-run spec_review.py --confirm",
+        }, 3)
+    runs = confirm.get("runs")
+    if isinstance(runs, list) and runs:
+        # multi-run confirm: 每 run 一个 hash, 当前 plan 的 hash 必然属于
+        # 本 run 的那一个 (fill_spec bytes 唯一) — 收集全部做集合匹配。
+        confirmed_hashes = [r.get("fill_spec_sha256") for r in runs]
+    else:
+        confirmed_hashes = [confirm.get("fill_spec_sha256")]
+    if (not confirmed_hashes) or (plan_spec_hash not in confirmed_hashes):
+        fail_record(workdir, {
+            "code": "SPEC_REVIEW_STALE",
+            "round": round_no,
+            "message": "review_confirm.fill_spec_sha256 != "
+                       "execution_plan.fill_spec_sha256 — the FillSpec was "
+                       "changed after review (or was never reviewed at this "
+                       "bytes identity); the old confirmation is void",
+            "review_confirm_file": str(cp),
+            "plan_fill_spec_sha256": plan_spec_hash,
+            "reviewed_fill_spec_sha256": confirmed_hashes,
+            "corrective_action": "Every FillSpec-affecting change requires: "
+                                 "compile_fill (COMPILE CLEAN) → spec_review "
+                                 "--confirm → re-run execute",
+        }, 3)
 
 
 def main() -> None:
@@ -457,6 +548,13 @@ def main() -> None:
         fail_record(workdir, {"code": "PLAN_INVALID", "message": str(e),
                               "corrective_action": "Recompile with compile_fill.py"}, 3)
 
+    # Spec Review gate BEFORE any fill (ADR 0019): the executed IR must be
+    # exactly the reviewed one — no review, no execute; stale review, no
+    # execute. Runs before input-hash verification: the review binding is the
+    # semantic identity, input drift is the mechanical identity; both must
+    # pass before copy_template.
+    review_gate(workdir, plan, args.round, args.review_confirm)
+
     # Input hash verification BEFORE any fill: the staged source/template
     # files must still be exactly what the plan was compiled against. A
     # staged file modified after compile silently changes what the draft
@@ -472,7 +570,8 @@ def main() -> None:
             "corrective_action": "Recompile with compile_fill.py (plan rebinds "
                                  "the staged input hashes), then re-run",
         }, 3)
-    actual_hashes, drifted = input_hash_drift(workdir, plan, args.template)
+    actual_hashes, drifted = input_hash_drift(workdir, plan, args.template,
+                                              args.staged_root)
     if drifted:
         fail_record(workdir, {
             "code": "INPUT_HASH_DRIFT",
@@ -483,7 +582,7 @@ def main() -> None:
             "actual_input_hashes": actual_hashes,
             "drifted_inputs": drifted,
             "corrective_action": "Restore the un-drifted staged input(s), or "
-                                 "re-run prepare_run.py + compile_fill.py to "
+                                 "re-run workspace_init.py --init + materialize_run.py + compile_fill.py to "
                                  "rebind, then re-run",
         }, 3)
 
@@ -678,7 +777,6 @@ def main() -> None:
         "validate": validate_state,
         "key_outputs": plan.get("key_outputs", []),
     }
-    _record_timing(workdir, "draft_execute")
     (workdir / RECEIPT_NAME).write_text(
         json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
 

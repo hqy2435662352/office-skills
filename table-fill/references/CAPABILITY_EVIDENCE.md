@@ -170,7 +170,7 @@ evidence」— canonical 起步, 未经验证不声称常见; 087 是截至目�
 
 | 状态 | 含义 | 动作 |
 |---|---|---|
-| **Known Supported** | 适用且有权威通道正面支持 | 直接使用; 正常 Run Verification 全部执行 (formal compile、execute、Validated Draft、readback、结构验证、Render QA、Execution Gate) |
+| **Known Supported** | 适用且有权威通道正向支持 | 直接使用; 正常 Run Verification 全部执行 (formal compile、execute、Validated Draft、readback、结构验证、Render QA、deliver) |
 | **Known Rejected** | 适用且有权威通道明确拒绝 (含 not-rolled-out 门) | 不尝试该行为; 寻找满足同一业务意图的 Known Equivalent Adaptation |
 | **Capability Unknown** | 无适用权威通道决定该问题 | 按第 5 节终局动作处理; 不因复杂、首次出现、特性数量或"想再确认"而进入 |
 
@@ -185,7 +185,7 @@ Table Fill / Prepare / Compiler / Executor / OfficeCLI 的机制行为 (接受�
 
 **不属于 Capability Question** (走各自既有路径, 不进入本参考):
 
-- 业务语义与业务歧义 → MOD Resolution / `gaps` / Execution Gate
+- 业务语义与业务歧义 → MOD Resolution / `gaps` / Spec Review（唯一人工点）
 - 源数据事实 → 展平 CSV / digest / 源文件
 - 普通 spec/编译/执行缺陷 → REPAIR (失败处置表) / `_draft_failure.json`
 - 人的视觉判断 → Render QA
@@ -339,7 +339,7 @@ HOW"而松动** (Task Mode 下 tests/fixtures 不属任何合法 Evidence Path)�
 **ASK/STOP 铁律**: 用户确认**不能把 Capability Unknown 变成技术许可** —
 ASK 选项只能是业务取舍, 不能包含"按未验证机制执行"或"也许安全"。
 
-### Run-Local Capability Evidence 与 Gate 披露
+### Run-Local Capability Evidence 与交付呈报
 
 Rescue 成功只产生 **Run-Local Capability Evidence**, 不升级为跨 Run 的
 Known Supported。Agent 在 workdir 留下简短人类可读记录, 至少包含:
@@ -350,7 +350,7 @@ Known Supported。Agent 在 workdir 留下简短人类可读记录, 至少包含
 - actual result
 - evidence artifact identity、path 与 hash (适用时)
 
-Execution Gate 增加**一句**精简披露, 语义必须包含: 回答了什么问题、PASS/FAIL
+交付呈报增加**一句**精简披露, 语义必须包含: 回答了什么问题、PASS/FAIL
 结论、证据只适用于当前 Run、尚未制度化。内部四项资格判断不展开呈现。
 
 ### Capability Gap Discovery 与模式切换

@@ -100,14 +100,15 @@ class PrecisionExecutionContractTests(unittest.TestCase):
 
     def _prepare(self) -> None:
         wd = self.workdir
-        proc = run_py(wd, "prepare_run.py", "--workdir", ".",
-                      "--files", "source.xlsx|source.xlsx,template.xlsx|template.xlsx",
-                      "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(wd, "prepare_run.py", "--workdir", ".",
-                      "--flatten", "--sheets", "source.xlsx:SRC;template.xlsx:S",
-                      "--target", "template.xlsx")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        sys.path.insert(0, str(SCRIPTS))
+        from _fixtures.run_driver import prepare_single, target_entry_name
+        prepare_single(
+            wd,
+            files="source.xlsx|source.xlsx,template.xlsx|template.xlsx",
+            sheets="source.xlsx:SRC;template.xlsx:S",
+            sources=target_entry_name("source", "SRC"),
+            target=target_entry_name("template", "S"),
+            task="precision e2e")
 
     def _write_spec(self, column_extra: dict | None) -> Path:
         wd = self.workdir
@@ -154,6 +155,9 @@ class PrecisionExecutionContractTests(unittest.TestCase):
                       "--workdir", ".")
 
     def _execute(self) -> subprocess.CompletedProcess:
+        sys.path.insert(0, str(SCRIPTS))
+        from _fixtures.run_driver import review_and_confirm
+        review_and_confirm(self.workdir)
         return run_py(self.workdir, "execute_batch.py", "--plan",
                       "execution_plan.json", "--template", "template.xlsx",
                       "--workdir", ".", "--round", "1", "--render", "html")

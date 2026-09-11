@@ -1,21 +1,20 @@
-"""Issue 05 — repair_row_gaps.py 自动重算指纹 (消除手工同步).
+"""ADR 0021 — repair_row_gaps.py 是 input-repair utility (canonical re-init).
 
 2026-08-13 埃及 FRESH 运行复盘: 目标 sheet 行号空洞 (row 22 缺失) →
-TEMPLATE_ROW_GAP 编译拒绝 → repair_row_gaps.py 物化行 → staged 文件变了 →
-指纹变 → 必须手工重跑 prepare_run.py --flatten + 把新 target_structure 抄进
-fill_spec.yaml → 重编译。三步手工环节, 每步都可能抄错/漏跑。
+TEMPLATE_ROW_GAP 编译拒绝 → 物化行 → staged 文件变 → 指纹变。旧实现:
+repair 原地改 staged + 自动重跑 prepare_run --flatten 同步指纹 +
+--patch-spec 改 spec → 破坏 immutable workspace 契约。
 
-本契约把「修复后自动同步」变成脚本行为:
+本契约 (ADR 0021 — Row-gap repair is input-version repair):
+- repair 在**副本**上物化缺失行元素, 产出 repaired input snapshot;
+- 原输入/当前 workspace 不被修改 (immutable);
+- repaired snapshot 必须经 canonical workspace_init --init 重新进入
+  (re-init), 然后 materialize_run 重投影 run view → 指纹必然变化;
+- 无空洞时 NO_ROW_GAPS (no-op, 幂等);
+- repair 不触碰 manifest/spec/编译 (零 resync/patch/next-state 推导)。
 
-- repair 成功后自动重跑 flatten (仅目标 sheet), 同步 prepare_manifest.json
-  指纹 (manifest 指纹 == repair 输出指纹 == 手工重 flatten 结果);
-- 行洞修复 = staged 文件修改 = 指纹必然变化 (机械事实, 本文件断言);
-- --patch-spec 一步把新 target_structure 写进 fill_spec.yaml;
-- 无空洞时是 no-op (NO_ROW_GAPS, 幂等)。
-
-Smoke (脚本集成, 无单元测试 — 见 issue 05): 构造带行洞 fixture →
-repair → manifest 指纹 == 重 flatten 结果。officecli 不可用时跳过
-(unit-only 环境)。
+Smoke (脚本集成): 构造带行洞 fixture → repair → snapshot 无洞且原文件
+未变 → re-init + materialize → 新指纹 != 旧指纹。officecli 不可用时跳过。
 
 Run with:
   python -m unittest tests.test_repair_gaps_e2e -v
@@ -33,8 +32,6 @@ import unittest
 import zipfile
 from pathlib import Path
 
-import yaml
-
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 
@@ -44,22 +41,6 @@ def run_py(workdir: Path, script: str, *args) -> subprocess.CompletedProcess:
         [sys.executable, "-X", "utf8", str(SCRIPTS / script), *args],
         cwd=str(workdir), capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=900)
-
-
-def parse_json_docs(text: str) -> list[dict]:
-    """Parse consecutive JSON documents on stdout (repair 先输出指纹结果,
-    --patch-spec 成功后追加 SPEC_PATCHED 结果)."""
-    dec = json.JSONDecoder()
-    out = []
-    i = 0
-    while i < len(text):
-        while i < len(text) and text[i] in " \r\n":
-            i += 1
-        if i >= len(text):
-            break
-        obj, i = dec.raw_decode(text, i)
-        out.append(obj)
-    return out
 
 
 def build_gap_fixture(dirpath: Path) -> None:
@@ -100,9 +81,9 @@ def build_gap_fixture(dirpath: Path) -> None:
 
 
 @unittest.skipIf(shutil.which("officecli") is None, "officecli not on PATH")
-class RepairGapsResyncTests(unittest.TestCase):
-    """Issue 05 冒烟: repair 自动重 flatten 同步指纹; 指纹必然变化;
-    --patch-spec 一步改 spec; 无空洞幂等."""
+class RepairGapsCanonicalReinitTests(unittest.TestCase):
+    """ADR 0021 冒烟: repair 副本产出 snapshot; 原输入不变; re-init +
+    materialize 后指纹必然变化; 无空洞幂等 no-op。"""
 
     def setUp(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -129,18 +110,21 @@ class RepairGapsResyncTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _prepare(self) -> None:
+    def _workspace_init(self, files: str = "template.xlsx|template.xlsx") -> None:
         wd = self.workdir
-        proc = run_py(wd, "prepare_run.py", "--workdir", ".",
-                      "--files", "source.xlsx|source.xlsx,template.xlsx|template.xlsx",
-                      "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(wd, "prepare_run.py", "--workdir", ".",
-                      "--flatten", "--sheets", "source.xlsx:SRC;template.xlsx:TPL",
-                      "--target", "template.xlsx")
+        proc = run_py(wd, "workspace_init.py", "--workdir", ".",
+                      "--init", "--files",
+                      "source.xlsx|source.xlsx,template.xlsx|template.xlsx"
+                      if "source.xlsx" not in files else files,
+                      "--sheets", "source.xlsx:SRC;template.xlsx:TPL",
+                      "--task", "row-gap canonical re-init e2e")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
-    def _manifest(self) -> dict:
+    def _materialize(self) -> dict:
+        from _fixtures.run_driver import materialize, target_entry_name
+        materialize(self.workdir,
+                    sources=target_entry_name("source", "SRC"),
+                    target=target_entry_name("template", "TPL"))
         return json.loads(
             (self.workdir / "prepare_manifest.json").read_text(encoding="utf-8"))
 
@@ -148,112 +132,101 @@ class RepairGapsResyncTests(unittest.TestCase):
         return json.loads(
             (self.workdir / "template_TPL_meta.json").read_text(encoding="utf-8"))
 
-    def _write_spec(self, target_fp: str) -> Path:
-        spec = {
-            "task": {"intent": "row-gap resync 契约", "selected_mod": "NONE",
-                     "selected_mod_revision": None},
-            "inputs": {"sources": ["source.xlsx"], "target": "template.xlsx",
-                       "source_sheets": [{"source": "source.xlsx", "sheets": ["SRC"]}],
-                       "target_sheet": "TPL"},
-            "fingerprints": {"source_structure": "unused-source-fp",
-                             "target_structure": target_fp},
-            "mapping": {"targets": [{
-                "sheet": "TPL", "base_last_row": 4,
-                "clone_roles": [{"role": "data", "template_row": 3}],
-                "rows": {"source": "source_SRC"},
-                "columns": [{"source": "A", "target": "A"}],
-            }]},
-            "decisions": [], "gaps": [],
-            "lineage": [{"source": "source_SRC_flat.csv", "role": "primary",
-                         "note": "row-gap resync fixture"}],
-            "validation": {"required_coverage": [], "required_empty": [],
-                           "key_outputs": ["A5"]},
-        }
-        p = self.workdir / "fill_spec.yaml"
-        p.write_text(yaml.safe_dump(spec, allow_unicode=True, sort_keys=False),
-                     encoding="utf-8")
-        return p
+    def test_repair_produces_snapshot_input_untouched(self):
+        """repair 在副本上修复: 产出 repaired snapshot, 原始 template.xlsx
+        一个字都不改 (immutable workspace, ADR 0021)。"""
+        self._manifest_before = None
+        wd = self.workdir
+        original_bytes = (wd / "template.xlsx").read_bytes()
 
-    def test_repair_resyncs_manifest_fingerprints(self):
-        """repair 后 manifest 指纹自动同步: == repair 输出 == 手工重 flatten
-        结果; 且与新指纹必不等于修复前 (指纹必然变化的机械事实)."""
-        self._prepare()
-        fp_before = self._manifest()["fingerprints"]["target_structure"]
-        src_fp_before = self._manifest()["fingerprints"]["source_structure"]
-        self.assertEqual(self._meta()["row_gaps"], [3])
-
-        proc = run_py(self.workdir, "repair_row_gaps.py", "--workdir", ".")
+        proc = run_py(wd, "repair_row_gaps.py", "--input", "template.xlsx",
+                      "--sheet", "TPL", "--out", "template.repaired.xlsx")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         out = json.loads(proc.stdout)
         self.assertEqual(out["code"], "ROW_GAPS_REPAIRED")
         self.assertEqual(out["repaired"], [3])
-        self.assertTrue(out["fingerprints_synced"])
-        new_fp = out["fingerprints"]["target_structure"]
 
-        m = self._manifest()
-        self.assertEqual(m["fingerprints"]["target_structure"], new_fp)
-        self.assertEqual(m["fingerprints"]["source_structure"], src_fp_before,
-                         "源侧指纹不受目标修复影响")
-        self.assertNotEqual(new_fp, fp_before,
-                            "行洞修复 = staged 文件修改 = 指纹必然变化")
-        self.assertEqual(self._meta()["row_gaps"], [])
+        # 原输入字节不变 (修复发生在副本上)
+        self.assertEqual((wd / "template.xlsx").read_bytes(), original_bytes,
+                         "repair 不得修改原输入 (immutable workspace)")
+        # snapshot 存在
+        self.assertTrue((wd / "template.repaired.xlsx").is_file())
 
-        # 手工重 flatten (仅目标) == repair 自动同步结果 (确定性)
-        proc = run_py(self.workdir, "prepare_run.py", "--workdir", ".",
-                      "--flatten", "--sheets", "template.xlsx:TPL",
-                      "--target", "template.xlsx")
+        # snapshot 无空洞 (机械验证)
+        import sys as _sys
+        _sys.path.insert(0, str(SCRIPTS))
+        import repair_row_gaps as rg  # noqa: PLC0415
+        sheet_path = rg.sheet_target_path(wd / "template.repaired.xlsx", "TPL")
+        self.assertEqual(rg.row_gaps_in(wd / "template.repaired.xlsx", sheet_path),
+                         [])
+
+    def test_canonical_reinit_yields_new_fingerprint(self):
+        """repaired snapshot 经 canonical re-init: 行洞修复 = 物理结构变化 =
+        target 指纹必然变化; re-materialize 投影出新指纹。"""
+        from _fixtures.run_driver import (
+            materialize, target_entry_name, workspace_init)
+        wd = self.workdir
+
+        # 1. 初始 workspace (带洞模板) → 指纹 A
+        workspace_init(wd,
+                       files="source.xlsx|source.xlsx,template.xlsx|template.xlsx",
+                       sheets="source.xlsx:SRC;template.xlsx:TPL",
+                       task="row-gap e2e round 1")
+        materialize(wd,
+                    sources=target_entry_name("source", "SRC"),
+                    target=target_entry_name("template", "TPL"))
+        fp_before = json.loads((wd / "prepare_manifest.json").read_text(
+            encoding="utf-8"))["fingerprints"]["target_structure"]
+        self.assertEqual(self._meta()["row_gaps"], [3])
+
+        # 2. repair 副本 → snapshot
+        proc = run_py(wd, "repair_row_gaps.py", "--input", "template.xlsx",
+                      "--sheet", "TPL", "--out", "template.repaired.xlsx")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        m2 = self._manifest()
-        self.assertEqual(m2["fingerprints"]["target_structure"], new_fp)
+        self.assertEqual(json.loads(proc.stdout)["code"], "ROW_GAPS_REPAIRED")
 
-    def test_repair_patch_spec_one_step(self):
-        """--patch-spec: 一步改写 fill_spec.yaml 的 target_structure 指纹
-        (旧 spec 会以 FILLSPEC_FINGERPRINT_MISMATCH 拒绝 → 补丁后匹配)."""
-        self._prepare()
-        fp_before = self._manifest()["fingerprints"]["target_structure"]
-        spec_path = self._write_spec(fp_before)
-
-        proc = run_py(self.workdir, "repair_row_gaps.py", "--workdir", ".",
-                      "--patch-spec", str(spec_path))
+        # 3. canonical re-init: 以 repaired snapshot 为新输入 (ADR 0021:
+        #    re-init 的 --files 换用 snapshot, 绝不原地改 staged 后局部续跑)
+        wd2 = wd / "round2"
+        wd2.mkdir()
+        src2 = wd2 / "source.xlsx"
+        shutil.copy2(wd / "source.xlsx", src2)
+        repaired = wd2 / "template.xlsx"
+        shutil.copy2(wd / "template.repaired.xlsx", repaired)
+        proc = run_py(wd2, "workspace_init.py", "--workdir", ".",
+                      "--init", "--files",
+                      "source.xlsx|source.xlsx,template.xlsx|template.xlsx",
+                      "--sheets", "source.xlsx:SRC;template.xlsx:TPL",
+                      "--task", "row-gap e2e round 2 (repaired snapshot)")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        docs = parse_json_docs(proc.stdout)
-        self.assertEqual(docs[0]["code"], "ROW_GAPS_REPAIRED")
-        self.assertEqual(docs[1]["code"], "SPEC_PATCHED")
-        new_fp = docs[0]["fingerprints"]["target_structure"]
-        self.assertEqual(Path(docs[1]["spec_patched"]), spec_path)
+        materialize(wd2,
+                    sources=target_entry_name("source", "SRC"),
+                    target=target_entry_name("template", "TPL"))
+        fp_after = json.loads((wd2 / "prepare_manifest.json").read_text(
+            encoding="utf-8"))["fingerprints"]["target_structure"]
 
-        spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
-        self.assertEqual(spec["fingerprints"]["target_structure"], new_fp)
-        self.assertNotEqual(new_fp, fp_before)
-        self.assertEqual(spec["task"]["intent"], "row-gap resync 契约",
-                         "--patch-spec 只改指纹, 不碰其余内容")
-
-    def test_repair_patch_spec_failure_keeps_fingerprints_visible(self):
-        """--patch-spec 失败 (exit 3) 时, 新指纹已在 stdout 首份 JSON 里 —
-        Agent 仍可抄进 spec; 重跑 repair 只会 NO_ROW_GAPS 不再带指纹."""
-        self._prepare()
-        bad = self.workdir / "bad_spec.yaml"
-        bad.write_text("task: {intent: no-fingerprints}\n", encoding="utf-8")
-        proc = run_py(self.workdir, "repair_row_gaps.py", "--workdir", ".",
-                      "--patch-spec", str(bad))
-        self.assertEqual(proc.returncode, 3)
-        self.assertIn("SPEC_FINGERPRINT_NOT_FOUND", proc.stderr)
-        docs = parse_json_docs(proc.stdout)
-        self.assertEqual(docs[0]["code"], "ROW_GAPS_REPAIRED")
-        self.assertEqual(docs[0]["fingerprints"]["target_structure"],
-                         self._manifest()["fingerprints"]["target_structure"])
+        # 物理结构变化 → 指纹必然变化 (机械事实); 无空洞
+        self.assertNotEqual(fp_after, fp_before,
+                            "行洞修复 = 物理结构变化 = 指纹必然变化")
+        meta2 = json.loads((wd2 / "template_TPL_meta.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(meta2["row_gaps"], [])
 
     def test_repair_no_gaps_is_idempotent_noop(self):
-        """无空洞时 NO_ROW_GAPS + fingerprints_synced=False (no-op, 幂等)."""
-        self._prepare()
-        run_py(self.workdir, "repair_row_gaps.py", "--workdir", ".")
-        m1 = self._manifest()
-        proc = run_py(self.workdir, "repair_row_gaps.py", "--workdir", ".")
+        """无空洞时 NO_ROW_GAPS (no-op, 幂等)。先修复带洞 fixture 产出
+        repaired snapshot, 再对 repaired snapshot 跑 → NO_ROW_GAPS。"""
+        wd = self.workdir
+        proc = run_py(wd, "repair_row_gaps.py", "--input", "template.xlsx",
+                      "--sheet", "TPL", "--out", "template.repaired.xlsx")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertEqual(json.loads(proc.stdout)["code"], "ROW_GAPS_REPAIRED")
+        # 对已修复的 snapshot 再跑 → 无洞 no-op (幂等)
+        proc = run_py(wd, "repair_row_gaps.py", "--input",
+                      "template.repaired.xlsx", "--sheet", "TPL",
+                      "--out", "template.repaired2.xlsx")
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         out = json.loads(proc.stdout)
         self.assertEqual(out["code"], "NO_ROW_GAPS")
-        self.assertFalse(out["fingerprints_synced"])
-        self.assertEqual(self._manifest()["fingerprints"], m1["fingerprints"])
 
 
 if __name__ == "__main__":

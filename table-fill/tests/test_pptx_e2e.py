@@ -101,17 +101,16 @@ class PptxEndToEndTests(unittest.TestCase):
                 pass
 
     def _run_pipeline(self, workdir: Path):
-        # 1. Prepare: outline + flatten the real table.
-        proc = run_py(workdir, "prepare_run.py", "--workdir", ".",
-                      "--files", f"{TEMPLATE}|template.pptx", "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(workdir, "prepare_run.py", "--workdir", ".",
-                      "--flatten", "--sheets", f"template.pptx:{TABLE}",
-                      "--target", "template.pptx")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-
-        manifest = json.loads((workdir / "prepare_manifest.json").read_text(
-            encoding="utf-8"))
+        # 1. Prepare: canonical init + materialize (ADR 0018). PPTX self-fill:
+        # the same staged file is both source and target entry.
+        from _fixtures.run_driver import prepare_single, target_entry_name
+        manifest = prepare_single(
+            workdir,
+            files=f"{TEMPLATE}|template.pptx",
+            sheets=f"template.pptx:{TABLE}",
+            sources=target_entry_name("template", TABLE),
+            target=target_entry_name("template", TABLE),
+            task="pptx e2e")
         fp = manifest["fingerprints"]
         src_name = manifest["target"]["name"]
         self.assertEqual(manifest["target"]["sheet"], TABLE)
@@ -171,7 +170,9 @@ class PptxEndToEndTests(unittest.TestCase):
             self.assertEqual(set(op["props"]), {"text"})
 
         # 4. Execute (pptx: no render QA — mechanism is value fills; readback
-        #    is the machine gate).
+        #    is the machine gate). Spec Review first (ADR 0019 Execute gate).
+        from _fixtures.run_driver import review_and_confirm
+        review_and_confirm(workdir)
         proc = run_py(workdir, "execute_batch.py", "--plan", "execution_plan.json",
                       "--template", "template.pptx", "--workdir", ".",
                       "--round", "1", "--render", "none")

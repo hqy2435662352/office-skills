@@ -839,20 +839,27 @@ class ModNominateTests(unittest.TestCase):
 
 
 class ReceiptHashTests(unittest.TestCase):
-    def _promote(self, workdir, expect_code):
+    """promote_output.py (deliver) — 哈希核对复制交付，无 gate、无 marker、无确认环节。
+
+    deliver 是唯一 post-verify 写入入口：读 draft_receipt.json，三方哈希核对
+    （spec/plan/draft） + 输入哈希三方核对（plan.input_hashes / receipt 执行时值 /
+    当前 staged 文件），任一漂移 → HASH_DRIFT (exit 3)；全一致 → 原子复制 + zip
+    确认 + final_receipt.json。"""
+
+    def _deliver(self, workdir, expect_code):
         with self.assertRaises(SystemExit) as ctx:
             sys.argv = ["promote_output", "--workdir", str(workdir),
                         "--final", str(workdir / "final.xlsx")]
             promote_output.main()
         self.assertEqual(ctx.exception.code, expect_code)
 
-    def _gate_workdir(self, tmp) -> tuple[Path, dict]:
-        """Workdir with real draft/spec/plan + staged inputs + receipt + gate."""
+    def _workdir(self, tmp) -> tuple[Path, dict]:
+        """Workdir with real draft/spec/plan + staged inputs + receipt."""
         import zipfile
         workdir = Path(tmp)
         draft = workdir / "validated_draft.xlsx"
         with zipfile.ZipFile(draft, "w") as z:
-            z.writestr("xl/workbook.xml", "<workbook/>")  # valid zip for the promote check
+            z.writestr("xl/workbook.xml", "<workbook/>")  # valid zip for the deliver check
         (workdir / "fill_spec.yaml").write_text("task: x", encoding="utf-8")
         (workdir / "source_maoli.xlsx").write_bytes(b"SOURCE-STAGED")
         (workdir / "template.xlsx").write_bytes(b"TEMPLATE-STAGED")
@@ -877,118 +884,50 @@ class ReceiptHashTests(unittest.TestCase):
             json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
         return workdir, hashes
 
-    def test_promotion_hash_mismatch_rejected(self):
+    def test_deliver_hash_mismatch_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, hashes = self._gate_workdir(tmp)
+            workdir, _hashes = self._workdir(tmp)
             (workdir / "draft_receipt.json").write_text(json.dumps(
                 {"draft_path": str(workdir / "validated_draft.xlsx"),
                  "draft_sha256": "0" * 64, "execution_plan_sha256": "1" * 64,
                  "fill_spec_sha256": "2" * 64}, ensure_ascii=False), encoding="utf-8")
-            # gate confirmed with the same (wrong) hashes → receipt still drifts
-            (workdir / ".gate3_confirmed").write_text(json.dumps(
-                {"hashes": {"fill_spec_sha256": "2" * 64,
-                            "execution_plan_sha256": "1" * 64,
-                            "draft_sha256": "0" * 64}}), encoding="utf-8")
-            self._promote(workdir, 3)
+            self._deliver(workdir, 3)
             self.assertFalse((workdir / "final.xlsx").exists())
 
-    def test_gate_confirm_requires_pending(self):
-        import execution_gate
+    def test_deliver_success(self):
         with tempfile.TemporaryDirectory() as tmp:
-            workdir = Path(tmp)
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
-            self.assertEqual(ctx.exception.code, 3)
-            self.assertFalse((workdir / ".gate3_confirmed").exists())
-
-    def test_gate_confirm_refuses_drifted_artifacts(self):
-        import execution_gate
-        with tempfile.TemporaryDirectory() as tmp:
-            workdir, _hashes = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            self.assertEqual(ctx.exception.code, 0)
-            # draft changes after presentation → confirm must refuse
-            (workdir / "validated_draft.xlsx").write_bytes(b"changed")
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
-            self.assertEqual(ctx.exception.code, 3)
-            self.assertFalse((workdir / ".gate3_confirmed").exists())
-
-    def test_gate_confirm_then_promote_ok(self):
-        import execution_gate
-        with tempfile.TemporaryDirectory() as tmp:
-            workdir, hashes = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            self.assertEqual(ctx.exception.code, 0)
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
-            self.assertEqual(ctx.exception.code, 0)
-            self.assertTrue((workdir / ".gate3_confirmed").exists())
-            self.assertFalse((workdir / ".gate3_pending").exists())
-            self._promote(workdir, 0)
+            workdir, hashes = self._workdir(tmp)
+            self._deliver(workdir, 0)
             self.assertTrue((workdir / "final.xlsx").exists())
             self.assertEqual(hashes["draft_sha256"],
                              promote_output.sha256_file(workdir / "final.xlsx"))
+            self.assertTrue((workdir / "final_receipt.json").exists())
 
-    def test_promote_requires_positive_confirmation(self):
+    def test_deliver_requires_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            # pending marker present but NO confirmed record → reject
-            (workdir / ".gate3_pending").write_text("pending", encoding="utf-8")
-            self._promote(workdir, 3)
-            # pending marker GONE but still no confirmed record → reject
-            (workdir / ".gate3_pending").unlink()
-            self._promote(workdir, 3)
+            workdir, _ = self._workdir(tmp)
+            (workdir / "draft_receipt.json").unlink()
+            self._deliver(workdir, 1)
 
-    def test_promote_refuses_confirmed_hash_drift(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            (workdir / ".gate3_confirmed").write_text(json.dumps(
-                {"hashes": {"fill_spec_sha256": "a" * 64,
-                            "execution_plan_sha256": "b" * 64,
-                            "draft_sha256": "c" * 64}}), encoding="utf-8")
-            self._promote(workdir, 3)
-
-    def test_promote_preserves_existing_final_on_replace_failure(self):
+    def test_deliver_preserves_existing_final_on_replace_failure(self):
         """The pre-existing final file must survive a failed atomic replace —
-        promotion never deletes the old final before the new one is staged."""
-        import execution_gate
+        delivery never deletes the old final before the new one is staged."""
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
+            workdir, _ = self._workdir(tmp)
             final = workdir / "final.xlsx"
             final.write_bytes(b"OLD-DELIVERED-FILE")
             with mock.patch("pathlib.Path.replace", side_effect=OSError("locked by Excel")):
-                self._promote(workdir, 3)
+                self._deliver(workdir, 3)
             # old final intact, staging temp cleaned up
             self.assertEqual(final.read_bytes(), b"OLD-DELIVERED-FILE")
             self.assertFalse((workdir / "final.xlsx.promoting").exists())
 
-    def test_promote_verifies_staged_copy_before_replace(self):
+    def test_deliver_verifies_staged_copy_before_replace(self):
         """A corrupt staged copy must be rejected BEFORE the old final is touched."""
-        import execution_gate
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
+            workdir, _ = self._workdir(tmp)
             final = workdir / "final.xlsx"
             final.write_bytes(b"OLD-DELIVERED-FILE")
             real_copy2 = promote_output.shutil.copy2
@@ -999,57 +938,36 @@ class ReceiptHashTests(unittest.TestCase):
                     f.write(b"EXTRA-CORRUPTION")
 
             with mock.patch("promote_output.shutil.copy2", side_effect=corrupt_copy):
-                self._promote(workdir, 3)
+                self._deliver(workdir, 3)
             self.assertEqual(final.read_bytes(), b"OLD-DELIVERED-FILE")
 
-    def test_promote_rejects_source_input_drift(self):
-        """Staged SOURCE changed after the gate → HASH_DRIFT (exit 3), no final."""
-        import execution_gate
+    def test_deliver_rejects_source_input_drift(self):
+        """Staged SOURCE changed after verify → HASH_DRIFT (exit 3), no final."""
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
+            workdir, _ = self._workdir(tmp)
             (workdir / "source_maoli.xlsx").write_bytes(b"TAMPERED-SOURCE")
-            self._promote(workdir, 3)
+            self._deliver(workdir, 3)
             self.assertFalse((workdir / "final.xlsx").exists())
 
-    def test_promote_rejects_template_input_drift(self):
-        """Staged TEMPLATE changed after the gate → HASH_DRIFT (exit 3)."""
-        import execution_gate
+    def test_deliver_rejects_template_input_drift(self):
+        """Staged TEMPLATE changed after verify → HASH_DRIFT (exit 3)."""
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
+            workdir, _ = self._workdir(tmp)
             (workdir / "template.xlsx").write_bytes(b"TAMPERED-TEMPLATE")
-            self._promote(workdir, 3)
+            self._deliver(workdir, 3)
             self.assertFalse((workdir / "final.xlsx").exists())
 
-    def test_promote_rejects_missing_input_evidence(self):
+    def test_deliver_rejects_missing_input_evidence(self):
         """Receipt without execution-time input hashes → HASH_DRIFT (fail-closed)."""
-        import execution_gate
         with tempfile.TemporaryDirectory() as tmp:
-            workdir, _ = self._gate_workdir(tmp)
+            workdir, _ = self._workdir(tmp)
             receipt = json.loads(
                 (workdir / "draft_receipt.json").read_text(encoding="utf-8"))
             del receipt["source_hashes"]
             del receipt["template_sha256"]
             (workdir / "draft_receipt.json").write_text(
                 json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--set", "--workdir", str(workdir)]
-                execution_gate.main()
-            with self.assertRaises(SystemExit):
-                sys.argv = ["execution_gate", "--confirm", "--workdir", str(workdir)]
-                execution_gate.main()
-            self._promote(workdir, 3)
+            self._deliver(workdir, 3)
             self.assertFalse((workdir / "final.xlsx").exists())
 
 
@@ -1660,43 +1578,6 @@ class OverflowDetectorBackingTests(unittest.TestCase):
         self.assertEqual(classify_issue("A5", "empty",
                                         "cell value is empty"), "empty_cell")
         self.assertEqual(classify_issue("A5", "", "ok"), "unknown")
-
-
-class NotePhaseTests(unittest.TestCase):
-    def test_note_phase_records_gap(self):
-        import note_phase
-        with tempfile.TemporaryDirectory() as tmp:
-            workdir = Path(tmp)
-            (workdir / "run_timing.json").write_text(json.dumps([
-                {"kind": "machine", "phase": "prepare_flatten",
-                 "started_at": "2026-08-10T10:00:00", "duration_ms": 10000},
-            ]), encoding="utf-8")
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["note_phase", "--workdir", str(workdir), "--phase", "spec_authoring"]
-                note_phase.main()
-            self.assertEqual(ctx.exception.code, 0)
-            entries = json.loads((workdir / "run_timing.json").read_text(encoding="utf-8"))
-            agent = entries[-1]
-            self.assertEqual(agent["kind"], "agent")
-            self.assertEqual(agent["phase"], "spec_authoring")
-            # gap since the machine entry finished (>=0s, measured in wall time)
-            self.assertGreaterEqual(agent["duration_ms"], 0)
-            self.assertEqual(agent["started_at"], "2026-08-10T10:00:10")
-
-    def test_note_phase_chains_agent_entries(self):
-        import note_phase
-        with tempfile.TemporaryDirectory() as tmp:
-            workdir = Path(tmp)
-            (workdir / "run_timing.json").write_text(json.dumps([
-                {"kind": "agent", "phase": "spec_authoring",
-                 "started_at": "2026-08-10T10:00:00", "duration_ms": 600000},
-            ]), encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sys.argv = ["note_phase", "--workdir", str(workdir), "--phase", "compile_review"]
-                note_phase.main()
-            entries = json.loads((workdir / "run_timing.json").read_text(encoding="utf-8"))
-            self.assertEqual(entries[-1]["started_at"], "2026-08-10T10:10:00")  # 10min later
-            self.assertEqual(entries[-1]["kind"], "agent")
 
 
 class MultiSourceTests(unittest.TestCase):
@@ -4882,12 +4763,11 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(r["operations"], len(plan["operations"]))
 
     def test_probe_writes_no_artifacts(self):
-        """probe 零副作用: 不写 execution_plan.json / mapping.md / run_timing.json."""
+        """probe 零副作用: 不写 execution_plan.json / mapping.md."""
         spec = spec_with(self.wd)
         self._probe(spec)
         self.assertFalse((self.tmp / "execution_plan.json").exists())
         self.assertFalse((self.tmp / "mapping.md").exists())
-        self.assertFalse((self.tmp / "run_timing.json").exists())
 
     def test_probe_rejected_writes_no_artifacts(self):
         spec = spec_with(self.wd)
@@ -4898,7 +4778,6 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(r["accepted"])
         self.assertFalse((self.tmp / "execution_plan.json").exists())
         self.assertFalse((self.tmp / "mapping.md").exists())
-        self.assertFalse((self.tmp / "run_timing.json").exists())
 
     def test_combination_pattern_renamed_columns_compiles(self):
         """组合模式片段复制即用实证: combination_patterns.yaml
@@ -4993,8 +4872,7 @@ class CapabilityQueryTests(unittest.TestCase):
 
     NAMESPACE = ["matrix", "matrix.field_locator", "matrix.record_map",
                  "matrix.transforms", "matrix.literal_fallback", "inplace",
-                 "inplace.placeholder_ownership", "task.assembly",
-                 "semantic_gate"]
+                 "inplace.placeholder_ownership"]
     STATES = ("SUPPORTED", "REJECTED", "NOT_ROLLED_OUT")
 
     def _run(self, *argv: str) -> subprocess.CompletedProcess:
@@ -5357,9 +5235,9 @@ class DocCoverageGuardTests(unittest.TestCase):
 
     def test_skill_md_formula_zero_policy_duality(self):
         """SKILL「公式约定」0-口径段含二分词 (issue 01): 入公式链 → 数值 0,
-        独立展示才可留空."""
+        独立展示才可留空; 禁止 IF(J="","",...) 空白渲染公式."""
         text = self._skill_md_text()
-        for word in ("入公式链", "数值 0", "独立展示", "IFERROR", "兜底"):
+        for word in ("入公式链", "数值 0", "独立展示", "IF(J"):
             self.assertIn(word, text, f"SKILL.md 缺 0-口径二分词 {word!r}")
 
     def test_known_traps_zero_policy_formula_chain(self):
@@ -5577,11 +5455,11 @@ class DocCoverageGuardTests(unittest.TestCase):
         return p.read_text(encoding="utf-8")
 
     def _skill_routing_section(self) -> str:
-        """SKILL.md §1.5 Task Shape Check (Routing V2) 区域 (防跨章节误伤)."""
+        """SKILL.md §3 Task Shape Check (Routing V2, S2) 区域 (防跨章节误伤)."""
         text = self._skill_md_text()
-        m = re.search(r"^### 1\.5 Task Shape Check.*?(?=^### 2\. )",
+        m = re.search(r"^### 3\. Task Shape Check.*?(?=^### 4\. )",
                       text, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(m, "SKILL.md 缺 §1.5 Task Shape Check 段")
+        self.assertIsNotNone(m, "SKILL.md 缺 §3 Task Shape Check 段")
         return m.group(0)
 
     def _capability_evidence_section0(self) -> str:
@@ -5631,10 +5509,10 @@ class DocCoverageGuardTests(unittest.TestCase):
     def test_skill_md_rescue_formalities_pointer(self):
         """SKILL.md 预算行 (issue 03 rehearsal S6 发现): Rescue 使用前按
         CAPABILITY_EVIDENCE.md §4 合同执行 — 预声明 question/plan/verdict、
-        workdir Run-local 记录、Gate 披露一句、无结论时 ASK/STOP 边界 —
+        workdir Run-local 记录、交付呈报一句、无结论时 ASK/STOP 边界 —
         主 Skill 至少给出形式要求指针 (详细合同仍在按需参考, 不复制政策)."""
         text = self._skill_md_text()
-        for word in ("预声明", "Run-local 记录", "Gate 披露", "未制度化",
+        for word in ("预声明", "Run-local 记录", "交付呈报一句",
                      "CAPABILITY_EVIDENCE.md", "ASK", "STOP"):
             self.assertIn(word, text, f"SKILL.md 缺 Rescue 形式指针词 {word!r}")
 
@@ -5877,25 +5755,25 @@ class DocCoverageGuardTests(unittest.TestCase):
                       "§1.5 缺立即进 MOD stop-rule 词")
 
     def test_skill_md_combined_final_gate_order(self):
-        """Combined 最小契约 (issue 01/03, R2-Q4): 单一 Final Gate 延后至
-        全部写操作完成 — 契约块含 单一 Final Gate, OfficeCLI finishing 步骤
-        在 Gate 之前; 正文声明 'officecli finishing 在 Gate 之前执行'.
-        (finishing 与 Gate 的相对顺序被颠倒时变红.)"""
+        """Combined 最小契约 (v3 收敛): verify 延后至全部写操作完成 — 契约块含
+        verify 全绿交付, OfficeCLI finishing 步骤在 verify 之前; 正文声明
+        'officecli finishing 在 verify 之前执行'.
+        (finishing 与 verify 的相对顺序被颠倒时变红.)"""
         section = self._skill_routing_section()
         m = re.search(r"#### Combined 最小契约.*?```text\n(.*?)```",
                       section, re.DOTALL)
         self.assertIsNotNone(m, "§1.5 缺 Combined 最小契约块")
         block = re.sub(r"[\s`]", "", m.group(1))
-        self.assertIn("单一FinalGate", block,
-                      "Combined 契约缺 单一 Final Gate")
+        self.assertIn("verify全绿", block,
+                      "Combined 契约缺 verify 全绿交付")
         self.assertIn("OfficeCLIfinishing", block,
                       "Combined 契约缺 OfficeCLI finishing 步骤")
         self.assertLess(block.index("OfficeCLIfinishing"),
-                        block.index("单一FinalGate"),
-                        "finishing 必须先于 Final Gate (单一 Final Gate 延后至全部写操作完成)")
+                        block.index("verify全绿"),
+                        "finishing 必须先于 verify (verify 延后至全部写操作完成)")
         stripped = re.sub(r"[\s`]", "", section)
-        self.assertIn("finishing在Gate之前执行", stripped,
-                      "§1.5 缺 finishing 在 Gate 之前执行的顺序关键句")
+        self.assertIn("finishing在verify之前执行", stripped,
+                      "§1.5 缺 finishing 在 verify 之前执行的顺序关键句")
 
     def test_old_universal_probe_and_escape_hatch_removed(self):
         """旧流程被原子替换 (migrate facts, replace process): 普遍 probe、
@@ -5970,12 +5848,13 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("nonempty", section)
 
     def test_skill_md_failure_cost_quantified(self):
-        """SKILL.md 撰写规程量化失败成本: 第 1 轮失败是预期路径, 修复 <2 分钟,
-        预算约束连续失败而非单次失败 (消除'怕失败读源码'的动机)."""
+        """SKILL.md 失败处置量化: 第 1 轮失败是预期路径 (REPAIR), 预算约束
+        连续失败而非单次失败 (第 2 次连续失败才 ASK/STOP — 消除'怕失败读源码'
+        的动机; 时间预算已退役, Observability 无时间限制)."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("预期路径", text)
-        self.assertIn("2 分钟", text)
         self.assertIn("连续失败", text)
+        self.assertIn("第 2 次连续失败", text)
 
     def test_fillspec_q11_q12_sections(self):
         """契约章节含 Q11 (克隆携带合并) 与 Q12 (merges×aggregates/多组聚合)."""
@@ -6361,7 +6240,7 @@ class DocCoverageGuardTests(unittest.TestCase):
         """MOD Resolution 补: MOD conflict 且排除信号命中 → 不再读 MOD 全文核对
         排除信号是否误报, 直接 fail-closed ASK (领域判断不改变裁决机制)."""
         text = self._skill_md_text()
-        m = re.search(r"^### 2\. MOD Resolution.*?(?=^### 3\.)",
+        m = re.search(r"^### 4\. MOD Resolution.*?(?=^### 5\.)",
                       text, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(m, "SKILL.md 缺 MOD Resolution 段")
         section = m.group(0)
@@ -6406,10 +6285,11 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("MOD_TEMPLATE", text)
 
     def test_skill_md_prepare_sheets_all_at_once(self):
-        """SKILL.md prepare 阶段 B: 一次列出全部源 sheet, 增量展平是兜底."""
+        """SKILL.md Workspace Init: --sheets 一次声明本 Job 业务 sheet 并集
+        (Selective Flatten — 角色中立 ≠ 全簿展平; 无 --target)."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("一次列出全部源 sheet", text)
-        self.assertIn("兜底", text)
+        self.assertIn("业务 sheet 并集", text)
+        self.assertIn("角色中立 ≠ 全簿展平", text)
 
     def test_fillspec_q15_lookup_integrity_section(self):
         """契约章节含 Q15: 空索引 → LOOKUP_TABLE_EMPTY (exit 3); 整列未命中 →
@@ -6491,7 +6371,7 @@ class DocCoverageGuardTests(unittest.TestCase):
         裁决后才加载选中 MOD 完整规则; 「候选规则必须加载后才可写 spec」
         的硬性要求保留 (改变加载时机与粒度, 不是是否加载)."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        m = re.search(r"^### 2\. MOD Resolution.*?(?=^### 3\.)",
+        m = re.search(r"^### 4\. MOD Resolution.*?(?=^### 5\.)",
                       text, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(m, "SKILL.md 缺 MOD Resolution 段")
         section = m.group(0)
@@ -6638,16 +6518,22 @@ class DocCoverageGuardTests(unittest.TestCase):
             self.assertIn(word, text)
 
     def test_skill_md_repair_auto_flatten(self):
-        """SKILL.md prepare 段: repair 后 flatten 已自动, 唯一动作 = 更新
-        spec 指纹 + 重编译."""
+        """SKILL.md row-gap repair 是 input-version repair (ADR 0021): §1
+        Workspace Init 指针 → 失败处置表 ROW_GAP_DETECTED — 副本修复 →
+        repaired snapshot → canonical re-init; 绝不原地改 staged 后局部续跑
+        (auto-resync/patch-spec 已退役)."""
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        m = re.search(r"^### 1\. Prepare.*?(?=^### 2\.)",
+        m = re.search(r"^### 1\. Workspace Init.*?(?=^### 2\.)",
                       text, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(m, "SKILL.md 缺 Prepare 段")
+        self.assertIsNotNone(m, "SKILL.md 缺 Workspace Init 段")
         section = m.group(0)
-        for word in ("repair_row_gaps.py", "自动重跑 flatten", "patch-spec",
-                     "唯一动作"):
+        for word in ("新输入快照", "重新 `--init`", "绝不原地改 staged 后局部续跑"):
             self.assertIn(word, section)
+        # 失败处置表: repair 是 canonical re-init 完整语义
+        for word in ("repair_row_gaps.py", "repaired input snapshot",
+                     "workspace_init --init", "刷新 FillSpec fingerprints",
+                     "Compile", "Spec Review", "Execute"):
+            self.assertIn(word, text, f"失败处置表缺 ROW_GAP 语义词 {word!r}")
 
     def test_fillspec_yaml_discipline_whole_line_quote(self):
         """FILLSPEC「YAML 纪律」契约条目: decisions/gaps 条目含 ': ' →

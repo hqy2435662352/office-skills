@@ -118,18 +118,16 @@ class MxpEndToEndTests(unittest.TestCase):
         shutil.copy2(TEMPLATE_SNAPSHOT, workdir / "template.xlsx")
         shutil.copy2(SOURCE_SNAPSHOT, workdir / "source.xlsx")
 
-        # Prepare: outline + flatten.
-        proc = run_py(workdir, "prepare_run.py", "--workdir", ".",
-                      "--files", "source.xlsx|source.xlsx,template.xlsx|template.xlsx",
-                      "--outline")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        proc = run_py(workdir, "prepare_run.py", "--workdir", ".",
-                      "--flatten",
-                      "--sheets", "source.xlsx:17_MXP;template.xlsx:ATLAS Quotation",
-                      "--target", "template.xlsx")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-
-        manifest = json.loads((workdir / "prepare_manifest.json").read_text(encoding="utf-8"))
+        # Prepare: canonical init + materialize (ADR 0018 — workspace_init is
+        # role-neutral, no --target; materialize_run projects the run view).
+        from _fixtures.run_driver import prepare_single, target_entry_name
+        manifest = prepare_single(
+            workdir,
+            files="source.xlsx|source.xlsx,template.xlsx|template.xlsx",
+            sheets="source.xlsx:17_MXP;template.xlsx:ATLAS Quotation",
+            sources=target_entry_name("source", "17_MXP"),
+            target=target_entry_name("template", "ATLAS Quotation"),
+            task="MXP 报价单 e2e")
         fp = manifest["fingerprints"]
 
         # Lookup fixtures (business decisions from the mapping table).
@@ -240,7 +238,10 @@ class MxpEndToEndTests(unittest.TestCase):
 
         # Execute (html render QA — text-only model fallback; the visual
         # verdict is the agent's, the artifact + structural receipt is the
-        # machine's).
+        # machine's). Spec Review first — the Execute gate rejects
+        # missing/stale review_confirm (ADR 0019).
+        from _fixtures.run_driver import review_and_confirm
+        review_and_confirm(workdir)
         proc = run_py(workdir, "execute_batch.py", "--plan", "execution_plan.json",
                       "--template", "template.xlsx", "--workdir", ".",
                       "--round", "1", "--render", "html")
