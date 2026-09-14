@@ -49,6 +49,7 @@ from _officecli import (  # noqa: E402
     officecli, officecli_validate, read_cell,
     resolve_check_path, sha256_file,
 )
+from flatten_table import cell_style_ids  # noqa: E402  (xlsx 结构事实唯一实现地)
 
 CHUNK_SIZE = 50
 DRAFT_NAME = "validated_draft"
@@ -403,6 +404,45 @@ def check_group_boundaries(book: Path, entries: list) -> list:
     return failures
 
 
+def check_clone_style_fidelity(draft: Path, plan: dict) -> list:
+    """Readback: newly added rows must carry the reference block's formatting.
+
+    Plan carries ``clone_style_reference`` (per sheet: the style-profile vector
+    of an anchor data row established at compile time). Every data row written
+    by this plan is compared against it column by column. Divergence means the
+    clone source was an unstyled merge-member row — the exact defect that
+    validate / issues / readback / render all reported green on (2026-09).
+
+    Silent no-op when the plan carries no reference (older plans / no style
+    info): "cannot judge" must never be reported as "broken".
+    """
+    refs = plan.get("clone_style_reference") or {}
+    if not refs:
+        return []
+    failures = []
+    for sheet, spec in refs.items():
+        cols = spec.get("cols") or []
+        expected = spec.get("profile") or []
+        rows = spec.get("rows") or []
+        if not (cols and expected and rows):
+            continue
+        try:
+            ids = cell_style_ids(draft, sheet)
+        except Exception:
+            continue
+        for r in rows:
+            actual = [ids.get(f"{c}{r}") for c in cols]
+            diff = [cols[i] for i, (a, e) in enumerate(zip(actual, expected))
+                    if a != e]
+            if diff:
+                failures.append({
+                    "sheet": sheet, "row": r, "columns": diff,
+                    "code": "CLONE_STYLE_FIDELITY_MISMATCH",
+                    "expected_profile": expected, "actual_profile": actual,
+                })
+    return failures
+
+
 def render_qa(workdir: Path, draft: Path, region: str, mode: str) -> dict:
     """Capability-aware Render QA. Deterministic QA already ran;
     this renders ONLY the affected region for visual (png) or structural
@@ -706,6 +746,18 @@ def main() -> None:
         if group_failures:
             structural["pass"] = False
             structural["failures"].extend(group_failures)
+
+        # 3c. 克隆源样式保真 (recorded 2026-09): data 行克隆源若是"合并非锚点
+        #     但不带块内格式"的行, 新块的类别列与聚合合并区会丢字体/填充/边框,
+        #     而 validate / issues / readback / render 全绿 — 编译期已有
+        #     CLONE_SOURCE_STYLE_MISMATCH 拦截, 这里是在**产物**上再证一次
+        #     (编译期判的是模板, 这里判的是真正写出来的 draft)。
+        style_failures = check_clone_style_fidelity(draft_path, plan)
+        structural["style_fidelity"] = {"pass": not style_failures,
+                                        "failures": style_failures}
+        if style_failures:
+            structural["pass"] = False
+            structural["failures"].extend(style_failures)
 
     # 4. Source coverage (per-source entries in multi-source plans).
     coverage = plan.get("source_coverage", [])

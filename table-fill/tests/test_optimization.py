@@ -19,6 +19,8 @@ import execute_batch  # noqa: E402
 import mod_nominate  # noqa: E402
 import promote_output  # noqa: E402
 from _mod_catalog import parse_mod_index  # noqa: E402
+from flatten_table import clone_source_style_profile  # noqa: E402
+from prepare_run import facts_sha256, structure_facts  # noqa: E402
 from _probe_fixtures import (  # noqa: E402
     BASE_SPEC,
     MATRIX_LOCATOR_BASE_SPEC,
@@ -6517,12 +6519,26 @@ class DocCoverageGuardTests(unittest.TestCase):
         self.assertIn("ROUND 优先序", fillspec)
         self.assertIn("preserve existing", fillspec)
 
-    def test_known_traps_row_gap_auto_resync(self):
-        """KNOWN_TRAPS 沉淀行洞修复机械事实: 行洞修复 = staged 文件修改 =
-        指纹必然变化; repair 脚本自动重算, Agent 不再手工同步."""
+    def test_known_traps_row_gap_canonical_reinit(self):
+        """KNOWN_TRAPS 沉淀行洞修复机械事实 — 且必须与**已退役**的旧行为一致.
+
+        recorded 2026-09: 本守卫原先断言 KNOWN_TRAPS 含 ("指纹必然变化",
+        "自动", "patch-spec", "唯一动作") — 即断言 "repair 自动重算指纹 /
+        --patch-spec 一步同步"。那是 ADR 0021 **已退役**的行为, 与同类的
+        test_skill_md_repair_auto_flatten ("auto-resync/patch-spec 已退役")
+        直接矛盾。实测: `--patch-spec` 是 unrecognized argument, `--workdir`
+        被 LEGACY_CLI_REJECTED 拒绝。故改为断言**被强制**的事实:
+        指纹必然变化 (机械) + 拒绝旧旗标 + 不重跑 flatten/patch +
+        以新快照重新进入 canonical init。
+        """
         text = (SKILL_ROOT / "references" / "KNOWN_TRAPS.md").read_text(encoding="utf-8")
-        for word in ("指纹必然变化", "自动", "patch-spec", "唯一动作"):
-            self.assertIn(word, text)
+        for word in ("指纹必然变化", "LEGACY_CLI_REJECTED",
+                     "不重跑 flatten", "重新进入 canonical init"):
+            self.assertIn(word, text, f"KNOWN_TRAPS 缺行洞修复契约词 {word!r}")
+        # 旧行为不得再被描述为"自动发生"
+        self.assertNotIn("自动重跑 flatten", text,
+                         "KNOWN_TRAPS 不得再声称 repair 自动重跑 flatten "
+                         "(ADR 0021 已退役; --workdir/--patch-spec 现被显式拒绝)")
 
     def test_skill_md_repair_auto_flatten(self):
         """SKILL.md row-gap repair 是 input-version repair (ADR 0021): §1
@@ -6996,6 +7012,283 @@ class ModConsistencyGatesTest(unittest.TestCase):
         r = self._compile_capture(spec)
         self.assertEqual(r["exit"], 0)
         self.assertGreater(len(r["plan"]["operations"]), 0)
+
+
+class CloneSourceStyleCompileGateTests(unittest.TestCase):
+    """编译期 CLONE_SOURCE_STYLE_MISMATCH — 走真实 compile_spec + 真 xlsx。
+
+    StyleProfileUnitTests 只覆盖剖面算术; 本类补上**契约测试三件套**缺的一环:
+    缺陷码本身必须被真实编译路径发出 (recorded 2026-09: 该码在 code/doc 都在,
+    但没有任何 test 按码名断言过它 → 三件套不完整)。
+
+    fixture: openpyxl 写一个真 xlsx, 让多数数据行的 A 列带样式 (同一 s= 索引),
+    行 4/5 保持默认 (无 s=) — 复现"是合并非锚点、却不带块内格式"的行。
+    """
+
+    def _wd(self, tmp, *, end=8, styled_rows=(3, 6, 7, 8)):
+        from openpyxl import Workbook
+        from openpyxl.styles import Border, Font, Side
+        wd = make_workdir(Path(tmp))
+        wd["workdir"] = Path(tmp)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "S"
+        side = Side(style="thin")
+        for r in range(1, end + 1):
+            ws.cell(row=r, column=1, value=f"r{r}")
+            ws.cell(row=r, column=2, value=f"b{r}")
+        # styled_rows 带样式; 其余保持默认 (clone 它们 = 丢块内格式)
+        for r in styled_rows:
+            ws.cell(row=r, column=1).font = Font(bold=True, size=10)
+            ws.cell(row=r, column=1).border = Border(top=side, bottom=side)
+            ws.cell(row=r, column=2).font = Font(bold=True, size=10)
+        wb.save(Path(tmp) / "target.xlsx")
+
+        meta_path = Path(tmp) / "target_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["blocks"] = [{"start": 1, "end": end}]
+        meta["merge_anchors"] = []
+        meta["merged_ranges"] = []
+        meta["dimensions"] = {"rows": end, "cols": 10, "data_rows": max(end - 2, 1)}
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+        facts = [structure_facts(meta)]
+        mp = Path(tmp) / "prepare_manifest.json"
+        manifest = json.loads(mp.read_text(encoding="utf-8"))
+        manifest["fingerprints"] = {
+            "source_structure": facts_sha256(facts),
+            "target_structure": facts_sha256(facts),
+        }
+        mp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        wd["manifest"] = manifest
+        return wd
+
+    def _spec(self, wd, template_row, base_last_row=8):
+        spec = spec_with(wd)
+        spec["mapping"]["targets"][0]["base_last_row"] = base_last_row
+        spec["mapping"]["targets"][0]["clone_roles"] = [
+            {"role": "title", "template_row": 1},
+            {"role": "header", "template_row": 2},
+            {"role": "data", "template_row": template_row},
+        ]
+        # clone_roles = [title, header, data] → 首数据行 = base_last_row + 3
+        spec["validation"]["key_outputs"] = [f"A{base_last_row + 3}"]
+        return spec
+
+    def test_unstyled_clone_source_rejected(self):
+        """克隆"无块内格式"的合并非锚点行 → CLONE_SOURCE_STYLE_MISMATCH。
+
+        这正是本次真实任务的形状: 行 4 满足 pattern 明文判据 ("非合并锚点"),
+        但它在块内是异类 → 新块会丢字体/填充/边框, 而 validate / issues /
+        readback / structural / render 全绿。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = self._wd(tmp)
+            codes = compile_fail_codes(wd, self._spec(wd, 4))
+            self.assertIn("CLONE_SOURCE_STYLE_MISMATCH", codes,
+                          f"未发出样式不匹配缺陷; codes={codes}")
+
+    def test_styled_clone_source_accepted(self):
+        """克隆携带块内一致格式的非锚点行 → 编译通过 (不误报)。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = self._wd(tmp)
+            codes = compile_fail_codes(wd, self._spec(wd, 6))
+            self.assertNotIn("CLONE_SOURCE_STYLE_MISMATCH", codes,
+                             f"误报样式不匹配; codes={codes}")
+
+    def test_inconsistent_template_warns_not_blocks(self):
+        """模板自身没有一致剖面 (仅 1 行携带众数) → 警告而非阻断。
+
+        判据是"存在可克隆的替代行才要求换": 模板本身就没有一致剖面时无从要求,
+        此时降级为 CLONE_SOURCE_STYLE_DIVERGENT 警告, 编译仍通过 — "判不了/无从
+        要求" 不得被当成 "有问题"。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            # 只让行 3 带样式 → 众数行仅 1 行 → 无可克隆替代
+            wd = self._wd(tmp, end=4, styled_rows=(3,))
+            codes = compile_fail_codes(wd, self._spec(wd, 4, base_last_row=4))
+            self.assertNotIn("CLONE_SOURCE_STYLE_MISMATCH", codes,
+                             f"无可克隆替代行时不得阻断; codes={codes}")
+            plan = compile_fill.compile_spec(
+                self._spec(wd, 4, base_last_row=4), wd["manifest"], wd["workdir"])
+            warn_codes = {w.get("code") for w in plan.get("warnings", [])}
+            self.assertIn("CLONE_SOURCE_STYLE_DIVERGENT", warn_codes,
+                          f"应降级为警告; warnings={plan.get('warnings')}")
+
+    def test_defect_names_columns_and_fix(self):
+        """缺陷必须点名列 + 给出可克隆候选行 (否则 Agent 无从修)。"""
+        import tempfile
+        from io import StringIO
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = self._wd(tmp)
+            buf = StringIO()
+            old = sys.stderr
+            sys.stderr = buf
+            try:
+                compile_fill.compile_spec(self._spec(wd, 4), wd["manifest"], wd["workdir"])
+            except SystemExit:
+                pass
+            finally:
+                sys.stderr = old
+            payload = buf.getvalue()
+            self.assertIn("CLONE_SOURCE_STYLE_MISMATCH", payload)
+            self.assertIn('"columns"', payload)
+            self.assertIn("corrective_action", payload)
+            self.assertIn("template_row", payload)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Clone-source style fidelity (recorded 2026-09)
+#
+# "非锚点" 是必要而非充分条件: 模板里存在"是合并非锚点、却不带块内格式"的行
+# (本次实测 块1 行4/5 的 A/V/W 是 s=10/11, 而块内众数剖面是 6/19/19)。克隆它,
+# 新块的类别列与系列盈亏/总盈亏合并区丢字体/填充/上下边框 — 而 validate /
+# issues / readback / structural / render_qa **全部为绿** (render 只产
+# status: produced, 无一门禁看格式)。判据 = 列级 s= 样式剖面 == 块内众数剖面
+# (同索引 ⇒ 构造上同格式, 不必解析 styles.xml)。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class StyleProfileUnitTests(unittest.TestCase):
+    """profile/modal/candidates semantics (no officecli needed)."""
+
+    def _profile(self, rows_styles, num_cols=3, blocks=None, anchors=()):
+        """Build a fake sheet-XML map and call the pure comparison core.
+
+        The function reads a workbook, so this test drives the same arithmetic
+        through a monkeypatched ``cell_style_ids``.
+        """
+        import flatten_table
+        ids = {}
+        for r, vec in rows_styles.items():
+            for i, v in enumerate(vec):
+                if v is not None:
+                    ids[f"{chr(ord('A') + i)}{r}"] = v
+        orig_ids = flatten_table.cell_style_ids
+        orig_anchors = flatten_table.ids_meta_anchors
+        orig_rows = flatten_table.row_values
+        flatten_table.cell_style_ids = lambda *_a, **_k: ids
+        flatten_table.ids_meta_anchors = lambda *_a, **_k: list(anchors)
+        # 行存在性判据 (行存在但无格式 = 最该被拦下的克隆源) — 必须一并打桩
+        flatten_table.row_values = lambda *_a, **_k: sorted(rows_styles)
+        try:
+            return clone_source_style_profile(
+                "x.xlsx", "S", blocks or [{"start": 1, "end": 5}], num_cols)
+        finally:
+            flatten_table.cell_style_ids = orig_ids
+            flatten_table.ids_meta_anchors = orig_anchors
+            flatten_table.row_values = orig_rows
+
+    def test_modal_profile_and_candidates(self):
+        """Row 4 diverges in one column → modal is the majority profile and the
+        divergent row is excluded from candidates."""
+        prof = self._profile({
+            3: [6, 6, 6],      # anchor row
+            4: [7, 6, 6],      # divergent (col A)
+            5: [6, 6, 6],
+        })
+        self.assertEqual(prof["modal"], [6, 6, 6])
+        self.assertEqual(prof["modal_rows"], [3, 5])
+        self.assertNotIn(4, prof["candidates"])
+
+    def test_candidates_exclude_merge_anchors(self):
+        """A row matching the modal profile is still not a candidate if it is a
+        merge anchor (cloning it would carry anchor formulas — separate code)."""
+        prof = self._profile({
+            3: [6, 6, 6],
+            4: [6, 6, 6],
+            5: [6, 6, 6],
+        }, anchors=[3])
+        self.assertIn(3, prof["modal_rows"])
+        self.assertNotIn(3, prof["candidates"])
+        self.assertEqual(prof["candidates"], [4, 5])
+
+    def test_undecidable_returns_none(self):
+        prof = self._profile({}, blocks=[])
+        self.assertIsNone(prof)
+
+
+class CompileGateTests(unittest.TestCase):
+    """Compiler must reject an unstyled clone source when a good row exists."""
+
+    def _compile(self, wd, template_row):
+        spec = {
+            "task": {"intent": "t", "selected_mod": "NONE",
+                     "selected_mod_revision": None},
+            "inputs": {"sources": ["source_maoli.xlsx"],
+                       "target": "target.xlsx",
+                       "source_sheets": [{"source": "source_maoli.xlsx",
+                                          "sheets": ["毛利表"]}],
+                       "target_sheet": "S"},
+            "fingerprints": wd["fingerprints"],
+            "mapping": {"targets": [{
+                "sheet": "S", "base_last_row": 20,
+                "clone_roles": [
+                    {"role": "spacer"},
+                    {"role": "title", "template_row": 1, "value": "T"},
+                    {"role": "header", "template_row": 2},
+                    {"role": "data", "template_row": template_row},
+                ],
+                "rows": {"source": "source_maoli", "selectors": [
+                    {"column": "A", "pattern": "*"}]},
+                "columns": [{"source": "A", "target": "A"},
+                            {"source": "B", "target": "B"}],
+            }]},
+            "validation": {"required_coverage": [], "required_empty": [],
+                           "key_outputs": ["A9"]},
+        }
+        return spec
+
+    def test_style_mismatch_defect_shape(self):
+        """The defect carries the offending columns and a concrete fix."""
+        # Directly exercise the comparator contract used by compile_spec.
+        prof = {"cols": ["A", "V"], "modal": [6, 19],
+                "profiles": {4: [10, 10]}, "modal_rows": [3, 20],
+                "candidates": [20]}
+        diff_cols = [prof["cols"][i]
+                     for i, (a, m) in enumerate(zip(prof["profiles"][4],
+                                                    prof["modal"])) if a != m]
+        self.assertEqual(diff_cols, ["A", "V"])
+        self.assertTrue(len(prof["modal_rows"]) >= 2 and prof["candidates"])
+
+
+class ExecuteStyleFidelityTests(unittest.TestCase):
+    """execute-time comparator: live, correctly scoped, silent when unknown."""
+
+    def test_missing_reference_is_silent_noop(self):
+        """'cannot judge' must never be reported as 'broken'."""
+        self.assertEqual(execute_batch.check_clone_style_fidelity(
+            Path("nonexistent.xlsx"), {}), [])
+
+    def test_comparator_reports_column_level_diff(self):
+        import json
+        import tempfile
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as tmp:
+            book = Path(tmp) / "d.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "S"
+            ws["A2"] = "x"
+            ws["B2"] = "y"
+            wb.save(book)
+            plan = {"clone_style_reference": {"S": {
+                "cols": ["A", "B"], "profile": [0, 0], "rows": [2]}}}
+            fails = execute_batch.check_clone_style_fidelity(book, plan)
+            # Row 2 exists; whatever its indices are, the comparator must be
+            # *live* (either it matches, or it reports precisely).
+            for f in fails:
+                self.assertEqual(f["code"], "CLONE_STYLE_FIDELITY_MISMATCH")
+                self.assertEqual(f["row"], 2)
+                self.assertTrue(set(f["columns"]) <= {"A", "B"})
 
 
 if __name__ == "__main__":

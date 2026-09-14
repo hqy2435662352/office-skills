@@ -1,42 +1,46 @@
 #!/usr/bin/env python3
 """
-scripts/repair_row_gaps.py — input-repair utility (ADR 0021).
+scripts/repair_row_gaps.py — input-repair CLI (ADR 0021).
 
 Row-number gaps (`row` element r-values discontinuous in sheet XML) break
-officecli `add ... after: /row[N]` anchor chains permanently. This utility
-repairs a COPY of the affected workbook and produces a NEW repaired input
-snapshot. It is input-version repair, NOT workspace mutation:
+officecli `add ... after: /row[N]` anchor chains permanently. This CLI repairs a
+COPY of a workbook and produces a NEW repaired input snapshot — input-version
+repair, NOT workspace mutation.
 
-  input workbook → copy to <out> → materialize missing row elements on the
-  copy → close/flush → verify gaps repaired → output repaired snapshot
+**You usually do not need this.** `workspace_init --init` repairs row gaps inside
+its own staging step by default (detect → repair the staged copy → then hash /
+outline / flatten), so the ordinary flow is a single pass. This CLI remains for
+the two cases init must decline:
 
-The current workspace stays immutable; once the repaired snapshot is adopted
-it re-enters through the canonical `workspace_init --init` path (re-init with
-the repaired file among --files), then materialize_run re-projects run views,
-FillSpec fingerprints are rebound, and Compile → Spec Review → Execute follow.
+  * `--no-repair` was used (byte-fidelity of the source was requested), or
+  * the caller's source path IS the staged path, so repairing in place would
+    mutate the caller's own file (init reports `reason: source-is-staged-file`).
 
-This script performs NO: manifest refresh, incremental flatten, fingerprint
-patching, spec patching, recompile, or any next-state derivation. It answers
-one question only: "produce a repaired copy of this workbook".
+It is also the way to repair a workbook WITHOUT building a workspace.
 
-Gap detection reads the workbook XML directly (allowed structural parsing —
-invariant 6); materialization uses the officecli adapter (`set ... numberformat
-=0.00` materializes an empty row element without cell content; `value:null`
-fails on un-normalized WPS/Excel XML). `officecli close` forces the flush that
-a resident-deferred write would otherwise lose.
+Detection and mutation are NOT implemented here — they live in `flatten_table`
+(the single home for xlsx structural facts: prefix-agnostic readers + the
+`SheetNotFound` fail-closed path). This file is only CLI + copy-to-snapshot +
+verify + report. (Recorded 2026-09: this script used to carry a private copy of
+the row regex written as `<row\\b`, which matches 0 rows on any officecli-touched
+workbook — officecli writes `<x:row>` — so it answered NO_ROW_GAPS for sheets
+that still had gaps, and it resolved the worksheet by "first sheet wins",
+ignoring --sheet entirely.)
+
+It performs NO: manifest refresh, incremental flatten, fingerprint patching,
+spec patching, recompile, or any next-state derivation.
 
 Usage:
-  python scripts/repair_row_gaps.py --input <staged.xlsx> --sheet <SheetName>
+  python scripts/repair_row_gaps.py --input <staged.xlsx> (--sheet <Name> | --all)
                                      [--out <repaired.xlsx>]
 
-Exit codes: 0=pass (repaired or no gaps), 1=fatal (env/file), 3=retryable.
+Exit codes: 0=pass (repaired or no gaps), 1=fatal (env/file/typo), 3=retryable.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import sys
 import zipfile
@@ -44,134 +48,106 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _officecli import (  # noqa: E402
-    ensure_utf8_stdio as _utf8_stdio, fail, officecli,
+from _officecli import ensure_utf8_stdio as _utf8_stdio, fail  # noqa: E402
+from flatten_table import (  # noqa: E402  (xlsx 结构事实唯一实现地)
+    SheetNotFound, all_row_gaps, flush_workbook, materialize_rows, row_gaps,
+    row_gaps_in_xml, sheet_names, sheet_rel_path,
 )
 
-ROW_RE = re.compile(r"<row\b[^>]*\br=\"(\d+)\"", re.IGNORECASE)
-
-# 与 prepare_run 的 files 参数同构: officecli 对中文路径失败, staged 名必须 ASCII
-# (不改文件名 — repair 只修内容, 命名由 workspace_init --files 映射消化)。
+# 兼容别名 (旧内部 helper 名): 语义不变, 实现统一在 flatten_table。
+sheet_target_path = sheet_rel_path
 
 
-def sheet_target_path(book: Path, sheet_name: str) -> str:
-    """sheet 名 → xl/<sheet file> 路径 (经 workbook.xml + rels 解析).
-
-    Rel 元素属性顺序不定 (Target 可能在 Id 前), 分别捕获后组合, 不依赖顺序。"""
+def row_gaps_in(book: Path, sheet_path: str) -> list:
+    """给定 worksheet 路径读 row 空洞 (前缀无关)."""
     with zipfile.ZipFile(book) as z:
         try:
-            wb = z.read("xl/workbook.xml").decode("utf-8")
-            rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
-        except KeyError:
-            fail("NOT_XLSX", f"{book} 不是标准 xlsx (缺 workbook.xml)",
-                 "用 officecli 或 Excel 保存后重试", exit_code=1)
-    rid_m = re.search(
-        r'<(?:\w+:)?sheet\b[^>]*name="([^"]*)"[^>]*r:id="(rId\d+)"', wb)
-    if not rid_m:
-        fail("SHEET_NOT_FOUND", f"sheet {sheet_name!r} 未在 workbook.xml 找到",
-             "用 outline 文件确认 sheet 名", exit_code=1)
-    r_id = rid_m.group(2)
-    rel_m = re.search(
-        rf'<Relationship\b[^>]*Id="{re.escape(r_id)}"[^>]*/?>', rels)
-    if not rel_m:
-        fail("SHEET_REL_MISSING",
-             f"sheet {r_id} 的 Relationship 未在 rels 找到",
-             "检查 xl/_rels/workbook.xml.rels", exit_code=1)
-    target_m = re.search(r'Target="([^"]+)"', rel_m.group(0))
-    if not target_m:
-        fail("SHEET_REL_MISSING",
-             f"sheet {r_id} 的 Relationship 缺 Target",
-             "检查 xl/_rels/workbook.xml.rels", exit_code=1)
-    target = target_m.group(1)
-    if not target.startswith("/"):
-        target = "xl/" + target.lstrip("/")
-    # 规范化相对路径 (../) 与重复前缀 (/xl/xl/...)
-    parts = []
-    for seg in target.split("/"):
-        if seg == "..":
-            if parts:
-                parts.pop()
-        elif seg and seg != ".":
-            parts.append(seg)
-    norm = "/".join(parts)
-    if not norm.startswith("xl/"):
-        norm = "xl/" + norm.lstrip("xl/")
-    return norm
-
-
-def row_gaps_in(book: Path, sheet_path: str) -> list[int]:
-    """读取 sheet XML 的 row r 值, 返回不连续处缺失的行号 (升序)."""
-    with zipfile.ZipFile(book) as z:
-        try:
-            xml = z.read(sheet_path).decode("utf-8")
+            xml = z.read(sheet_path).decode("utf-8", errors="replace")
         except KeyError:
             fail("SHEET_XML_MISSING", f"{sheet_path} 不存在于 {book}",
                  "检查 sheet 路径解析", exit_code=1)
-    r_vals = sorted({int(m) for m in ROW_RE.findall(xml)})
-    if not r_vals:
-        return []
-    gaps = [expected for expected in range(min(r_vals) + 1, max(r_vals))
-            if expected not in set(r_vals)]
-    return gaps
+    return row_gaps_in_xml(xml)
 
 
 def verify_no_gaps(book: Path, sheet_path: str) -> bool:
     return not row_gaps_in(book, sheet_path)
 
 
-def repair_copy(input_path: Path, out_path: Path, sheet_name: str) -> dict:
-    """在副本上物化缺失行元素 → close 刷盘 → 验证无洞 → 输出 repaired snapshot.
+def _plan(book: Path, sheet, do_all: bool) -> dict:
+    """{sheet: gaps} 限定在请求的 scope 内 (拼错 fail-closed)."""
+    try:
+        available = sheet_names(book)
+    except (KeyError, OSError, zipfile.BadZipFile):
+        fail("NOT_XLSX", f"{book} 不是标准 xlsx (缺 workbook.xml)",
+             "用 officecli 或 Excel 保存后重试", exit_code=1)
+    if do_all:
+        return all_row_gaps(book)
+    if sheet not in available:
+        # 拼错绝不能退化成"在别的 sheet 上静默 no-op"。
+        fail("SHEET_NOT_FOUND",
+             f"sheet {sheet!r} 不在 {book.name} (可用: {available})",
+             "用 outline 文件确认 sheet 名, 或用 --all 修复全部 sheet",
+             exit_code=1)
+    gaps = row_gaps(book, sheet)
+    return {sheet: gaps} if gaps else {}
 
-    只做 Office 手术。fails closed: 任何一步失败都不产生"半修复被当作快照"的
-    状态 — 调用方应删除 out 并重试 (脚本幂等: 已修复的副本再跑 → NO_ROW_GAPS)。"""
-    sheet_path = sheet_target_path(input_path, sheet_name)
-    # 只修 xlsx (pptx 无 row 元素概念); slide[...] 目标由调用方自行跳过 —
-    # 这里按 sheet XML 存在性判, 不存在即 NO_ROW_GAPS (pptx 没有行空洞域)。
-    if not sheet_path.endswith(".xml") or not sheet_path.startswith("xl/"):
-        return {"status": "PASS", "code": "NO_ROW_GAPS",
-                "repaired": [], "reason": "pptx/no-row sheet: 无行元素空洞域"}
-    gaps = row_gaps_in(input_path, sheet_path)
-    if not gaps:
-        return {"status": "PASS", "code": "NO_ROW_GAPS",
-                "repaired": [], "reason": "row r 值连续"}
+
+def repair_copy(input_path: Path, out_path: Path, sheet, do_all: bool) -> dict:
+    """副本上物化缺失行元素 → close 刷盘 → 逐 sheet 复核 → 输出 snapshot.
+
+    fails closed: 任一步失败都不产生"半修复被当作快照"的状态 — 调用方应删除
+    out 并重试 (幂等: 已修复的副本再跑 → NO_ROW_GAPS)。"""
+    if input_path.suffix.lower() not in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        return {"status": "PASS", "code": "NO_ROW_GAPS", "repaired": [],
+                "sheets": [],
+                "reason": f"{input_path.suffix}: 无行元素空洞域 (pptx/docx)"}
+
+    plan = _plan(input_path, sheet, do_all)
+    if not plan:
+        return {"status": "PASS", "code": "NO_ROW_GAPS", "repaired": [],
+                "sheets": [],
+                "reason": "row r 值连续" if not do_all
+                          else "全部 sheet row r 值连续"}
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(input_path, out_path)
-    # 副本可写 (stage_files 会设只读, 复制后 officecli 需要写)
     try:
-        out_path.chmod(0o644)
+        out_path.chmod(0o644)  # stage_files 会设只读; 副本需可写
     except OSError:
         pass
 
-    fixed = []
-    for r in gaps:
-        path = f"/{sheet_name}/A{r}"
-        proc = officecli("set", str(out_path), path,
-                         "--prop", "numberformat=0.00")
-        if proc.returncode != 0:
-            fail("REPAIR_OP_FAILED",
-                 f"officecli set {path} failed: {proc.stderr[-400:]}",
-                 "检查 sheet 名 / 副本文件", exit_code=3)
-        fixed.append(r)
-    # 强制刷盘: resident 延迟写未落盘时, 紧跟的验证会复见空洞
-    # (2026-08-13 实测: set 返回后立即重读会复见空洞)。
-    proc = officecli("close", str(out_path))
-    if proc.returncode != 0:
-        fail("REPAIR_FLUSH_FAILED",
-             f"officecli close failed: {proc.stderr[-400:]}",
-             "行元素已物化但可能未刷盘 — 删除 out 后重跑 (幂等)",
-             exit_code=3)
+    per_sheet, total = [], []
+    for sh, gaps in plan.items():
+        try:
+            fixed = materialize_rows(out_path, sh, gaps)
+        except RuntimeError as e:
+            fail("REPAIR_OP_FAILED", str(e), "检查 sheet 名 / 副本文件", exit_code=3)
+        per_sheet.append({"sheet": sh, "gaps_before": gaps,
+                          "repaired": fixed, "gaps_after": None})
+        total.extend(fixed)
 
-    if not verify_no_gaps(out_path, sheet_path):
-        fail("REPAIR_VERIFY_FAILED",
-             f"副本 {out_path} 仍含行号空洞 (sheet {sheet_name})",
+    # 强制刷盘: resident 延迟写未落盘时, 紧跟的验证会复见空洞 (2026-08-13 实测)。
+    try:
+        flush_workbook(out_path)
+    except RuntimeError as e:
+        fail("REPAIR_FLUSH_FAILED", f"{e} — 行元素已物化但可能未刷盘",
+             "删除 out 后重跑 (幂等)", exit_code=3)
+
+    # 逐 sheet 复核 — 用同一前缀无关检测器 (旧的验证同样失明)
+    residual = {}
+    for rec in per_sheet:
+        after = row_gaps(out_path, rec["sheet"])
+        rec["gaps_after"] = after
+        if after:
+            residual[rec["sheet"]] = after
+    if residual:
+        fail("REPAIR_VERIFY_FAILED", f"副本 {out_path} 仍含行号空洞: {residual}",
              "删除 out 并重跑 (幂等); 若持续, 检查是否 officecli close 未刷盘",
              exit_code=3)
 
     return {"status": "PASS", "code": "ROW_GAPS_REPAIRED",
-            "sheet": sheet_name, "repaired": fixed,
-            "input": str(input_path),
-            "output_snapshot": str(out_path),
+            "repaired": total, "sheets": per_sheet,
+            "input": str(input_path), "output_snapshot": str(out_path),
             "next": "以该 repaired snapshot 为输入重新 workspace_init --init "
                     "(canonical re-entry, ADR 0021) → materialize_run → 刷新 "
                     "FillSpec 指纹 → Compile Clean → Spec Review → Execute"}
@@ -180,33 +156,36 @@ def repair_copy(input_path: Path, out_path: Path, sheet_name: str) -> dict:
 def main() -> None:
     _utf8_stdio()
     parser = argparse.ArgumentParser(
-        description="input-repair utility: 在副本上物化行号空洞, 产出 repaired "
+        description="input-repair CLI: 在副本上物化行号空洞, 产出 repaired "
                     "input snapshot (ADR 0021)")
     parser.add_argument("--input", type=Path, required=True,
                         help="待修复的 Office 输入 (staged 名, ASCII)")
-    parser.add_argument("--sheet", type=str, required=True,
-                        help="sheet 名 (如 11_FRESH本土)")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--sheet", type=str, default=None,
+                       help="sheet 名 (如 11_FRESH本土)")
+    scope.add_argument("--all", action="store_true", dest="do_all",
+                       help="修复该工作簿全部含空洞的 sheet (单一快照)")
     parser.add_argument("--out", type=Path, default=None,
-                        help="repaired snapshot 路径 (默认: <input>.repaired<ext> "
-                             "同目录)")
+                        help="repaired snapshot 路径 (默认: <input>.repaired<ext> 同目录)")
     parser.add_argument("--workdir", type=Path, default=None,
                         help="(兼容) 旧 CLI 占位 — 新语义不需要; 保留以拒绝误用")
     args = parser.parse_args()
 
     if args.workdir is not None:
         fail("LEGACY_CLI_REJECTED",
-             "repair_row_gaps 已收缩为 input-repair utility (ADR 0021): "
+             "repair_row_gaps 已收缩为 input-repair CLI (ADR 0021): "
              "--workdir/--target/--patch-spec 不再存在",
-             "用法: repair_row_gaps.py --input <staged.xlsx> --sheet <Name> "
-             "[--out <repaired.xlsx>] — 不触碰 manifest/spec/编译", exit_code=3)
+             "用法: repair_row_gaps.py --input <staged.xlsx> (--sheet <Name> | "
+             "--all) [--out <repaired.xlsx>] — 不触碰 manifest/spec/编译",
+             exit_code=3)
 
     if not args.input.is_file():
         fail("INPUT_NOT_FOUND", f"input not found: {args.input}",
              "确认 staged 输入路径", exit_code=1)
     out = args.out or args.input.with_name(
         f"{args.input.stem}.repaired{args.input.suffix}")
-    result = repair_copy(args.input, out, args.sheet)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(repair_copy(args.input, out, args.sheet, args.do_all),
+                     ensure_ascii=False, indent=2))
     sys.exit(0)
 
 

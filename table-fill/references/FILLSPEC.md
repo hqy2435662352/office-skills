@@ -666,6 +666,19 @@ formulas:
   `value` 覆盖则残留。**任何克隆源的 template_row 都避免选锚点行**;
   title/header 给 `value` 可覆盖文本, 但公式残留不在此机制覆盖内。
 - 混合 inplace 的 overflow 克隆 (template_row) 同样适用 data 检查。
+- **"非锚点"是必要而非充分条件 (recorded 2026-09)**: 克隆源还必须**携带块内
+  格式**。模板里存在"是合并**非**锚点、却不带块内格式"的行 — 合并区的非锚点
+  格通常无字体/填充/边框 (Case 010 的同一片盲区, 但在克隆路径上)。克隆这种行
+  会让新块的类别列与聚合合并区丢格式, 而 `validate` / `issues` / readback /
+  结构 readback / `render_qa` **全部为绿** (render 只产 `status: produced`)。
+  因此 data 克隆源的完整判据 = **非锚点 且 样式剖面 == 块内数据行众数剖面**,
+  编译期 `CLONE_SOURCE_STYLE_MISMATCH` 机械拦截 (staged 目标拿不到时降级为
+  `CLONE_SOURCE_STYLE_DIVERGENT` 警告, 不阻断)。怎么一次读出候选行:
+  `flatten_table.clone_source_style_profile(file, sheet, blocks, num_cols)`
+  返回 `{"modal", "modal_rows", "candidates", ...}` — 比较的是单元格 `s=`
+  样式索引 (同索引 ⇒ 构造上同格式), 不需要解析 styles.xml。
+  执行期另有产物级复核 (plan 的 `clone_style_reference` → receipt
+  `structural.style_fidelity`)。
 
 ### Q9: title/header 的 value 何时写入?
 
@@ -784,16 +797,26 @@ formulas:
 
 ### Q16: 模板行号空洞修复后指纹怎么办?
 
+**通常不用管**: `workspace_init --init` 默认在 staging 内检测 + 修复行号空洞, 且
+发生在**任何哈希/outline/展平/指纹被记录之前** — 一趟 init 出的事实空间自洽,
+`meta.row_gaps` 为空, 不存在"修复后指纹过期"的问题。所以 `TEMPLATE_ROW_GAP`
+只在这两种情况下才可能发生:
+
+* init 用了 `--no-repair` (要逐字节复刻源文件), 或
+* 源路径 == 暂存路径 → init 拒绝原地修复 (它等于改用户原件), 记
+  `row_gaps_deferred` 且 `reason: source-is-staged-file`。
+
 | 情形 | 行为 |
 |---|---|
-| 编译报 `TEMPLATE_ROW_GAP` (exit 3) — 行洞命中 add 锚点/克隆源 | 跑 `scripts/repair_row_gaps.py --workdir <dir>` — 物化缺失行元素, 并**自动重跑 flatten (仅目标 sheet) 同步 prepare_manifest.json 指纹** |
-| 修复后要更新 spec 指纹 | **Agent 不再手工同步** — 脚本输出 JSON 带新 `fingerprints.target_structure`, 抄进 fill_spec.yaml, 或一步完成: `repair_row_gaps.py --workdir <dir> --patch-spec fill_spec.yaml` (外科手术式改写该键, 保留其余内容) |
-| 修复后重编译 | `compile_fill.py --spec fill_spec.yaml --workdir <dir>` — 指纹匹配后正常出 plan |
+| 编译报 `TEMPLATE_ROW_GAP` (exit 3) — 行洞命中 add 锚点/克隆源 | 独立 CLI 产出**新输入快照**: `scripts/repair_row_gaps.py --input <xlsx> --all [--out <snapshot>]` (它只修**副本**, 不触碰 staged, 不重跑 flatten, 不 patch 任何东西) |
+| 修复后指纹 | **机械事实: 修复 = 输入字节变化 = 指纹必然变化**。指纹不由 repair 同步 — 而是以该 snapshot 为输入**重新 `workspace_init --init`** (canonical re-entry, ADR 0021), 于是 manifest 哈希 / 展平 / 指纹 / `meta.row_gaps` 一次性全部按新字节重算, 不存在"过期的 files[].sha256"或"手工抄指纹" |
+| 重新初始化之后 | `materialize_run` 重投影 run view → `compile_fill.py --spec fill_spec.yaml --workdir <dir>` (spec 的 `fingerprints` 要用新值) → Spec Review → Execute |
 
-- 流程保证: **行洞修复 = staged 文件修改 = 指纹必然变化** (机械事实); 指纹
-  同步由 repair 脚本自动完成, 唯一手工动作 = 更新 spec 指纹 + 重编译。
-- 注意: `repair_row_gaps.py` 修复后若仍报空洞 (复见), 先查 `officecli close`
-  刷盘 (脚本已内置), 再查 staged 文件是否被后续 flatten 覆盖过。
+- 为什么不让 repair 自己去同步指纹: 那等于**在已推进的事实空间上做局部突变**
+  (manifest/派生指纹/spec 三处各自可能只改一半), 正是 ADR 0021 收缩掉的行为 —
+  该 CLI 现在显式拒绝 `--workdir` / `--patch-spec` (`LEGACY_CLI_REJECTED`).
+- 注意: 修复后若仍报空洞, 先查 `officecli close` 刷盘 (CLI 已内置 flush + 逐
+  sheet 复核), 再查是否又用了旧快照重新 init。
 
 ### Q17: 多个块 (或多源条目) 的 selectors 选中同一源行怎么办?
 
@@ -944,7 +967,7 @@ minor; none → 写 val='none'; null/空串 → 写 val='' 非法)。
 >
 > | 边界 | 动作 |
 > |---|---|
-> | **compile** | `compile_fill.py` 重算 staged 输入 (sources + target) 的内容 sha256, 写入 `plan.input_hashes` (按 staged 文件名) — **不是** 抄 prepare_manifest.json 的 `files[].sha256` (那是 outline 期快照, repair_row_gaps 修改 staged 文件后**过期** — repair 只重算指纹, 不刷新 files[].sha256; 重编译即重绑定, repair 流程天然兼容) |
+> | **compile** | `compile_fill.py` 重算 staged 输入 (sources + target) 的内容 sha256, 写入 `plan.input_hashes` (按 staged 文件名) — **不是** 抄 prepare_manifest.json 的 `files[].sha256` (那是 init 期快照)。行号空洞修复**不发生在这个缝上**: 默认由 `workspace_init --init` 在记录任何哈希**之前**对暂存副本完成, 因此修复后字节与 manifest 哈希天然一致, 不存在"过期的 files[].sha256"; 独立 CLI 则产出**新快照**并要求重新 init (同样一致) |
 > | **execute** | `execute_batch.py` 在 `copy_template` **之前**重算 staged 输入哈希, 与 `plan.input_hashes` 比对; 漂移/缺失绑定 → `INPUT_HASH_DRIFT` / `INPUT_HASH_BINDING_MISSING` (exit 3, corrective_action: 恢复未漂移输入或重 prepare+重编译) — 绝不带着漂移输入开始填充 |
 > | **receipt** | `draft_receipt.json` 的 `source_hashes` / `template_sha256` 是**执行时重算值** (不再无条件抄 manifest); 另记 `input_hash_check` = {bound, actual, drifted}, 一致/漂移可查 |
 > | **deliver** | `promote_output.py` 的 HASH_DRIFT 核对范围含 source/template: plan 绑定 / receipt / 当前 staged 文件三方一致, 任一漂移 → exit 3 (fail-closed: 缺绑定或缺 receipt 证据也拒绝) |
@@ -1112,6 +1135,8 @@ digest, 不要 unzip sheet XML 考古。
 | INPUT_HASH_DRIFT | staged 输入 (source/template) 在 compile 后被修改/缺失 — execute 在 copy_template 前拒绝 (exit 3), 或 deliver 的 HASH_DRIFT 三方核对拒绝 | 恢复未漂移的 staged 输入, 或重跑 prepare_run + compile_fill.py 重绑定 (见 E5) |
 | INPUT_HASH_BINDING_MISSING | plan 无 input_hashes 绑定 (旧版 compile 产物), execute 无法核对输入 | 重跑 compile_fill.py 重绑定后重执行 (见 E5) |
 | CLONE_SOURCE_IS_ANCHOR | 数据克隆源是合并锚点 | 换非锚点数据行 |
+| CLONE_SOURCE_STYLE_MISMATCH | 数据克隆源是合并非锚点, **但不携带块内格式** (其列级 `s=` 样式索引剖面 != 该 sheet 数据行众数剖面), 而块内确实存在携带众数剖面的可克隆行 | 换成 corrective_action 列出的候选行 (即"非锚点 **且** 样式剖面 == 锚点行"的行)。recorded 2026-09: 模板块1 的行4/5 的 A/V/W 是合并非锚点格且无格式 (10/11) 而锚点行是 6/19/19 — 克隆它会丢字体/填充/上下边框, 而 validate / issues / readback / structural / render **全部为绿** (render 只产 `status: produced`, 无一门禁看格式) |
+| CLONE_SOURCE_STYLE_DIVERGENT | 同上, 但块内**没有**一致剖面的可克隆行 (模板本身混乱) — 警告不阻断, 需人工确认格式 | 人工检查该块格式; 或显式用 `styles:` 声明锚点样式 |
 | CLONE_RESIDUE_UNHANDLED | template_row 携带某列值但未覆盖 | 加 columns mapping 或 nulls |
 | DUPLICATE_TARGET_WRITE | 同一格被写两次 | 检查 columns/nulls/formulas/group/sets 重叠 |
 | MERGE_RANGE_INVALID / AGG_RANGE_INVALID | 范围越过数据块 | 用 `1:{n}` (聚合); group_aggregates 的组范围由数据派生, 越块是编译器内部不变量守卫 (观测契约: 公式范围恒在块内, 埃及等价用例断言) |
@@ -1135,7 +1160,7 @@ digest, 不要 unzip sheet XML 考古。
 | INPLACE_NO_CLONE_SOURCE | inplace data role 缺 template_row | 声明非锚点占位行 |
 | INPLACE_REGION_OVERLAP | 前置 add/remove 或 sets 触碰占位区 | base_last_row ≥ 占位区末端; 移除/写入移到区外 |
 | STRUCTURAL_OP_OUT_OF_ZONE | 非终末 inplace 块声明 remove_rows (结构行操作只属于终末 inplace 块的 Trim) | 前置 append 块不声明 remove_rows; 收缩由终末 inplace 块 Trim (编译器推导) |
-| TEMPLATE_ROW_GAP | 目标 sheet 行号空洞命中 add 锚点/克隆源行 | `scripts/repair_row_gaps.py --workdir <dir>` — 指纹自动重算; 更新 spec 指纹 (或 `--patch-spec`) → 重编译 (见 Q16) |
+| TEMPLATE_ROW_GAP | 目标 sheet 行号空洞命中 add 锚点/克隆源行 | 默认已被 `--init` 自修复; 仍报则说明用了 `--no-repair` 或源==暂存被拒 → `scripts/repair_row_gaps.py --input <xlsx> --all [--out <snapshot>]` 产出新快照 → **重新 `workspace_init --init`** (指纹/哈希随之重算) → 重编译 (见 Q16) |
 | REMOVE_TARGETS_APPEND_ZONE | append 块 remove_rows > base_last_row — add 推移行号后 remove 命中新数据行 (自毁 plan) | 首选 **append-only 合法终态**: 占位行自然下沉保留, 无需删除; remove_rows 只能声明 ≤ base_last_row 的模板既有行; 仅当占位行带样式时 inplace 才是条件选项 |
 | PLACEHOLDER_RESIDUE_UNHANDLED | 保留占位行携带未覆盖值 | 加 columns/null/group label |
 | PLACEHOLDER_RESIDUE_PARTIAL_NULLS | nulls 只覆盖部分保留行 | rows: all 或列映射 |

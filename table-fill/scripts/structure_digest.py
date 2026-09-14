@@ -166,7 +166,10 @@ def build_digest(meta: dict, csv_path: Path, candidates: dict | None,
     gaps = meta.get("row_gaps") or []
     if gaps:
         lines.append(f"- 行号空洞: {gaps} — row 元素 r 值不连续, "
-                     f"`add ... after: /row[N]` 锚点链会断裂, 需 materialize 后重跑 prepare")
+                     f"`add ... after: /row[N]` 锚点链会断裂。init 默认已在 staging "
+                     f"内自修复 (先于哈希/展平), 故本行出现 = 修复被跳过或拒绝 "
+                     f"(`--no-repair` / 源==暂存) — 见 manifest repairs[].deferred; "
+                     f"独立 CLI: repair_row_gaps.py --input <xlsx> --all 产出新快照后重新 init")
 
     if for_target:
         sg = meta.get("style_granularity") or {}
@@ -321,7 +324,10 @@ def build_premod_evidence(meta: dict, csv_path: Path, candidates: dict | None,
     gaps = meta.get("row_gaps") or []
     if gaps:
         lines.append(f"- 行号空洞: {gaps} — row 元素 r 值不连续, "
-                     f"`add ... after: /row[N]` 锚点链会断裂, 需 materialize 后重跑 prepare")
+                     f"`add ... after: /row[N]` 锚点链会断裂。init 默认已在 staging "
+                     f"内自修复 (先于哈希/展平), 故本行出现 = 修复被跳过或拒绝 "
+                     f"(`--no-repair` / 源==暂存) — 见 manifest repairs[].deferred; "
+                     f"独立 CLI: repair_row_gaps.py --input <xlsx> --all 产出新快照后重新 init")
 
     if for_target:
         sg = meta.get("style_granularity") or {}

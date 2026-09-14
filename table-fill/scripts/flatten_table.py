@@ -8,7 +8,8 @@ Usage:
   python flatten_table_ocl.py --input file.xlsx --target "SheetName" --output out.csv
 """
 
-import json, csv, re, sys, argparse, time
+import json, csv, re, sys, argparse, time, zipfile
+from html import unescape as html_unescape
 from pathlib import Path
 
 from _officecli import officecli, fail  # noqa: E402  (shared UTF-8 adapter)
@@ -629,42 +630,203 @@ CLONE_ROLES = (("title", 0), ("header", 1), ("data", 2))
 
 
 def _read_sheet_xml(filepath, sheet):
-    """解包 xlsx, 定位 sheet 的 worksheet XML 文本 (命名空间前缀 x: 或裸均可).
+    """解包 xlsx, 定位 sheet 的 worksheet XML 文本 (返回 (ZipFile, xml)|(None,None)).
 
-    返回 (ZipFile, sheet_xml_text) 或 (None, None) (解析失败/缺 sheet)。
-    与 detect_row_gaps / detect_style_granularity 共享, 避免路径解析漂移。
+    ⚠️ 命名空间鲁棒性是**承重**的, 不是洁癖 (recorded 2026-09): WPS/Excel 写裸
+    `<sheet>`/`<row>`, 而 **officecli 写回的任何部件都带 `x:` 前缀**。
+    旧实现用裸 `<sheet` 匹配 workbook.xml → officecli 碰过的文件匹配为空 →
+    本函数返回 (None, None) → 三个检测器同时静默失明: detect_row_gaps 报 [],
+    detect_column_widths 报 {} (precision: keep 校验降级), detect_style_granularity
+    报 None (克隆源候选丢失) — 全部不报错。前缀由"最后写这个部件的工具"决定,
+    从不是值得依赖的事实。
+
+    同时**按名解析** (旧 "第一个 sheet 通吃" 的写法会让 --sheet 静默操作错表),
+    未知名 fail-closed (`SheetNotFound`)。本模块是 xlsx 结构事实的唯一实现地
+    (detect_row_gaps / detect_column_widths / detect_style_granularity /
+    compute_bbox_facts / repair 的读写都经这里), 不另立并行模块。
     """
-    import zipfile
     try:
-        zf = zipfile.ZipFile(filepath)
+        z = zipfile.ZipFile(filepath)
     except (OSError, zipfile.BadZipFile):
         return None, None
-    try:
-        wb = zf.read("xl/workbook.xml").decode("utf-8", errors="replace")
-        rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8", errors="replace")
-    except KeyError:
+    xml = read_sheet_xml(filepath, sheet)
+    if xml is None:
+        try:
+            z.close()
+        except Exception:
+            pass
         return None, None
-    m = re.search(r'<sheet[^>]*name="' + re.escape(sheet) + r'"[^>]*r:id="(rId\d+)"', wb)
-    if not m:
-        m = re.search(r'<sheet[^>]*r:id="(rId\d+)"[^>]*name="' + re.escape(sheet) + r'"', wb)
-    if not m:
-        return None, None
-    rid = m.group(1)
-    tm = re.search(r'Id="' + rid + r'"[^>]*Target="([^"]+)"', rels)
-    if not tm:
-        tm = re.search(r'Target="([^"]+)"[^>]*Id="' + rid + r'"', rels)
-    if not tm:
-        return None, None
-    target = tm.group(1)
+    return z, xml
+
+
+# ── Sheet XML 访问 (前缀无关 + 按名解析) ────────────────────────────────
+# 元素名可能带任意命名空间前缀 (裸 / x: / x14: ...)。前缀是"最后写这个部件的
+# 工具"留下的实现细节, 从不承载事实 — 因此所有读取都走这里, 一处回答。
+_NS = r"(?:[A-Za-z_][\w.\-]*:)?"
+_SHEET_EL_RE = re.compile(rf"<{_NS}sheet\b[^>]*?/?>")
+_REL_EL_RE = re.compile(rf"<{_NS}Relationship\b[^>]*?/?>")
+_ROW_R_RE = re.compile(rf"<{_NS}row\b[^>]*?\br=\"(\d+)\"")
+_CELL_RE = re.compile(rf"<{_NS}c\b[^>]*?\br=\"([A-Z]+\d+)\"([^>]*?)(?:/>|>)")
+
+
+class SheetNotFound(Exception):
+    """请求的 sheet 名不在 workbook.xml 中 (拼错必须 fail-closed)."""
+
+
+def _xml_attr(el: str, name: str):
+    m = re.search(rf'\b{name}="([^"]*)"', el)
+    return html_unescape(m.group(1)) if m else None
+
+
+def sheet_names(book) -> list:
+    """workbook 顺序的 sheet 名 (XML 转义已还原)."""
+    with zipfile.ZipFile(book) as z:
+        wb = z.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    out = []
+    for el in _SHEET_EL_RE.findall(wb):
+        nm = _xml_attr(el, "name")
+        rid = _xml_attr(el, "r:id") or _xml_attr(el, "id")
+        if nm is not None and rid:
+            out.append(nm)
+    return out
+
+
+def sheet_rel_path(book, sheet_name: str) -> str:
+    """sheet 名 → in-zip worksheet 路径 (规范化; 未知/非 worksheet → SheetNotFound)."""
+    with zipfile.ZipFile(book) as z:
+        wb = z.read("xl/workbook.xml").decode("utf-8", errors="replace")
+        rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8", errors="replace")
+
+    rid = None
+    for el in _SHEET_EL_RE.findall(wb):
+        if _xml_attr(el, "name") == sheet_name:
+            rid = _xml_attr(el, "r:id") or _xml_attr(el, "id")
+            break
+    if rid is None:
+        raise SheetNotFound(
+            f"sheet {sheet_name!r} not found in workbook.xml "
+            f"(available: {sheet_names(book)})")
+
+    target = None
+    for el in _REL_EL_RE.findall(rels):
+        if _xml_attr(el, "Id") == rid:
+            target = _xml_attr(el, "Target")
+            break
+    if target is None:
+        raise SheetNotFound(
+            f"relationship {rid!r} for sheet {sheet_name!r} missing in rels")
     if not target.endswith(".xml"):
-        return None, None
-    # rels Target 可能带 /xl/ 前缀 (openpyxl 生成) 或为相对路径 (Excel 保存)
-    if target.startswith("/xl/"):
-        target = target[4:]
+        raise SheetNotFound(
+            f"sheet {sheet_name!r} → non-worksheet target {target!r}")
+
+    # 规范化: 绝对 (/xl/...)、相对 (worksheets/...)、../ 三种写法
+    parts = []
+    for seg in target.split("/"):
+        if seg == "..":
+            if parts:
+                parts.pop()
+        elif seg and seg != ".":
+            parts.append(seg)
+    norm = "/".join(parts)
+    if not norm.startswith("xl/"):
+        norm = "xl/" + norm.lstrip("/")
+    return norm
+
+
+def read_sheet_xml(book, sheet_name: str):
+    """worksheet XML 文本 (不可读/缺 sheet → None)."""
     try:
-        return zf, zf.read("xl/" + target.lstrip("/")).decode("utf-8", errors="replace")
-    except KeyError:
-        return None, None
+        path = sheet_rel_path(book, sheet_name)
+        with zipfile.ZipFile(book) as z:
+            return z.read(path).decode("utf-8", errors="replace")
+    except (SheetNotFound, KeyError, OSError, zipfile.BadZipFile):
+        return None
+
+
+def row_values(book, sheet_name: str) -> list:
+    """该 sheet 全部 row 元素的 r 值 (升序去重)."""
+    xml = read_sheet_xml(book, sheet_name)
+    if not xml:
+        return []
+    return sorted({int(m) for m in _ROW_R_RE.findall(xml)})
+
+
+def row_gaps_in_xml(xml: str) -> list:
+    """单份 worksheet XML 内的缺失行号 (升序) — 唯一实现, 供文件/文本两种入口."""
+    if not xml:
+        return []
+    rs = sorted({int(m) for m in _ROW_R_RE.findall(xml)})
+    if not rs:
+        return []
+    present = set(rs)
+    return sorted(r for r in range(1, max(rs) + 1) if r not in present)
+
+
+def row_gaps(book, sheet_name: str) -> list:
+    """缺失行号 (升序)。这些洞会让 officecli `add ... after: /row[N]` 锚点链永久断裂。"""
+    return row_gaps_in_xml(read_sheet_xml(book, sheet_name) or "")
+
+
+def all_row_gaps(book) -> dict:
+    """{sheet 名: 空洞} — 只含确有空洞的 sheet。"""
+    out = {}
+    try:
+        names = sheet_names(book)
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return out
+    for nm in names:
+        try:
+            g = row_gaps(book, nm)
+        except Exception:
+            continue
+        if g:
+            out[nm] = g
+    return out
+
+
+def cell_style_ids(book, sheet_name: str) -> dict:
+    """{"A4": style_index} — 携带显式 `s=` 的单元格。
+
+    两个单元格 `s=` 索引相同 ⇒ **构造上**格式相同, 所以判"这格没带块内格式"
+    只需集合比较, 不必解析 styles.xml。
+    """
+    xml = read_sheet_xml(book, sheet_name)
+    if not xml:
+        return {}
+    out = {}
+    for m in _CELL_RE.finditer(xml):
+        sm = re.search(r'\bs="(\d+)"', m.group(2))
+        if sm:
+            out[m.group(1)] = int(sm.group(1))
+    return out
+
+
+def materialize_rows(book, sheet_name: str, rows: list) -> list:
+    """物化缺失 row 元素 (就地). 返回已完成的行号。
+
+    `officecli set ... numberformat=0.00` 能物化空 row 元素而不写单元格内容
+    (`value:null` 在未规范化的 WPS/Excel XML 上失败 — 2026-08-13 spike)。
+    刷盘由调用方负责: resident 延迟写, 紧跟的重读可能仍看到旧文件。
+    """
+    done = []
+    for r in rows:
+        path = f"/{sheet_name}/A{r}"
+        proc = officecli("set", str(book), path, "--prop", "numberformat=0.00")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"officecli set {path} failed (rc={proc.returncode}): "
+                f"{(proc.stderr or '')[-300:]}")
+        done.append(r)
+    return done
+
+
+def flush_workbook(book) -> None:
+    """强制 resident 落盘 (否则延迟写会丢)."""
+    proc = officecli("close", str(book))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"officecli close failed (rc={proc.returncode}): "
+            f"{(proc.stderr or '')[-300:]}")
 
 
 def detect_column_widths(filepath, sheet):
@@ -697,17 +859,10 @@ def detect_row_gaps(filepath, sheet):
 
     officecli 的 `add ... after: /row[N]` 锚点要求 N 元素真实存在; 空洞
     会使插入行落在空洞之后的 r 值、锚点链永久断裂 (2026-08-12 埃及复盘)。
-    直接解包 xlsx XML 读取 row r 值 (命名空间前缀 x: 或裸均可)。
+    实现 = `row_gaps` (本模块唯一实现; 旧版此处另有一份裸正则副本, 见 _read_sheet_xml)。
     返回缺失 r 值列表 (空 = 无空洞)。
     """
-    zf, xl = _read_sheet_xml(filepath, sheet)
-    if zf is None:
-        return []
-    rs = {int(r) for r in re.findall(r"<(?:x:)?row r=\"(\d+)\"", xl)}
-    if not rs:
-        return []
-    hi = max(rs)
-    return sorted(r for r in range(1, hi + 1) if r not in rs)
+    return row_gaps(filepath, sheet)
 
 
 def detect_style_granularity(filepath, sheet, blocks, flat_rows, num_cols):
@@ -812,6 +967,92 @@ def detect_style_granularity(filepath, sheet, blocks, flat_rows, num_cols):
 
     return {"placeholder_segments": segments,
             "clone_source_rows": clone_source_rows}
+
+
+def clone_source_style_profile(filepath, sheet, blocks, num_cols):
+    """块数据行的列级 style-index 剖面 + 众数剖面 + 非锚点候选行.
+
+    为什么用 style index 而不是解析 styles.xml: 两个单元格的 `s=` 索引相同
+    就意味着**构造上**格式相同 — 要判"这一格没带块内格式"不需要知道它具体
+    是哪个字体/填充, 只需要知道它和别人不一样。这把判定降成集合比较, 无需
+    理解 OOXML 样式表。
+
+    recorded 2026-09 (本 run): 模板块1 的 A/V/W 三列是合并区**非锚点**格且
+    无块内格式 (style index 10/11, 而锚点行是 6/19/19)。克隆这种行做 data
+    行, 新块的类别列与系列盈亏/总盈亏合并区就会丢字体/填充/上下边框 —
+    而 validate / issues / readback / structural / render **全绿** (渲染只是
+    `status: produced`, 无一门禁看格式)。唯一的机械发现点就是这里。
+
+    data 行定义沿用 CLONE_ROLES 契约: 每块 title=start / header=start+1 /
+    data=start+2..end。返回 None 表示无法判定 (无 XML / 无块 / 无 style 信息),
+    调用方应静默跳过 (不得把"判不了"当成"有问题")。
+
+    返回:
+      {
+        "profiles":    {row: [style_index_or_None, ...]},   # 每块数据行
+        "modal":       [style_index_or_None, ...],          # 列级众数剖面
+        "modal_rows":  [row, ...],                          # 携带众数剖面的行
+        "anchor_rows": [row, ...],                          # 合并锚点行 (不可克隆)
+        "candidates":  [row, ...],                          # 非锚点且==众数的行
+      }
+    """
+    ids = cell_style_ids(filepath, sheet)
+    if not ids:
+        return None
+    cols = [col_idx_to_letter(i) for i in range(num_cols)]
+
+    # 每块的数据区行号 (title=start, header=start+1, data=start+2..end)
+    data_rows = []
+    for b in blocks or []:
+        start = b.get("start")
+        end = b.get("end", start)
+        if not isinstance(start, int):
+            continue
+        data_rows.extend(r for r in range(start + 2, (end or start) + 1))
+
+    # 只保留**真实存在**的数据行 (有 row 元素), 不要求它携带样式。
+    # ⚠️ 早先版本加了"至少一格有 s=" 的过滤, 结果是**整行无格式**的克隆源被排除
+    # 在剖面图之外 → 检查静默不触发 (recorded 2026-09, 契约测试暴露)。
+    # 判据必须是"行存在", 因为"整行无格式"正是最该被拦下的克隆源形态。
+    existing = set(row_values(filepath, sheet))
+    data_rows = [r for r in sorted(set(data_rows)) if r in existing]
+    if len(data_rows) < 2:
+        return None
+
+    profiles = {r: [ids.get(f"{c}{r}") for c in cols] for r in data_rows}
+
+    # 列级众数 (tie → 行号最小者, 保证确定性)
+    modal = []
+    for ci in range(num_cols):
+        counts = {}
+        for r in data_rows:
+            v = profiles[r][ci]
+            counts.setdefault(v, []).append(r)
+        best = max(counts.items(), key=lambda kv: (len(kv[1]), -min(kv[1])))
+        modal.append(best[0])
+
+    modal_rows = [r for r in data_rows if profiles[r] == modal]
+
+    anchors = set()
+    for a in (ids_meta_anchors(filepath, sheet) or []):
+        anchors.add(a)
+
+    candidates = [r for r in modal_rows if r not in anchors]
+    return {"profiles": profiles, "modal": modal, "modal_rows": modal_rows,
+            "anchor_rows": sorted(anchors), "candidates": candidates,
+            "cols": cols}
+
+
+def ids_meta_anchors(filepath, sheet):
+    """该 sheet 的合并锚点行号集合 (worksheet XML 的 mergeCell 左上角)."""
+    xml = read_sheet_xml(filepath, sheet)
+    if not xml:
+        return []
+    rows = set()
+    for m in re.finditer(r'<(?:[A-Za-z_][\w.\-]*:)?mergeCell\b[^>]*ref="([A-Z]+)(\d+):', xml):
+        rows.add(int(m.group(2)))
+    return sorted(rows)
+
 
 
 def _styled_xfs_from_styles_xml(styles_xml: str) -> set:

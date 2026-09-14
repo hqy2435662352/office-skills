@@ -295,9 +295,11 @@ flatten 产物（`*_flat.csv` /
 staged 文件 / `*_outline.txt` / `_plan_*.json` / `.preflight_cache.json`；
 `mod_resolution.json`（task 级 context/，非 run 触发器）/ `task_shape.json`
 （run-scoped 但非触发器）。
-`repair_row_gaps.py` 的 `--flatten` 重跑接缝豁免 fill_spec.yaml（spec 存在时
-plan/receipt 尚不存在；compile 的指纹 / input_hashes 契约对乱序改动
-fail-closed）。
+行号空洞修复不构成 run 触发缝: 默认由 `workspace_init --init` 在 staging 内部完成
+（先于哈希/展平/指纹），独立 `repair_row_gaps.py` 只产出新输入快照并要求重新
+`--init` — 两者都不写 run 生命周期产物。`fill_spec.yaml` 是 Agent 手写产物，无脚本
+重跑接缝（spec 存在时 plan/receipt 尚不存在；compile 的指纹 / input_hashes 契约对
+乱序改动 fail-closed）。
 
 
 ## 7. CLI 用法

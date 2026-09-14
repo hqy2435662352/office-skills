@@ -41,7 +41,7 @@ S7 Execute + Verify → S8 Deliver
 
 | 阶段 | 细则所有者 | 不可省契约 |
 |---|---|---|
-| **S0 Workspace Init** | §1 | `workspace_init.py --init` Job 级一次原子完成 staging → 事实空间; workdir 必须 ASCII; 输入漂移 → 重新 `--init` |
+| **S0 Workspace Init** | §1 | `workspace_init.py --init` Job 级一次原子完成 staging → **行号空洞自修复** → 事实空间; workdir 必须 ASCII; 输入漂移 → 重新 `--init` (`--no-repair` 关闭自修复) |
 | **S1 Topology** | §2 | Topology: 用任务文本 + workspace_manifest 事实判定 single_run / multi_run, **零新增探测**; lowering 只由 `materialize_run.py` 做 |
 | **S2 Task Shape** | §3 | 判定输入 = 任务指令 × 源 evidence × 目标 evidence; 零新脚本 / 零额外 LLM / 零额外探测 |
 | **S3 MOD Resolution** | §4 | 按裁决规则**自动采用或**提请用户裁决 → `mod_resolution.json`; 未裁决 (status ∈/ {resolved, none}) 禁止业务推导 |
@@ -73,7 +73,7 @@ No defect, no exploration. No exception signal, no exception route. No unresolve
 | Execute | 机械执行 + 机器验证 | `validated_draft.*` / `draft_receipt.json` |
 | Deliver | 哈希核对复制 | `final_receipt.json` |
 
-**五原则**: FillSpec First / Compiler Driven / Task Is Optimization / Run Is Disposable / Minimum Runtime State。**Task vs Run**: Task = task.yaml + runs/ (数据组织容器, 无业务决策能力, 无执行状态机); Run = 一次执行尝试 (spec/plan/output/receipt 全在 `runs/<id>/`); 单 run 平铺 workdir 不进 Task。**Repair = input-version repair**: 行号空洞修复产出新输入快照后经 canonical `workspace_init` 重新进入, 绝不做 workspace 原地突变 (见失败处置表 ROW_GAP_DETECTED)。
+**五原则**: FillSpec First / Compiler Driven / Task Is Optimization / Run Is Disposable / Minimum Runtime State。**Task vs Run**: Task = task.yaml + runs/ (数据组织容器, 无业务决策能力, 无执行状态机); Run = 一次执行尝试 (spec/plan/output/receipt 全在 `runs/<id>/`); 单 run 平铺 workdir 不进 Task。**Repair = input-version repair**: 行号空洞修复只发生在**输入快照**上 (init 内暂存副本, 或独立 utility 产出的 repaired snapshot), 绝不原地突变既有 workspace 事实空间 — 默认路径已由 init 内部一次完成, 无需第二趟 (见 §1 与失败处置表 `ROW_GAP_DETECTED`)。
 
 ## 不变量
 
@@ -91,7 +91,7 @@ No defect, no exploration. No exception signal, no exception route. No unresolve
 | 对象 | 类型 | 权威性 |
 |---|---|---|
 | staged source/target | 输入快照 | 本次运行输入事实 (compile 期绑定 plan.input_hashes; manifest files[].sha256 是 init 期快照) |
-| `workspace_manifest.json` | Canonical | 工作区唯一事实空间 — inputs / outlines / flattened (role-neutral, entry-level structure_sha256); 无 target/kind/二元 fingerprints |
+| `workspace_manifest.json` | Canonical | 工作区唯一事实空间 — inputs / outlines / flattened (role-neutral, entry-level structure_sha256) / `repairs` (staging 内行号空洞修复证据: 逐文件-逐 sheet 的已修行号 + `deferred` 及其 `reason` + 非 scope 的 `unscoped_gaps`); 无 target/kind/二元 fingerprints |
 | `prepare_manifest.json` | Derived (run-local) | materialize_run 从 workspace 投影: flattened + target entry + 派生 source/target fingerprints (compile-facing 视图) |
 | `fill_spec.yaml` | Canonical | 唯一业务语义、映射、转换和追溯事实源 |
 | `execution_plan.json` / `mapping.md` | Derived | Compiler 从 FillSpec 物化 (编辑 spec, 从不编辑 plan/mapping) |
@@ -108,7 +108,8 @@ No defect, no exploration. No exception signal, no exception route. No unresolve
 
 ```
 <workdir>/ (ASCII; C:\Temp\tablefill\<task>\):
-  workspace_manifest.json   — canonical physical facts (role-neutral, 无 target)
+  workspace_manifest.json   — canonical physical facts (role-neutral, 无 target); 含 repairs 段
+                              (staging 内行号空洞修复证据; 无空洞时为空数组)
   *_outline.txt / *_premod_evidence.md (role-neutral) / *_flat.csv / *_meta.json / *_candidates.yaml
   prepare_manifest.json     — run-local compiler view (materialize_run 产出; 单 run 平铺 workdir)
   <target>_target_view.md   — run-local target routing evidence (materialize_run 渲染, 与 workspace
@@ -155,17 +156,28 @@ skill(name="officecli-xlsx")    # 路径语法、open/save 生命周期、batch 
 
 ## 工作流 (七个公开命令)
 
-`workspace_init.py --init` (Job 级唯一入口: 一次原子完成 staging/outline/展平/classify/role-neutral premod evidence → 事实空间 `workspace_manifest.json`; **不写 prepare_manifest, 不需要 --target**) → Topology Check (single-run CLI 定义 / multi-run task.yaml) → `materialize_run.py` (Topology 的 lowering: 校验引用 → 派生 run fingerprints → 渲染 target routing view → 生成每 run `prepare_manifest.json`) → Task Shape Check → `mod_nominate.py` → 用户裁决 → [规则加载] → digest → `fill_spec.yaml` (LLM 撰写) → `compile_fill.py` (Compile/Repair Loop → COMPILE CLEAN) → Spec Review (唯一人工点, `spec_review.py`, 摘要 = 映射/转换/排除三节业务语言, 确认绑定 Compile Clean 的 FillSpec 哈希) → `execute_batch.py` (唯一一次填充 + Review/输入哈希双层门禁 + 机器验证) → Validated Draft + receipt → `promote_output.py` (哈希核对复制自动交付)。
+`workspace_init.py --init` (Job 级唯一入口: 一次原子完成 staging/行号空洞自修复/outline/展平/classify/role-neutral premod evidence → 事实空间 `workspace_manifest.json`; **不写 prepare_manifest, 不需要 --target**) → Topology Check (single-run CLI 定义 / multi-run task.yaml) → `materialize_run.py` (Topology 的 lowering: 校验引用 → 派生 run fingerprints → 渲染 target routing view → 生成每 run `prepare_manifest.json`) → Task Shape Check → `mod_nominate.py` → 用户裁决 → [规则加载] → digest → `fill_spec.yaml` (LLM 撰写) → `compile_fill.py` (Compile/Repair Loop → COMPILE CLEAN) → Spec Review (唯一人工点, `spec_review.py`, 摘要 = 映射/转换/排除三节业务语言, 确认绑定 Compile Clean 的 FillSpec 哈希) → `execute_batch.py` (唯一一次填充 + Review/输入哈希双层门禁 + 机器验证) → Validated Draft + receipt → `promote_output.py` (哈希核对复制自动交付)。
 
 ### 1. Workspace Init — `workspace_init.py --init` (Job 级唯一入口)
 
-- **`workspace_init.py --init`** (每 Job 一次): `--files "源|ascii名,..." --sheets "file.xlsx:S1,S2;..." --task <文本>` — 环境预检+暂存+outline+展平+classify+role-neutral premod evidence+digest 延后一次原子完成; 写 `workspace_manifest.json` (唯一事实空间, canonical, **角色中立**)。workdir 必须 ASCII; staged/outline 幂等 (同哈希跳过), 失败/漏列 → 重新 `--init`。
+- **`workspace_init.py --init`** (每 Job 一次): `--files "源|ascii名,..." --sheets "file.xlsx:S1,S2;..." --task <文本>` — 环境预检+暂存+**行号空洞自修复**+outline+展平+classify+role-neutral premod evidence+digest 延后一次原子完成; 写 `workspace_manifest.json` (唯一事实空间, canonical, **角色中立**)。workdir 必须 ASCII; staged/outline 幂等 (同哈希跳过), 失败/漏列 → 重新 `--init`。`--no-repair` 关闭自修复 (见下)。
 - **`--sheets` = 本 Job 的 flattened business scope** (Selective Flatten Invariant): 只展平任务明确纳入的业务 sheet 并集 — 角色中立 ≠ 全簿展平; 禁止 "先全部 flatten, 反正后面再选" (历史 sheet 混入 / context 污染 / MOD 提名噪音)。选定业务 sheet 时不依赖 topology 判定: 任务文本已足以回答 "哪些 sheet 属于本 Job 事实空间", 不需要先知道 run 划分。
 - **Sheet Scope ≠ Run Role**: sheet 选择 (哪些 sheet 进事实空间) 发生在 init 内; source/target 角色 (某 run 中谁是谁) 发生在 topology/materialization 后。sheet selection ≠ topology, sheet selection ≠ source/target 赋值。
 - flatten 产出每 sheet 一个 `{name}_premod_evidence.md` (**role-neutral**: 只含路由+MOD 提名所需最小结构事实, 剥离解题材料; 无 target 视角的占位/克隆段 — 那是 run-local target routing view 的内容); full `{name}_digest.md` 在 MOD 解锁后才生成 (见 MOD Resolution)。
 - **无 `--target`**: target 角色不进入初始化接口, 也不进入 workspace_manifest (manifest `target`/`kind`/二元 fingerprints 一律不存在; 同一工作簿可在一个 run 作 target、另一 run 作 source, 文件级贴角色标签是粒度错误)。
 - 验证与继承: `--verify` 重算全部 staged 输入哈希与 manifest 比对 (漂移 → exit 3 + 提示重新初始化); `--inherit-from <dir>` 显式继承另一已 init 工作区的事实空间 (逐条哈希核对复制, 不匹配 fail-closed)。
-- 行号空洞修复**不在此处**: 见失败处置表 `ROW_GAP_DETECTED` — repair 产出**新输入快照**后重新 `--init`, 绝不原地改 staged 后局部续跑。
+- 行号空洞修复**在 staging 内一次完成** (默认): init 在暂存副本上检测 + 物化缺失
+  row 元素, **先于** 哈希/outline/展平/指纹 记录 — 因此一趟 init 即出可用事实空间,
+  不存在 "init → 读 evidence 发现空洞 → repair → 再 init" 的两趟形状。三个不变量
+  同时成立: 用户原件从未被碰 (staging 已复制)、manifest 记的是修复后字节、全部
+  派生事实由同一份一致输入算出。`--no-repair` 关闭 (逐字节复刻源文件时用), 此时
+  空洞记入 `row_gaps_deferred` 且 premod evidence 照旧提示; 源路径与暂存路径**同
+  一个文件**时自动修复被拒绝 (改它等于改用户原件), 同样记 `reason:
+  source-is-staged-file` 的 deferred — 此时走独立 repair 产出快照。scope = `--sheets`
+  业务 sheet 并集; 非 scope sheet 的空洞只记入 `row_gaps_unscoped`。
+  独立 utility 仍在 (workspace 外修复 / 需要独立快照时):
+  `repair_row_gaps.py --input <xlsx> (--sheet <Name> | --all) [--out <snapshot>]` —
+  它产出**新输入快照**, 以该快照重新 `--init`, 绝不原地改 staged 后局部续跑。
 - 不得仅为 lookup/inheritance 索引把 sheet flatten 进 manifest — 索引由 `build_inheritance_index.py` 直接读 staged workbook (见 FILLSPEC「Fill source use vs lookup-only use」)。
 
 ### 2. Topology + Run Materialization (S1, 硬性)
@@ -312,7 +324,7 @@ python scripts/execute_batch.py --plan execution_plan.json --template t.xlsx --w
 
 **前置门禁 (fail-closed, 复制模板之前)**: ① **Review 门禁**: `review_confirm.json` 必须存在 (否则 `SPEC_REVIEW_MISSING` exit 3) 且 `review_confirm.fill_spec_sha256 == execution_plan.fill_spec_sha256` (否则 `SPEC_REVIEW_STALE` exit 3) — 一切路径自动收敛: Review 后没改 spec → execute; Review 后改了 spec → 旧确认 stale → 重编译 → 必须 Review 新版本 → execute; 用户确认的始终是即将被执行的那一份 IR; ② **输入哈希核对**: staged 输入 vs plan.input_hashes (compile 期绑定), 漂移 → INPUT_HASH_DRIFT (exit 3), 在复制模板**之前**拒绝。
 
-③ 复制 staged target → validated_draft.<ext> (模板永不被修改); ④ 按 plan 执行 (≤50 op/chunk, 执行尾部显式 close 刷盘); ⑤ `officecli validate` 先于 issue delta (validate 刷新编辑并强制公式求值); ⑥ issue delta vs 模板基线, 只认新增; ⑦ readback 全部由 Compiler 派生 — 值比较数字归一化**只限真数值形态** (容忍 138.00 vs 138, $1,234.5 vs 1234.5, 12.5%), 字母数字标识 (SKU/型号/Z 码) 按文本精确比较, 公式格断言非空, nulls 断言 EMPTY; **禁止手写 checks**; ⑧ 结构 readback: FINAL_ROW_COUNT_MISMATCH + group_merges 边界 (GROUP_BOUNDARY_MISMATCH); ⑨ Render QA: `--render png|html|none` (默认 html, 只渲染 plan.render_qa.region; 纯文本模型用 html 结构检查, 不得声称视觉验证; 失败 → RENDER_QA_FAILED); ⑩ 写 draft_receipt.json (哈希为执行时重算 + input_hash_check 绑定, spec/plan/draft 哈希, op 计数, coverage/readback/structural/render_qa/issue delta/validate) — **Draft 保留不删除**。执行细节见 LAYER4_EXECUTE_LOOP.md / FAILURE_CLASSES.md。
+③ 复制 staged target → validated_draft.<ext> (模板永不被修改); ④ 按 plan 执行 (≤50 op/chunk, 执行尾部显式 close 刷盘); ⑤ `officecli validate` 先于 issue delta (validate 刷新编辑并强制公式求值); ⑥ issue delta vs 模板基线, 只认新增; ⑦ readback 全部由 Compiler 派生 — 值比较数字归一化**只限真数值形态** (容忍 138.00 vs 138, $1,234.5 vs 1234.5, 12.5%), 字母数字标识 (SKU/型号/Z 码) 按文本精确比较, 公式格断言非空, nulls 断言 EMPTY; **禁止手写 checks**; ⑧ 结构 readback: FINAL_ROW_COUNT_MISMATCH + group_merges 边界 (GROUP_BOUNDARY_MISMATCH) + **克隆源样式保真** (plan 的 `clone_style_reference` → 新增数据行的列级样式剖面必须等于块内锚点剖面; 差异 → `CLONE_STYLE_FIDELITY_MISMATCH`, 记于 receipt `structural.style_fidelity`) — 这一项专门覆盖"格式已丢而 validate/issues/readback/render 全绿"的盲区 (recorded 2026-09; 编译期另有 `CLONE_SOURCE_STYLE_MISMATCH` 前置拦截); ⑨ Render QA: `--render png|html|none` (默认 html, 只渲染 plan.render_qa.region; 纯文本模型用 html 结构检查, 不得声称视觉验证; 失败 → RENDER_QA_FAILED); ⑩ 写 draft_receipt.json (哈希为执行时重算 + input_hash_check 绑定, spec/plan/draft 哈希, op 计数, coverage/readback/structural/render_qa/issue delta/validate) — **Draft 保留不删除**。执行细节见 LAYER4_EXECUTE_LOOP.md / FAILURE_CLASSES.md。
 
 **失败二分 (硬性, 决定是否重新 Review)**:
 - **执行/环境类缺陷 (FillSpec 不变)**: officecli timeout / 文件锁占用 / 临时 IO error / render service unavailable → `fill_spec_sha256 unchanged` → 修复运行条件 (重试/清理 resident/重跑) → **直接重 execute, 不需要重新 Review** (用户确认的 IR 没变);
@@ -376,7 +388,7 @@ exit 0 = Pass, proceed; exit 1 = Fatal (**非瞬时**环境错误: file missing 
 | 编译缺陷 — 业务歧义 (两映射都合理/填 0 还是空/字段归属/输出语义) | **ASK / gaps**: 单独询问用户或记 gaps 由 Spec Review 呈现 — **禁止"修到能编译"** |
 | 执行/环境失败, FillSpec 不变 (officecli timeout/锁占用/IO error/render 不可用) | **RECOVER**: 修复运行条件 → 直接重 execute — **不需要重新 Review** (review_confirm 绑定不变) |
 | 执行失败, 需改 FillSpec (locator 不成立/结构需变/写入策略需变/映射需调整) | **REPAIR 全链**: 修 spec → 重新 Compile Clean → **重新 Spec Review** → 重新 execute (旧确认已失效) |
-| `ROW_GAP_DETECTED` (行号空洞) | **REPAIR via canonical re-init**: `repair_row_gaps.py` 在**副本**上修复 → 产出 repaired input snapshot → 旧 workspace 作废 → 以 repaired snapshot 为输入重新 `workspace_init --init` → 重新 materialize (各 run view) → 刷新 FillSpec fingerprints → Compile → Spec Review → Execute。**绝不原地改 staged 后局部续跑、绝不增量 flatten、绝不 patch manifest 继续跑**; 有效 topology/run 定义/MOD/映射决策可 replay, 不重推业务推理 (replay ≠ 全脑重启) |
+| `ROW_GAP_DETECTED` (行号空洞) | **通常已自愈**: `workspace_init --init` 默认在 staging 内一次性修复 (见 §1), 所以这一行只在两种情况下才需要动作 — ① `--no-repair` 或源==暂存被拒 (`row_gaps_deferred`, 看 `reason`); ② 空洞落在**目标** sheet 的 add 锚点/克隆源上而模板未被修复 (编译期 `TEMPLATE_ROW_GAP`)。两者都走 **REPAIR via canonical re-init**: `repair_row_gaps.py --input <xlsx> --all [--out <snapshot>]` 在**副本**上修复 → 产出 repaired input snapshot → 旧 workspace 作废 → 以该快照为输入重新 `workspace_init --init` → 重新 materialize (各 run view) → 刷新 FillSpec fingerprints → Compile → Spec Review → Execute。**绝不原地改 staged 后局部续跑、绝不增量 flatten、绝不 patch manifest 继续跑**; 有效 topology/run 定义/MOD/映射决策可 replay, 不重推业务推理 (replay ≠ 全脑重启) |
 | MOD 冲突/歧义 (mod_nominate.py) | **ASK**: 单独询问用户 (降级/替换/覆盖), 不与其他问题捆绑 |
 | 连续第 2 次失败 (同一任务) | 重新分类: 多个安全解释 → **ASK**; 无可证明安全计划 → **STOP** |
 | 不可证明安全的操作 | **STOP**: 解释 + 推荐正确的领域能力 (如 STRUCTURAL_OP_OUT_OF_ZONE → inplace+trim) |

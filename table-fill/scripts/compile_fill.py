@@ -69,6 +69,7 @@ from _officecli import (  # noqa: E402
     fail as _fail,
     sha256_file,
 )
+from flatten_table import clone_source_style_profile  # noqa: E402
 PLAN_NAME = "execution_plan.json"
 MAPPING_NAME = "mapping.md"
 SOURCE_TRACE_NAME = "source_trace.json"
@@ -366,10 +367,12 @@ def bind_input_hashes(workdir: Path, inputs: dict,
     plan.input_hashes = {staged_name: sha256} for every source + the target —
     the exact files execute_batch.py will read at execution time. This is
     recomputed at COMPILE time (not copied from prepare_manifest.json
-    files[].sha256, which is an outline-stage snapshot that goes stale after
-    repair_row_gaps modifies the staged target — repair resyncs fingerprints
-    but not files[].sha256; recompile rebinds). A staged file missing at
-    compile time binds None (unverifiable — execute fails closed on it).
+    files[].sha256, which is an init-stage snapshot). Row-gap repair never
+    invalidates it: the default path repairs inside `workspace_init --init`
+    BEFORE any hash is recorded (so staged bytes == manifest hash), and the
+    standalone repair CLI emits a NEW snapshot that must re-enter `--init`.
+    A staged file missing at compile time binds None (unverifiable — execute
+    fails closed on it).
 
     ticket 08: shared_root 给定时，raw 输入从 shared_root/staged/<name> 按名
     引用（task 级共享，不复制进 run 目录）。"""
@@ -3805,6 +3808,9 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
     matrix_cells: list = []
     source_trace: list = []
     warnings: list = []
+    # 克隆源样式剖面 (xlsx 行布局块才计算; 见下方 CLONE_SOURCE_STYLE_MISMATCH)。
+    # 在分支之前初始化: matrix / pptx 路径不经过该分支, 但仍会被 plan 组装读到。
+    _style_prof = None
     if matrix_cfg is not None:
         if platform == "pptx":
             defects.append({"code": "PPTX_CAPABILITY_NOT_ROLLED_OUT",
@@ -4123,6 +4129,18 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
             anchors = {a["anchor"] for a in target_meta.get("merge_anchors", [])}
             anchor_rows = {int(re.search(r"\d+$", a).group()) for a in anchors}
             whole_run_gated = False
+            # 克隆源样式剖面 (一次性): 判 data 的 template_row 是否携带块内格式.
+            # 见 flatten_table.clone_source_style_profile 的 recorded 说明 —
+            # 这一项没有其它机器门禁看得见 (validate/issues/readback/structural/
+            # render 全绿而格式已丢), 所以必须在编译期判.
+            try:
+                _style_prof = clone_source_style_profile(
+                    str(workdir / manifest_target["file"]),
+                    target_cfg.get("sheet") or manifest_target.get("sheet"),
+                    target_meta.get("blocks"),
+                    num_cols)
+            except Exception:
+                _style_prof = None  # 判不了 ≠ 有问题: 静默跳过
             for b in block_infos:
                 cfg = b["cfg"]
                 validate_nulls_rows(cfg, defects)  # 先于任何 parse_rel_rows 调用
@@ -4143,6 +4161,52 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                                                "merge anchor; cloning it carries anchor formulas "
                                                "into non-anchor cells",
                                     "corrective_action": "Pick a non-anchor data row with the same format"})
+                # 克隆源样式剖面检查 (recorded 2026-09): data 行克隆源必须携带
+                # 块内格式. 模板里可能存在"是合并非锚点、却不带块内格式"的行
+                # (本 run 实测: 块1 行4/5 的 A/V/W 列 style index 10/11, 而块内
+                # 众数剖面是 6/19/19) — 克隆它, 新块的类别列与系列盈亏/总盈亏
+                # 合并区就会丢字体/填充/上下边框, 而 validate / issues /
+                # readback / structural / render 全部为绿.
+                if (_style_prof and not b.get("inplace")
+                        and template_row in _style_prof["profiles"]
+                        and _style_prof["profiles"][template_row] != _style_prof["modal"]):
+                    diff_cols = [
+                        _style_prof["cols"][i]
+                        for i, (a, m) in enumerate(zip(_style_prof["profiles"][template_row],
+                                                       _style_prof["modal"]))
+                        if a != m
+                    ]
+                    # 只有"块内确实存在携带众数剖面的可克隆行"时才算缺陷 —
+                    # 否则无从要求 (模板本身就没有一致剖面), 降级为不阻断.
+                    if (len(_style_prof["modal_rows"]) >= 2
+                            and _style_prof["candidates"]):
+                        defects.append({
+                            "code": "CLONE_SOURCE_STYLE_MISMATCH",
+                            "template_row": template_row,
+                            "columns": diff_cols,
+                            "message": f"{b['label']}: data clone source row {template_row} does "
+                                       f"not carry the block's own formatting in column(s) "
+                                       f"{', '.join(diff_cols)} (style profile differs from the "
+                                       f"sheet's dominant data-row profile, carried by rows "
+                                       f"{_style_prof['modal_rows']}) — the new block would "
+                                       f"render those columns with the template's unstyled "
+                                       f"merge-member formatting (no font/fill/border). "
+                                       f"validate/issues/readback/render do NOT catch this.",
+                            "corrective_action": "Pick a non-anchor data row whose formatting "
+                                                 f"matches the block: {_style_prof['candidates']} "
+                                                 f"(e.g. template_row: "
+                                                 f"{_style_prof['candidates'][0]})",
+                        })
+                    else:
+                        warnings.append({
+                            "code": "CLONE_SOURCE_STYLE_DIVERGENT",
+                            "template_row": template_row,
+                            "columns": diff_cols,
+                            "message": f"{b['label']}: data clone source row {template_row} "
+                                       f"differs from the sheet's dominant data-row profile in "
+                                       f"{', '.join(diff_cols)} and no consistent alternative "
+                                       f"row exists — check the block's formatting manually",
+                        })
                 null_specs = {x["col"]: x.get("rows") for x in cfg.get("nulls", [])}
                 per_row = cfg.get("formulas", {}).get("per_row", {})
                 gm_cols = {g.get("col") for g in cfg.get("group_merges", [])}
@@ -4209,12 +4273,19 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                                            f"{kind} row {a} is a row-number gap in the target "
                                            f"sheet (row elements: missing {row_gaps}) — officecli "
                                            f"`add after/from /row[{a}]` would fail at runtime",
-                                "corrective_action": "Materialize the missing row "
-                                                     "elements (scripts/repair_row_gaps.py "
-                                                     "--workdir <dir> — fingerprints "
-                                                     "auto re-synced), then update the "
-                                                     "spec target_structure fingerprint "
-                                                     "(or --patch-spec) and recompile",
+                                "corrective_action": "The default path already repairs gaps "
+                                                     "inside `workspace_init --init` (before any "
+                                                     "hash is recorded) — if you still see this, "
+                                                     "init was run with --no-repair or refused "
+                                                     "because the source path IS the staged path "
+                                                     "(check manifest `repairs[].deferred`). Fix: "
+                                                     "scripts/repair_row_gaps.py --input <xlsx> "
+                                                     "--all --out <snapshot>, then re-run "
+                                                     "workspace_init --init with that snapshot "
+                                                     "(hashes/flatten/fingerprints are recomputed "
+                                                     "from the new bytes) and recompile with the "
+                                                     "new fingerprints. The repair CLI does NOT "
+                                                     "re-sync fingerprints or patch the spec.",
                             })
             if defects:
                 fail("STATIC_VALIDATION_FAILED", f"{len(defects)} static validation defect(s)",
@@ -4394,6 +4465,19 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
         plan_writes.append({"row": c["target_row"], "col": c["target_col"],
                             "value": c["value"]})
 
+    # 克隆源样式保真的执行期参照: 每块写入的数据行 → 期望样式剖面.
+    clone_style_reference: dict = {}
+    if platform == "xlsx" and _style_prof:
+        _sheet_name = target_cfg.get("sheet")
+        _written_rows = sorted({trow for _, _, trow in row_map})
+        if _sheet_name and _written_rows:
+            clone_style_reference[_sheet_name] = {
+                "cols": _style_prof["cols"],
+                "profile": _style_prof["modal"],
+                "rows": _written_rows,
+                "reference_rows": _style_prof["modal_rows"],
+            }
+
     plan = {
         "schema_version": "2.5",  # v3 保留给 plugin-化世代
         "fill_spec": None,
@@ -4428,6 +4512,10 @@ def compile_spec(spec: dict, manifest: dict, workdir: Path,
                               "inplace_trim": trim_count,
                               "inplace_overflow": inplace_overflow},
         "group_boundaries": group_boundaries,
+        # 克隆源样式保真的执行期参照 (recorded 2026-09): 编译期为每个新增块
+        # 记录"块内众数数据行样式剖面 + 本 plan 写入的数据行号", 执行器据此
+        # 在**产物**上复核格式确实落在新行上 (编译期判模板, 这里判 draft)。
+        "clone_style_reference": clone_style_reference,
         "sets": set_records,
         # Ticket 06: matrix 一等表达元数据 + 每条写入的 source lineage —
         # {target, source, transform_chain} 聚合 (mirrors source_trace.json)。

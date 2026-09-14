@@ -40,6 +40,15 @@ plan 并**保留**结果为 `validated_draft.<ext>`; Spec Review 确认（唯一
      单格合并 (A19:A19) 与陈旧合并都在集合差里显形 — `officecli validate`
      对合并残留视而不见, 组边界是唯一闭环检查 → 不匹配 =
      GROUP_BOUNDARY_MISMATCH。
+   - **克隆源样式保真 (recorded 2026-09)**: `plan.clone_style_reference` 记录
+     块内众数数据行的列级样式剖面 + 本 plan 写入的数据行号; 在 draft 上逐行
+     比对 `s=` 样式索引 → 不等 = `CLONE_STYLE_FIDELITY_MISMATCH` (记入
+     receipt `structural.style_fidelity`)。这一项专治"格式已丢而 validate /
+     issues / readback / render 全绿"的盲区 — data 克隆源若是「合并非锚点但
+     不带块内格式」的行, 新块的类别列与聚合合并区会丢字体/填充/边框, 而
+     `render_qa` 只产 `status: produced`、不看格式。编译期另有
+     `CLONE_SOURCE_STYLE_MISMATCH` 前置拦截; 判不了 (无参照) 时静默跳过 —
+     "判不了" 不得被当成 "坏了"。
 8. **Render QA**: `--render png|html|none`, **默认 `html`** (issue 03 / Case 07
    改进 4 — 省略 `--render` 时按 html 执行, Agent 无需再自补 `view html`)。
    - png (多模态模型): `view screenshot --range <region>` → 视觉检查。

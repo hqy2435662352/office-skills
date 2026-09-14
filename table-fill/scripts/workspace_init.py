@@ -62,7 +62,10 @@ from _officecli import (  # noqa: E402
 
 import preflight  # noqa: E402
 import stage_files  # noqa: E402
-from flatten_table import officecli_outline  # noqa: E402
+from flatten_table import (  # noqa: E402  (xlsx 结构事实唯一实现地)
+    all_row_gaps, flush_workbook, materialize_rows, officecli_outline, row_gaps,
+    sheet_names,
+)
 from prepare_run import (  # noqa: E402
     WORKSPACE_SCHEMA_VERSION as SCHEMA_VERSION,  # canonical home: prepare_run
     # (writer 与 materialize/--verify 的消费端校验共用同一常量, 防漂移)
@@ -212,14 +215,11 @@ def _resolve_staged_ref(staged_names: set, fname: str) -> str:
     return cands[0] if len(cands) == 1 else ""
 
 
-def _flatten_stage(workdir: Path, manifest: dict, sheets_arg: str) -> None:
-    """同一套展平/classify/digest, 一次 --init 内完成 (不复用 prepare_run 的
-    run_flatten_stage 是因为 init 是单次原子入口, 不需要增量 merge 状态)。
+def _parse_sheets_arg(sheets_arg: str, staged_names: set) -> list[tuple[str, list[str]]]:
+    """'file:S1,S2;file2:S3' → [(staged_file, [sheets])] (解析独立于展平).
 
-    role-neutral (ADR 0018): 不区分 source/target — 无 --target, 无 kind,
-    无二元 fingerprints; 每个展平条目记录自己的 entry-level structure_sha256。
-    """
-    staged_names = {f["staged"] for f in manifest["inputs"]}
+    独立出来的原因: 展平之前就要知道业务 sheet 并集 — 行号空洞修复必须在
+    任何事实被记录之前按 scope 完成 (见 _repair_staged_gaps)。"""
     parsed = []
     for chunk in sheets_arg.split(";"):
         chunk = chunk.strip()
@@ -241,7 +241,122 @@ def _flatten_stage(workdir: Path, manifest: dict, sheets_arg: str) -> None:
             fail("SHEETS_ARG_INVALID", f"no sheets listed for {fname!r}",
                  "List at least one sheet per file")
         parsed.append((fname, sheets))
+    return parsed
 
+
+# 行元素空洞的输入域 (pptx/docx 无 row 概念)
+_ROW_DOMAIN_SUFFIXES = (".xlsx", ".xlsm", ".xltx", ".xltm")
+
+
+def _repair_staged_gaps(workdir: Path, records: list, parsed: list,
+                        *, enabled: bool) -> list:
+    """在**暂存副本**上检测并物化行号空洞 — 一次性 init 的关键前置步。
+
+    为什么放在这里 (recorded 2026-09): 空洞检测过去只发生在展平之后
+    (premod evidence 里的提示), 而修复必须产出**新输入快照**再走 canonical
+    re-init — 于是常规流程被迫 init → 读 evidence → repair → 再 init 两趟,
+    第二趟把 staging/outline/展平 全部重做一遍。真正的不变量是「manifest 的
+    哈希 == 磁盘字节, 且既有事实空间不被回改」, 而不是"修复必须是第二个
+    进程"。在 staging 之后、任何哈希/outline/展平/指纹被记录**之前**修 暂存
+    副本, 三个不变量同时成立: 用户原件从未被碰 (stage 已复制), manifest 记的
+    就是修复后字节, 展平产物 (orig 行号 / row_gaps / 指纹) 全部由同一个
+    一致事实算出。一趟出事实空间。
+
+    scope: 只修 --sheets 列出的业务 sheet (Selective Flatten 同一口径);
+    非 scope sheet 的空洞只作信息记录, 不产生字节变化。
+    """
+    scope: dict[str, list[str]] = {}
+    for fname, sheets in parsed:
+        scope.setdefault(fname, []).extend(sheets)
+
+    results = []
+    for rec in records:
+        if rec.get("status") == "ERROR" or not rec.get("dst"):
+            continue
+        name = Path(rec["dst"]).name
+        staged = workdir / name
+        if staged.suffix.lower() not in _ROW_DOMAIN_SUFFIXES:
+            continue
+
+        # 安全闸门 (硬性): 自动修复**只允许**改暂存副本。当调用方的源路径就是
+        # 暂存路径本身 (源文件已在 workdir 内) 时 src 与 staged 是同一个文件 —
+        # 原地修复等于改写用户原件, 违反 immutable-input 契约。此时拒绝修复并
+        # 记为 deferred, 由用户选择 standalone repair (产出独立快照)。
+        try:
+            same_file = os.path.samefile(rec.get("src") or "", staged)
+        except OSError:
+            try:
+                same_file = Path(rec["src"]).resolve() == staged.resolve()
+            except OSError:
+                same_file = False
+
+        try:
+            available = sheet_names(staged)
+        except Exception:
+            continue  # 非标准 xlsx: 留给 outline/flatten 报真实错误
+        wanted = [s for s in (scope.get(name) or available) if s in available]
+        if not wanted:
+            continue
+
+        unscoped = {s: g for s, g in all_row_gaps(staged).items()
+                    if s not in wanted}
+        repaired: dict[str, list[int]] = {}
+        deferred: list[dict] = []
+        for sh in wanted:
+            gaps = row_gaps(staged, sh)
+            if not gaps:
+                continue
+            if not enabled:
+                deferred.append({"sheet": sh, "rows": gaps,
+                                 "reason": "repair-disabled"})
+                continue
+            if same_file:
+                deferred.append({"sheet": sh, "rows": gaps,
+                                 "reason": "source-is-staged-file"})
+                continue
+            try:
+                repaired[sh] = materialize_rows(staged, sh, gaps)
+            except RuntimeError as e:
+                fail("REPAIR_OP_FAILED",
+                     f"{name} / sheet {sh!r}: {e}",
+                     "检查文件可写性; 或用 --no-repair 跳过自动修复后手工处理",
+                     exit_code=3)
+        if not repaired and not deferred and not unscoped:
+            continue
+
+        if any(repaired.values()):
+            try:
+                flush_workbook(staged)
+            except RuntimeError as e:
+                fail("REPAIR_FLUSH_FAILED",
+                     f"{name}: {e} — 行元素已物化但可能未刷盘",
+                     "删除 workdir 后重跑 --init (幂等)", exit_code=3)
+            residual = {sh: row_gaps(staged, sh) for sh in repaired}
+            residual = {k: v for k, v in residual.items() if v}
+            if residual:
+                fail("REPAIR_VERIFY_FAILED",
+                     f"{name} 修复后仍含行号空洞: {residual}",
+                     "删除 workdir 后重跑 --init; 若持续, 检查 officecli 是否可写",
+                     exit_code=3)
+
+        results.append({
+            "staged": name,
+            "source": rec.get("src"),
+            "repaired": [{"sheet": sh, "rows": rows}
+                         for sh, rows in repaired.items() if rows],
+            "deferred": deferred,
+            "unscoped_gaps": unscoped,
+        })
+    return results
+
+
+def _flatten_stage(workdir: Path, manifest: dict, parsed: list) -> None:
+    """同一套展平/classify/digest, 一次 --init 内完成 (不复用 prepare_run 的
+    run_flatten_stage 是因为 init 是单次原子入口, 不需要增量 merge 状态)。
+
+    role-neutral (ADR 0018): 不区分 source/target — 无 --target, 无 kind,
+    无二元 fingerprints; 每个展平条目记录自己的 entry-level structure_sha256。
+    """
     by_file: dict[str, list[tuple[str, str]]] = {}
     for fname, sheets in parsed:
         for s in sheets:
@@ -332,7 +447,7 @@ def _stamp_derived(workdir: Path, manifest: dict) -> None:
 
 
 def run_init(workdir: Path, files_arg: str, sheets_arg: str,
-             task: str) -> None:
+             task: str, *, repair_gaps: bool = True) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     _workdir_ascii_check(workdir)
     _preflight_or_fail()
@@ -349,6 +464,14 @@ def run_init(workdir: Path, files_arg: str, sheets_arg: str,
     if errors:
         fail("STAGE_FAILED", f"{len(errors)} file(s) failed staging",
              "检查源路径与 ASCII staged 名", exit_code=1)
+
+    # ── 一行号空洞自修复 (先于任何事实记录) ──────────────────────────────
+    # 必须在 outline / sha256 / 展平 / 指纹之前: 修复改变字节, 而这些事实
+    # 全部要绑定修复后的字节, 否则 manifest 记录与磁盘不一致, 就得靠第二趟
+    # re-init 收敛 (旧的 init → repair → re-init 两趟形状)。
+    staged_names = {Path(r["dst"]).name for r in records if r.get("dst")}
+    parsed = _parse_sheets_arg(sheets_arg, staged_names)
+    repairs = _repair_staged_gaps(workdir, records, parsed, enabled=repair_gaps)
 
     inputs = []
     outlines = {}
@@ -384,10 +507,11 @@ def run_init(workdir: Path, files_arg: str, sheets_arg: str,
         "outlines": outlines,
         "flattened": [],
         "derived": [],
+        "repairs": repairs,
         "inherited_from": None,
     }
 
-    _flatten_stage(workdir, manifest, sheets_arg)
+    _flatten_stage(workdir, manifest, parsed)
     _stamp_derived(workdir, manifest)
 
     _save_manifest(workdir, manifest)
@@ -397,12 +521,25 @@ def run_init(workdir: Path, files_arg: str, sheets_arg: str,
         "manifest": MANIFEST_NAME,
         "inputs": [f["staged"] for f in inputs],
         "flattened": [e["name"] for e in manifest["flattened"]],
+        "row_gaps_repaired": [
+            {"staged": r["staged"], "sheets": r["repaired"]}
+            for r in repairs if r["repaired"]
+        ],
+        "row_gaps_deferred": [
+            {"staged": r["staged"], "sheets": r["deferred"]}
+            for r in repairs if r.get("deferred")
+        ],
+        "row_gaps_unscoped": [
+            {"staged": r["staged"], "sheets": r["unscoped_gaps"]}
+            for r in repairs if r.get("unscoped_gaps")
+        ],
         "structure_sha256": {
             e["name"]: e.get("structure_sha256")
             for e in manifest["flattened"]
         },
         "note": "role-neutral manifest (ADR 0018) — run-local prepare_manifest "
-                "由 materialize_run.py 投影",
+                "由 materialize_run.py 投影; 行号空洞已在 staging 内一次性修复 "
+                "(可用 --no-repair 关闭)",
     }, ensure_ascii=False, indent=2))
     sys.exit(0)
 
@@ -560,6 +697,7 @@ def run_inherit(workdir: Path, inherit_from: Path) -> None:
         "outlines": outlines,
         "flattened": flattened,
         "derived": [],
+        "repairs": [],
         "inherited_from": str(inherit_from),
     }
     _stamp_derived(workdir, manifest)
@@ -605,6 +743,10 @@ def main() -> None:
                         help='--init: 业务 sheet 并集 "ascii名.xlsx:S1,S2;ascii名2.xlsx:S3" '
                              '(Selective Flatten — 只展平本 Job 业务 scope, 角色中立)')
     parser.add_argument("--task", type=str, default="", help="任务文本 (记录于 manifest)")
+    parser.add_argument("--no-repair", action="store_true", dest="no_repair",
+                        help="--init: 关闭 staging 内的行号空洞自动修复 "
+                             "(默认开启; 需要逐字节复刻源文件时使用 — 空洞将记录为 "
+                             "deferred 并在 premod evidence 中提示)")
     args = parser.parse_args()
 
     if args.verify:
@@ -619,7 +761,8 @@ def main() -> None:
             fail("NO_SHEETS", "--init 需要 --sheets (业务 sheet 并集)",
                  "提供 'file:SheetA,SheetB' 对; 无 --target — 角色由 materialize_run 投影")
         try:
-            run_init(args.workdir, args.files, args.sheets, args.task)
+            run_init(args.workdir, args.files, args.sheets, args.task,
+                     repair_gaps=not args.no_repair)
         finally:
             _strip_shim(args.workdir)
 
